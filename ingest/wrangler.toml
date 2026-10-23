@@ -42,3 +42,9 @@ preview_bucket_name = "alc-cam-recordings-preview"
 binding = "CAM_HTTP"
 service_id = "01a166ef-0929-7330-af52-3da25f41c42e"
 remote = true
+
+# #2-0 の確認用: VPC Network (Tunnel の先の網へ fetch の URL の IP がそのまま宛先になる)。src/probe.rs だけが使う
+[[vpc_networks]]
+binding = "CAM_NET"
+tunnel_id = "589ac3b8-a73b-4cb8-b2ba-61719490b47d"
+remote = true

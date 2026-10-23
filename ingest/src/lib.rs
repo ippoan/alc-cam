@@ -14,6 +14,7 @@
 
 mod camera;
 mod clip;
+mod probe;
 mod raw;
 
 use cam_sd::{jst_iso, parse_time, safe_segment};
@@ -67,6 +68,10 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = if cfg.prefix.is_empty() { full.as_str() } else { full.strip_prefix(cfg.prefix.as_str()).unwrap_or(&full) }.to_string();
     if path == "/health" {
         return Response::ok("ok");
+    }
+    // #2-0 の確認用 (PROBE_CAM_IP が無ければ 404。dev --remote でしか立てない)
+    if path == "/__probe" {
+        return probe::handle(&req, &env).await;
     }
     // auth-worker が付け直したヘッダだけを信じる (この Worker に外から直接届く口は無い)
     let header = |k: &str| req.headers().get(k).ok().flatten().unwrap_or_default();

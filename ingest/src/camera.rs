@@ -49,6 +49,7 @@ const BASE: &str = "http://camera.vpc.internal";
 
 pub struct Camera {
     fetcher: Fetcher,
+    base: String,
     user: String,
     pass: String,
     nc: u32,
@@ -56,9 +57,14 @@ pub struct Camera {
 
 impl Camera {
     pub fn new(env: &Env, binding: &str, auth: &str) -> Result<Self> {
+        Self::with_base(env, binding, auth, BASE)
+    }
+
+    /// VPC Network の binding では URL の host が宛先そのものになるので、`http://<IP>` を渡す (#2-0 の確認用)
+    pub fn with_base(env: &Env, binding: &str, auth: &str, base: &str) -> Result<Self> {
         let vpc: VpcHttp = env.get_binding(binding)?;
         let (user, pass) = cam_sd::split_auth(auth).ok_or("CAM_AUTH は user:pass の形にしてください")?;
-        Ok(Self { fetcher: Fetcher::unchecked_from_js(vpc.0), user: user.into(), pass: pass.into(), nc: 0 })
+        Ok(Self { fetcher: Fetcher::unchecked_from_js(vpc.0), base: base.into(), user: user.into(), pass: pass.into(), nc: 0 })
     }
 
     pub async fn get_text(&mut self, path: &str) -> Result<String> {
@@ -75,7 +81,7 @@ impl Camera {
     }
 
     async fn send(&mut self, method: Method, path: &str, body: Option<String>) -> Result<Response> {
-        let first = self.fetcher.fetch_request(build(method.clone(), path, body.clone(), None)?).await?;
+        let first = self.fetcher.fetch_request(build(&self.base, method.clone(), path, body.clone(), None)?).await?;
         if first.status_code() != 401 {
             return Ok(first);
         }
@@ -87,7 +93,7 @@ impl Camera {
         self.nc += 1;
         let cnonce = format!("{:016x}", (js_sys::Math::random() * 1e16) as u64);
         let auth = digest::authorization(&challenge, method.as_ref(), path, &self.user, &self.pass, self.nc, &cnonce);
-        let res = self.fetcher.fetch_request(build(method, path, body, Some(&auth))?).await?;
+        let res = self.fetcher.fetch_request(build(&self.base, method, path, body, Some(&auth))?).await?;
         if res.status_code() == 401 {
             return Err("カメラの認証に失敗しました (CAM_AUTH を確かめてください)".into());
         }
@@ -95,7 +101,7 @@ impl Camera {
     }
 }
 
-fn build(method: Method, path: &str, body: Option<String>, auth: Option<&str>) -> Result<Request> {
+fn build(base: &str, method: Method, path: &str, body: Option<String>, auth: Option<&str>) -> Result<Request> {
     let headers = Headers::new();
     if let Some(a) = auth {
         headers.set("Authorization", a)?;
@@ -109,5 +115,5 @@ fn build(method: Method, path: &str, body: Option<String>, auth: Option<&str>) -
     if let Some(b) = body {
         init.with_body(Some(b.into()));
     }
-    Request::new_with_init(&format!("{BASE}{path}"), &init)
+    Request::new_with_init(&format!("{base}{path}"), &init)
 }
