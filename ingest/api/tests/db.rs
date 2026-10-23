@@ -638,6 +638,74 @@ async fn device_candidates_are_counted() {
 }
 
 #[tokio::test]
+async fn dev_device_candidates_are_marked() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let su = admin().await;
+    let emp: Uuid = su.query_one("INSERT INTO alc_api.employees (tenant_id, nfc_id, name) VALUES ($1, $2, '乗務員') RETURNING id", &[&t, &format!("nfc-{}", Uuid::new_v4())]).await.unwrap().get(0);
+    let emp_other: Uuid = su.query_one("INSERT INTO alc_api.employees (tenant_id, nfc_id, name) VALUES ($1, $2, '他社') RETURNING id", &[&other, &format!("nfc-{}", Uuid::new_v4())]).await.unwrap().get(0);
+    // 本番の行 (app.device_dev 未設定)
+    su.execute("INSERT INTO alc_api.hub_measurements (tenant_id, device_id, kind, payload, seq, recorded_at) VALUES ($1, 'prod-1', 'alcohol', '{}', 1, now() - interval '3 hours')", &[&t]).await.unwrap();
+    // 開発端末の行は RLS の WITH CHECK に合わせ、app.device_dev='1' を立てた transaction で入れる
+    for (tenant, employee, device, at) in [
+        (t, emp, "dev-1", "now() - interval '1 hour'"),
+        (t, emp, "dev-2", "now() - interval '2 hours'"),
+        (other, emp_other, "dev-other", "now() - interval '1 hour'"),
+    ] {
+        // 指静脈の登録 (created_at = 今) は dev-1 と他テナントだけ。dev-2 は 2 時間前の timecard が最終
+        let vein = if device == "dev-2" {
+            String::new()
+        } else {
+            format!("INSERT INTO alc_api.vein_enroll_events (tenant_id, employee_id, registered_device_id) VALUES ('{tenant}', '{employee}', '{device}');")
+        };
+        su.batch_execute(&format!(
+            "BEGIN; SELECT set_config('app.device_dev', '1', true); \
+             INSERT INTO alc_api.hub_measurements (tenant_id, device_id, kind, payload, seq, recorded_at) VALUES ('{tenant}', '{device}', 'timecard', '{{}}', 2, {at}); \
+             {vein} COMMIT;"
+        ))
+        .await
+        .unwrap();
+    }
+    let flags: Vec<bool> = su
+        .query("SELECT is_dev FROM alc_api.hub_measurements WHERE tenant_id = $1 AND device_id LIKE 'dev-%' ORDER BY device_id", &[&t])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(flags, [true, true], "準備の行が is_dev = true で入っていない");
+
+    let mut pg = rt().await;
+    let (s, body) = call(&mut pg, &caller(t, false), "GET", "/device-candidates", "", Value::Null).await;
+    assert_eq!(s, 200, "{body}");
+    let got: Vec<(&str, bool)> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["device_id"].as_str().unwrap(), r["is_dev"].as_bool().unwrap()))
+        .collect();
+    // 新しい順に、本番と開発端末が混ざって並ぶ。他テナントの開発端末は出ない
+    assert_eq!(got, [("dev-1", true), ("dev-2", true), ("prod-1", false)]);
+    assert_eq!(body[0]["counts"]["timecard"], 1);
+    assert_eq!(body[0]["counts"]["vein_enroll"], 1);
+    assert_eq!(body[2]["counts"]["alcohol"], 1);
+
+    // set_config は transaction 単位: 同じ接続の次の呼び出し (本番の軸) に漏れない
+    let (_, again) = call(&mut pg, &caller(t, false), "GET", "/device-candidates", "", Value::Null).await;
+    assert_eq!(again, body);
+    let leaked: Option<String> = pg
+        .tenant_tx(t, move |tx| {
+            Box::pin(async move {
+                let r = tx.query_typed_one("SELECT current_setting('app.device_dev', true)", &[]).await?;
+                Ok(r.get::<_, Option<String>>(0))
+            })
+        })
+        .await
+        .unwrap();
+    assert!(matches!(leaked.as_deref(), None | Some("")), "{leaked:?}");
+}
+
+#[tokio::test]
 async fn clips_are_recorded() {
     let t = tenant().await;
     let mut pg = rt().await;
