@@ -14,6 +14,7 @@ auth-worker (/api/cam-clips/) ─Service Binding─▶ alc-cam-sd-ingest ─Work
 
 ```
 GET   /api/cam-clips/cameras                 → {"can_edit_destination": bool, "cameras": [{id, name, vpc_binding, rec_username, has_password, recording, device_ids, rec_scanned_until}]}
+                                               運行管理者席の鍵には → {"cameras": [{id, name, device_ids}]} (録画の設定は返さない)
 POST  /api/cam-clips/cameras                 {name, vpc_binding?, rec_username?, rec_password?, device_ids?} → 201 (active = false で作る)
 PATCH /api/cam-clips/cameras/{id}            同じ項目 (省略 = 変えない、vpc_binding: null = 取り込みをやめる、rec_password: "" = 変えない)
 GET   /api/cam-clips/device-candidates?days=30   直近 days 日 (1〜90) にイベントを出した端末と kind ごとの件数 (行ごとに is_dev: 開発端末の行も軸ごとに読んで返す)
@@ -55,9 +56,14 @@ GET   /api/cam-clips/events?camera_id=<uuid>&date=2026-10-23   (JST の 1 日)
   `alc_api.cameras` の `rec_*` 列に持つ (binding 名は `rec_ip` 列に入る。列名は IP のままで migration はしていない)。
   カメラの IP は Cloudflare の VPC Service の側に在り、repo にも DB にも無い
 - 外から直接は届かない (workers_dev / route なし。`ingest/scripts/check-exposure.sh` が CI で検査)。auth-worker の振り分け表
-  `ALC_BINDING_ROUTES` から届き、JWT の検証は auth-worker が済ませる。Worker は付け直された `X-User-Role` が `admin` で
-  なければ 403、`X-Tenant-ID` が無ければ 401・UUID でなければ 400。宛先 (`vpc_binding`) を書くのは `X-User-Developer: 1`
-  (開発者の Google ログイン) のときだけで、それ以外は 403
+  `ALC_BINDING_ROUTES` から届き、JWT の検証は auth-worker が済ませる。Worker が受ける呼び手は 2 つで、それ以外は 403:
+  - 管理者のログイン (画面用の proxy、`X-User-Role: admin`) — 全部の口
+  - 運行管理者席の鍵 (端末用の proxy、`X-Device-Role: device-tenko-manager`) — 遠隔点呼の画面が乗務員の端末からカメラを
+    引くための `GET /cameras` だけ。他の口は 403。auth-worker 側でも席の許可表 (`TENKO_MANAGER_ROUTES`) がこの GET 1 本だけを通す
+
+  `X-User-Role` と `X-Device-Role` が両方あるときも 403 (auth-worker はどちらか片方しか付けない)。テナントはどちらも `X-Tenant-ID`
+  (席の鍵は鍵を登録したテナント) で決まり、読めるのはそのテナントの行だけ。`X-Tenant-ID` が無ければ 401・UUID でなければ 400。
+  宛先 (`vpc_binding`) を書くのは管理者が `X-User-Developer: 1` (開発者の Google ログイン) のときだけで、それ以外は 403
 - **宛先の検査** (`ingest/api/src/dest.rs`): 宛先の IP・ポートは VPC Service の側に固定されるので、Worker が見るのは binding 名
   だけ。登録の時とカメラへ fetch する直前の両方で `^CAM_[A-Z0-9_]{1,60}$` (`CAM_HYPERDRIVE` は除く) に合うことと、その binding が
   この Worker に在ることを確かめる (無ければ登録時 400・切り出し時 500)。URL は `http://camera.vpc.internal/...` (host は

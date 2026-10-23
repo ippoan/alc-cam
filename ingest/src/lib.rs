@@ -6,7 +6,8 @@
 //!                                       └▶ R2 `clips/<tenant>/<camera_id>/<開始>_<終了>.mp4`
 //!
 //! 口 (path は `PUBLIC_PATH_PREFIX` = `/api/cam-clips` を剥がした後。中身は api/ の `cam_ingest_api`):
-//! - `GET /cameras`・`POST /cameras`・`PATCH /cameras/{id}` — カメラの台帳 (alc_api.cameras)。宛先 (`vpc_binding`、
+//! - `GET /cameras`・`POST /cameras`・`PATCH /cameras/{id}` — カメラの台帳 (alc_api.cameras)。運行管理者席の鍵は `GET /cameras` だけ
+//!   (応答は `id`・`name`・`device_ids`)。宛先 (`vpc_binding`、
 //!   VPC Service の binding 名。DB の列は `rec_ip`) を書けるのは `X-User-Developer: 1` (開発者の Google ログイン) のときだけ
 //! - `GET /device-candidates?days=30` — 映している端末を選ぶための、直近のイベントの端末の一覧
 //! - `POST /clips` に `{"camera_id": "...", "from": "...", "to": "..."}` (ISO 8601。時差が無ければ JST)
@@ -16,8 +17,8 @@
 //! cron (wrangler.toml の `[triggers]`、1 時間ごと): 結び付けた端末のイベントの前後 10 秒を自動で切り出す (src/auto.rs)
 //!
 //! 外から直接届く口は持たない (workers_dev / route なし)。auth-worker の振り分け表 (`ALC_BINDING_ROUTES`)
-//! から Service Binding で届き、JWT の検証は auth-worker が済ませて `X-Tenant-ID` / `X-User-Role` /
-//! `X-User-Developer` を付け直す (alc 系の分割 Worker と同じ)。
+//! から Service Binding で届き、JWT の検証は auth-worker が済ませて `X-Tenant-ID` と、画面用の proxy なら
+//! `X-User-Role` / `X-User-Developer`、端末用の proxy (運行管理者席の鍵) なら `X-Device-Role` を付け直す (alc 系の分割 Worker と同じ)。
 //!
 //! カメラの資格情報は応答にもログにも出さない (宛先の IP は VPC Service の側に在り、Worker は持たない)。
 
