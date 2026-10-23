@@ -20,8 +20,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   # SD 録画の切り出しの Worker (ingest/、別 workspace。直下の worker は wasm32 専用、ingest/api は native でも動く)。
-  # デプロイはしない (手で wrangler deploy)。
-  # 先頭の check-exposure.sh は「外から素で届かない・VPC Network と Hyperdrive は本番にだけ」の検査、
+  # デプロイは main への merge で .github/workflows/deploy.yml が本番へ出す (PR では --dry-run)。
+  # 先頭の check-exposure.sh は「外から素で届かない・VPC Network は無く、VPC Service (カメラごと) と Hyperdrive は
+  # 本番 (トップレベル) にだけ」の検査、
   # check-exposure-test.sh はその陰性対照 (wrangler.toml を崩すと exit 1 になること)。
   ingest:
     runs-on: ubuntu-latest
@@ -85,7 +86,7 @@ jobs:
         run: gh release create ${{ github.ref_name }} dist/alc-cam-windows.zip --generate-notes
 
   # green の PR を merge する (ippoan/ci-workflows の reusable。merge は GitHub App の token で行う)。
-  # デプロイはしない (ingest は手で wrangler deploy)。windows も PR で走るので needs に入れる
+  # デプロイはここではしない (ingest は merge 後に deploy.yml が出す)。windows も PR で走るので needs に入れる
   auto-merge:
     name: Auto Merge
     needs: [test, ingest, windows]
