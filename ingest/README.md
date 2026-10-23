@@ -59,3 +59,7 @@ cargo clippy --target wasm32-unknown-unknown -- -D warnings
 ```
 
 手元のファイルだけで切り出しを試すなら `cargo run -p cam-mp4 --example clip -- 出力 from_ms to_ms start_ms:入力…`。
+
+デプロイ: main への merge で CI が本番へ deploy する (`.github/workflows/deploy.yml`。staging は無い。PR では `wrangler deploy --dry-run` だけ)。
+手元の wrangler の OAuth では Secrets Store の binding を付けられないので手では出さない。手動のやり直しは Actions の `Deploy` を `workflow_dispatch` で回す。
+token は org の secret `CLOUDFLARE_API_TOKEN`。deploy の前に `scripts/check-exposure.sh` が落ちれば出ない。
