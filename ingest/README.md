@@ -4,7 +4,7 @@
 Worker `alc-cam-sd-ingest`。再エンコードはしない。
 
 ```
-auth-worker (/api/cam-clips/) ─Service Binding─▶ alc-cam-sd-ingest ─Workers VPC Network (CAM_NET, Tunnel)─▶ カメラ (cameras.rec_ip:80、Digest)
+auth-worker (/api/cam-clips/) ─Service Binding─▶ alc-cam-sd-ingest ─Workers VPC Network (CAM_NET, cf1:network → Tunnel)─▶ カメラ (cameras.rec_ip:80、Digest)
                                      ├▶ Hyperdrive ─▶ alc_api.cameras / cam_camera_devices / cam_clips (テナントの RLS)
                                      ├▶ R2 alc-cam-recordings/<tenant>/<camera_id>/<SD のカメラ名>/<種類>/<YYYYMMDD>/<HH>/<元ファイル>.mp4
                                      └▶ R2 alc-cam-recordings/clips/<tenant>/<camera_id>/<開始>_<終了>.mp4   (切り出した 1 本)
