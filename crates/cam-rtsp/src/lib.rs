@@ -13,7 +13,7 @@ mod url;
 mod clock;
 
 pub use client::{Client, Event};
-pub use url::target;
+pub use url::{parse as parse_url, target, RtspUrl};
 
 /// 受信を続けられない失敗。文言に資格情報・宛先は含めない (ログにそのまま出してよい)。
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -13,6 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
+import { startFakeCgi } from './fake-cgi.mjs';
 import { startFakeRtsp } from './fake-rtsp.mjs';
 import { startSignaling } from './signaling.mjs';
 import { KEEPALIVE_PING } from '../extension/lib/signaling.js';
@@ -22,6 +23,7 @@ const EXT_ID = 'icmmpdjddlphkbokdalofdjpkcgfiggd';
 const HOST_NAME = 'org.ippoan.alc_cam_host';
 const HOST_BIN = path.resolve(here, '../target/debug/alc-cam-host');
 const SIG_PORT = 8791;
+const CGI_PORT = 8780;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const lanIp = Object.values(os.networkInterfaces()).flat().find((a) => a.family === 'IPv4' && !a.internal)?.address;
 
@@ -44,6 +46,9 @@ const hostRunning = () => {
 };
 
 const camera = startFakeRtsp({ host: lanIp, port: 8554 });
+// 首振りの CGI (本物は 80 番。host は ALC_CAM_HTTP_PORT を見る。Chromium から起動される host へ環境変数で渡る)
+const cgi = startFakeCgi({ host: lanIp, port: CGI_PORT });
+process.env.ALC_CAM_HTTP_PORT = String(CGI_PORT);
 const signaling = startSignaling({ port: SIG_PORT, v1Sites: ['v1-site'] });
 
 // native messaging host の登録 (Linux の Chromium は <user-data-dir>/NativeMessagingHosts も見る)
@@ -100,6 +105,44 @@ try {
   results.b = await decodes(b, 15, 'B (途中参加) のデコード');
   results.bothWatching = { aDelta: await stillFlowing(a), camera: { ...camera.stats } };
   await a.screenshot({ path: path.join(here, 'e2e-viewer.png') });
+
+  // 首振り: 映像と同じ PeerConnection のデータチャネル ptz で host へ。A と B が同時に押す
+  results.ptzCaps = await waitFor(() => a.evaluate(() => window.camState.ptz.caps), 10_000, 'ptz の caps');
+  // 押している間は 300ms ごとに再送する (alc-app と同じ)。A が左を押している途中で B が上を押す (最後の命令優先)
+  const hold = async (page, dir, times) => {
+    for (let i = 0; i < times; i++) {
+      await page.evaluate((d) => window.ptzSend({ action: 'move', dir: d }), dir);
+      await sleep(300);
+    }
+  };
+  await hold(a, 'left', 3);
+  await hold(b, 'up', 3);
+  await a.evaluate(() => window.ptzSend({ action: 'stop' })); // A の離し: 後から動かしている B は止めない
+  const upBeforeAStop = cgi.stats.calls.filter((c) => c.startsWith('move=up')).length;
+  await sleep(400);
+  const upAfterAStop = cgi.stats.calls.filter((c) => c.startsWith('move=up')).length;
+  await b.evaluate(() => window.ptzSend({ action: 'stop' }));
+  await sleep(500);
+  const stepsAfterStop = cgi.stats.calls.length;
+  // 離したのに stop が届かない (閉じた等) → 自動で止まる
+  await a.evaluate(() => window.ptzSend({ action: 'move', dir: 'right' }));
+  await sleep(2000);
+  const stepsAfterAuto = cgi.stats.calls.length;
+  await sleep(800);
+  await a.evaluate(() => window.ptzSend({ action: 'preset', preset: 2 }));
+  await a.evaluate(() => window.ptzSend({ action: 'zoom', dir: 'in' }));
+  await a.evaluate(() => window.ptzSend({ action: 'preset', preset: 9 }));
+  await sleep(800);
+  results.ptz = {
+    stats: { ...cgi.stats, calls: [...cgi.stats.calls] },
+    upBeforeAStop,
+    upAfterAStop,
+    stepsAfterStop,
+    stepsAfterAuto,
+    stepsAtEnd: cgi.stats.calls.length,
+    a: await a.evaluate(() => window.camState.ptz.results),
+    b: await b.evaluate(() => window.camState.ptz.results),
+  };
 
   // A が離れても B は流れ続け、カメラは畳まない
   await a.close();
@@ -177,6 +220,7 @@ try {
   await ctx.close();
   await viewerBrowser.close();
   camera.close();
+  cgi.close();
   signaling.close();
 }
 
@@ -197,6 +241,18 @@ const checks = results.error ? {} : {
   // service worker を止めても繋ぎ直して映る
   reconnectsAfterSwStop: results.afterSwRestart.cDelta > 0,
   stoppedByToggle: !!results.stoppedByToggle,
+  // データチャネルで caps が届き、押している間ステップが続き (左も上も)、要求は常に 1 本・Digest が通る
+  ptzCaps: results.ptzCaps?.dirs?.length === 4 && results.ptzCaps.zoom === false,
+  ptzSteps: ['move=left', 'move=up'].every((m) => results.ptz.stats.calls.filter((c) => c.startsWith(m)).length >= 2),
+  ptzOneAtATime: results.ptz.stats.maxInFlight === 1 && results.ptz.stats.unauthorized === 0,
+  // A の stop で B は止まらない・B の stop の後は送らない・stop が無くても 1 秒で止まる
+  ptzStops: results.ptz.upAfterAStop > results.ptz.upBeforeAStop &&
+    results.ptz.stats.calls[results.ptz.stepsAfterStop]?.startsWith('move=right') &&
+    results.ptz.stepsAfterAuto === results.ptz.stats.calls.filter((c) => !c.startsWith('movepresetpoint')).length,
+  ptzPreset: results.ptz.stats.calls.at(-1) === 'movepresetpoint=2',
+  ptzResults: results.ptz.a.some((r) => r.action === 'move' && r.ok) && results.ptz.b.some((r) => r.action === 'move' && r.ok) &&
+    results.ptz.a.some((r) => r.action === 'preset' && r.ok) && results.ptz.a.some((r) => r.action === 'zoom' && r.unsupported) &&
+    results.ptz.a.some((r) => r.action === 'preset' && !r.ok && !r.unsupported),
 };
 console.log(JSON.stringify(checks, null, 1));
 const ok = !results.error && Object.values(checks).every(Boolean);

@@ -1,0 +1,10 @@
+# カメラ (I-O DATA TS-NS320W 系) の首振り。見る人からの命令の間引き (最後の命令優先・自動 stop) と、
+# 管理画面の CGI (HTTP/1.1・Digest) の組み立て。I/O を持たない (host が TCP を持つ)。
+[package]
+name = "cam-ptz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+cam-rtsp = { path = "../cam-rtsp" }

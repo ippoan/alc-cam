@@ -4,6 +4,9 @@
 //!   拡張 ──stdin──▶ config / start / stop / sdp_answer / ice_candidate   (config 以外は viewer_id 付き)
 //!   拡張 ◀─stdout── ready / sdp_offer / camera / peer / log
 //!
+//! 首振りは映像と同じ PeerConnection のデータチャネル `ptz` で見る側から直接届き、カメラの管理画面 (HTTP) へ送る
+//! (`ptz`。拡張は関わらない)。
+//!
 //! 見る人が来るたび (start) その人への WebRTC の offer を返す。カメラの RTSP は最初の 1 人で開き、
 //! 最後の 1 人が離れたら TEARDOWN する (カメラにつき 1 本)。映像は `hub` が見る人ごとに複製して P2P で送る。
 
@@ -11,17 +14,19 @@ mod camera;
 mod hub;
 mod native;
 mod peer;
+mod ptz;
 mod stun;
 
 use std::io;
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use camera::{Cam, Camera};
 use hub::{Frame, Hub, MAX_VIEWERS};
 use native::{In, Out};
 use peer::Viewer;
+use ptz::Ptz;
 
 /// 1 巡で UDP を待つ時間の合計 (見る人で割る)。stdin とカメラのフレームにもすぐ応じるため短く
 const MAX_WAIT: Duration = Duration::from_millis(5);
@@ -59,6 +64,8 @@ fn main() {
     let mut config: Option<(String, String)> = None;
     let mut hub: Hub<Viewer> = Hub::default();
     let mut camera: Option<Camera> = None;
+    let mut ptz: Option<Ptz> = None;
+    let mut ptz_ctl = cam_ptz::Controller::default();
 
     loop {
         // 見る人が居ないあいだは stdin を待つだけ
@@ -72,7 +79,11 @@ fn main() {
         match msg {
             None => {}
             Some(Err(e)) => out(Out::Log { message: format!("読めないメッセージ: {e}") }),
-            Some(Ok(In::Config { rtsp_url, stun })) => config = Some((rtsp_url, stun)),
+            Some(Ok(In::Config { rtsp_url, stun })) => {
+                ptz = Ptz::open(&rtsp_url).map_err(|e| out(Out::Log { message: format!("首振りは使えません: {e}") })).ok();
+                ptz_ctl = cam_ptz::Controller::default();
+                config = Some((rtsp_url, stun));
+            }
             Some(Ok(In::Start { viewer_id })) => match &config {
                 None => out(Out::Log { message: "config より先に start が来ました".into() }),
                 Some(_) if !hub.contains(&viewer_id) && hub.len() >= MAX_VIEWERS => {
@@ -89,6 +100,7 @@ fn main() {
                 },
             },
             Some(Ok(In::Stop { viewer_id })) => {
+                ptz_ctl.forget(&viewer_id);
                 if hub.remove(&viewer_id).is_some() {
                     out(Out::Peer { viewer_id, ok: false, message: "見る人が離れました".into() });
                 }
@@ -144,6 +156,34 @@ fn main() {
             }
             for (viewer_id, _, message) in hub.flush_connected() {
                 out(Out::Peer { viewer_id, ok: false, message });
+            }
+        }
+
+        // 首振り: 見る側の命令 → 交通整理 → カメラへ 1 本ずつ → 結果を命令した人へ
+        let now = Instant::now();
+        let mut replies = Vec::new();
+        for viewer_id in hub.ids() {
+            let Some(v) = hub.get_mut(&viewer_id) else { continue };
+            for text in v.take_ptz() {
+                match ptz::parse(&text) {
+                    None => {}
+                    Some((action, Err(message))) => v.send_ptz(&ptz::reply(&action, false, false, &message)),
+                    Some((action, Ok(_))) if ptz.is_none() => v.send_ptz(&ptz::reply(&action, false, true, "首振りは使えません")),
+                    Some((_, Ok(cmd))) => replies.extend(ptz_ctl.command(&viewer_id, cmd, now)),
+                }
+            }
+        }
+        if let Some(p) = &ptz {
+            while let Ok((job, result)) = p.rx.try_recv() {
+                replies.extend(ptz_ctl.done(&job, result));
+            }
+            if let Some(job) = ptz_ctl.poll(now) {
+                p.send(job);
+            }
+        }
+        for r in replies {
+            if let Some(v) = hub.get_mut(&r.to) {
+                v.send_ptz(&ptz::reply(r.action, r.ok, r.unsupported, &r.message));
             }
         }
 
