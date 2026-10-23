@@ -1,0 +1,13 @@
+# alc-cam: 拠点のカメラを、Chrome 拡張を開いている間だけ WebRTC (P2P) で見る側へ届ける。
+#   host/            native messaging の常駐 alc-cam-host (RTSP → WebRTC、再エンコードなし)
+#   crates/cam-rtsp  RTSP (TCP interleaved) → H.264 Annex B のアクセスユニット (I/O を持たない)
+#   extension/       拠点側の Chrome 拡張 (cf-alc-signaling の /cam-room に device として繋ぎ、host と中継する)
+[workspace]
+members = ["host", "crates/cam-rtsp"]
+resolver = "2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

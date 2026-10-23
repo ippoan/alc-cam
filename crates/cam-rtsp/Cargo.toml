@@ -1,0 +1,11 @@
+# RTSP (TCP interleaved) で H.264 を受け、Annex B のアクセスユニットに組み直す部品。I/O を持たない
+# (バイトを渡すとイベントと「書き出すバイト」が返る)。Worker (VPC の socket) とテスト (メモリ上の偽カメラ) が同じものを使う。
+[package]
+name = "cam-rtsp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+md-5 = { version = "0.10", default-features = false }

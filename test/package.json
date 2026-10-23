@@ -1,0 +1,7 @@
+{
+  "name": "alc-cam-ext-test",
+  "private": true,
+  "type": "module",
+  "scripts": { "e2e": "node e2e.mjs", "server": "node server.mjs" },
+  "devDependencies": { "playwright-core": "1.56.1", "ws": "8.18.3" }
+}

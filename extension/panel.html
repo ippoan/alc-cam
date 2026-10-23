@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>alc-cam 拠点中継</title>
+  <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <header>
+    <h1>alc-cam 拠点中継</h1>
+    <button id="toggle" type="button">開始</button>
+  </header>
+
+  <dl class="status">
+    <dt>host</dt><dd id="st-host">停止</dd>
+    <dt>シグナリング</dt><dd id="st-signal">停止</dd>
+    <dt>見る人</dt><dd id="st-viewer">なし</dd>
+    <dt>カメラ</dt><dd id="st-camera">-</dd>
+    <dt>映像</dt><dd id="st-peer">-</dd>
+  </dl>
+
+  <details id="settings-box">
+    <summary>設定</summary>
+    <form id="settings">
+      <label>シグナリング (cf-alc-signaling)
+        <input name="signalingUrl" type="url" required placeholder="wss://alc-signaling.ippoan.org">
+      </label>
+      <label>拠点 ID
+        <input name="siteId" required pattern="[A-Za-z0-9_\-]+">
+      </label>
+      <label>カメラ RTSP URL (stream2 = 360p 推奨)
+        <input name="rtspUrl" type="password" required autocomplete="off" placeholder="rtsp://user:pass@192.168.1.50/stream2">
+      </label>
+      <label>STUN
+        <input name="stun" required placeholder="stun.l.google.com:19302">
+      </label>
+      <label class="check"><input name="autoStart" type="checkbox"> パネルを開いたら自動で開始</label>
+      <button type="submit">保存</button>
+      <span id="saved" hidden>保存しました</span>
+    </form>
+  </details>
+
+  <script type="module" src="panel.js"></script>
+</body>
+</html>
