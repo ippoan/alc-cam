@@ -2,7 +2,7 @@
 //! native のテスト (単体と tests/ の実 DB) で確かめる。直下の Worker は workers-rs に載せるだけ。
 //!
 //! 1 リクエストの流れ (Worker の `fetch`):
-//! 1. [`caller`] — auth-worker が付け直したヘッダから呼び手を決める (role が admin・tenant が UUID)
+//! 1. [`caller`] — auth-worker が付け直したヘッダから呼び手を決める (管理者のログイン、または運行管理者席の鍵・tenant が UUID)
 //! 2. [`parse`] — method・path・本文から [`Op`] を作る。入力の検査と、宛先 (`vpc_binding`) の形の検査 ([`dest`])、
 //!    「宛先を書けるのは developer だけ」の検査 (POST の分) はここで終わる (DB に触らない)
 //! 3. [`execute`] — カメラの台帳と端末の候補の口を DB で実行する (PATCH の「宛先を変えるか」は今の値と比べる)。
@@ -11,6 +11,7 @@
 //! 宛先 (`vpc_binding`) は VPC Service の binding 名 (宛先の IP は Cloudflare 側に在り、Worker は持たない)。DB では
 //! `cameras.rec_ip` 列に入る ([`pg`])。その binding がこの Worker に在るかは Worker が確かめる ([`Op::vpc_binding`])。
 //! 応答・ログに資格情報を出さない。一覧の応答は `vpc_binding` を返すが、パスワードは返さない。
+//! 運行管理者席の鍵 ([`Role::TenkoManager`]) に許すのは一覧 (`GET /cameras`) だけで、応答は `id`・`name`・`device_ids` に絞る。
 
 pub mod auto;
 pub mod dest;
@@ -62,21 +63,38 @@ pub struct Reply {
     pub body: Value,
 }
 
+/// 呼び手の種類
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// 管理者のログイン (auth-worker の画面用の proxy が付ける `X-User-Role: admin`)。全部の口を使える
+    Admin,
+    /// 運行管理者席の鍵 (auth-worker の端末用の proxy が付ける `X-Device-Role: device-tenko-manager`)。
+    /// 遠隔点呼の画面が乗務員の端末からカメラを引くための一覧 (`GET /cameras`) だけを使える
+    TenkoManager,
+}
+
+/// 運行管理者席の鍵の role (auth-worker `DEVICE_ROLE_TENKO_MANAGER`)
+pub const TENKO_MANAGER_DEVICE_ROLE: &str = "device-tenko-manager";
+
 /// auth-worker が付け直したヘッダから決めた呼び手
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Caller {
     pub tenant: Uuid,
-    /// 開発者の Google ログイン (`X-User-Developer: 1`)。宛先 (`vpc_binding`) を書けるのはこのときだけ
+    /// 開発者の Google ログイン (`X-User-Developer: 1`)。宛先 (`vpc_binding`) を書けるのはこのときだけ (管理者に限る)
     pub developer: bool,
+    pub role: Role,
 }
 
 /// ヘッダから呼び手を決める。`header` は名前で引いて、無ければ `None`。
-/// - `X-User-Role` が `admin` でない → 403
+/// - `X-User-Role: admin` だけ → 管理者。`X-Device-Role: device-tenko-manager` だけ → 運行管理者席。
+///   それ以外 (どちらも無い・他の値・両方ある) → 403。auth-worker はどちらか片方しか付けないので、両方は拒否側に倒す
 /// - `X-Tenant-ID` が無い (空を含む) → 401、UUID でない → 400
 pub fn caller(header: impl Fn(&str) -> Option<String>) -> Result<Caller, ApiError> {
-    if header("X-User-Role").as_deref() != Some("admin") {
-        return Err(ApiError::new(403, "管理者だけが使えます"));
-    }
+    let role = match (header("X-User-Role"), header("X-Device-Role")) {
+        (Some(u), None) if u == "admin" => Role::Admin,
+        (None, Some(d)) if d == TENKO_MANAGER_DEVICE_ROLE => Role::TenkoManager,
+        _ => return Err(ApiError::new(403, "管理者だけが使えます")),
+    };
     let tenant = header("X-Tenant-ID")
         .filter(|t| !t.is_empty())
         .ok_or_else(|| ApiError::new(401, "テナントがありません"))?;
@@ -84,7 +102,9 @@ pub fn caller(header: impl Fn(&str) -> Option<String>) -> Result<Caller, ApiErro
         .map_err(|_| ApiError::new(400, "テナントの形が正しくありません"))?;
     Ok(Caller {
         tenant,
-        developer: header("X-User-Developer").as_deref() == Some("1"),
+        // 端末の経路で X-User-Developer は付かないが、付いていても席の鍵には宛先を書かせない
+        developer: role == Role::Admin && header("X-User-Developer").as_deref() == Some("1"),
+        role,
     })
 }
 
@@ -363,7 +383,8 @@ fn clip_key(rest: &str, caller: &Caller) -> Result<String, ApiError> {
     Ok(format!("clips/{rest}"))
 }
 
-/// method・path (`PUBLIC_PATH_PREFIX` を剥がした後)・query (`?` の後)・本文から仕事を決める。DB には触らない
+/// method・path (`PUBLIC_PATH_PREFIX` を剥がした後)・query (`?` の後)・本文から仕事を決める。DB には触らない。
+/// 運行管理者席の鍵は `GET /cameras` 以外を 403 にする (無い口も 404 でなく 403)
 pub fn parse(
     method: &str,
     path: &str,
@@ -372,6 +393,9 @@ pub fn parse(
     caller: &Caller,
     max_clip_ms: i64,
 ) -> Result<Op, ApiError> {
+    if caller.role == Role::TenkoManager && (method, path) != ("GET", "/cameras") {
+        return Err(ApiError::new(403, "運行管理者席はカメラの一覧だけを使えます"));
+    }
     match (method, path) {
         ("GET", "/cameras") => Ok(Op::ListCameras),
         ("POST", "/cameras") => Ok(Op::CreateCamera(camera_input(body, caller)?)),
@@ -430,6 +454,15 @@ fn camera_json(c: &CameraRow) -> Value {
     })
 }
 
+/// 運行管理者席への一覧の 1 件。画面がカメラを引くのに要る項目だけで、録画の設定 (宛先・資格情報・取り込みの進み) は返さない
+fn camera_json_for_tenko_manager(c: &CameraRow) -> Value {
+    json!({
+        "id": c.id,
+        "name": c.name,
+        "device_ids": c.device_ids,
+    })
+}
+
 fn db_error(e: &tokio_postgres::Error) -> ApiError {
     if pg::is_vpc_binding_conflict(e) {
         return ApiError::new(409, "その VPC binding は既に使われています");
@@ -464,10 +497,11 @@ pub async fn execute(
             let cameras = pg::list_cameras(pg, tenant, None)
                 .await
                 .map_err(|e| db_error(&e))?;
-            Ok(Reply {
-                status: 200,
-                body: json!({ "can_edit_destination": caller.developer, "cameras": cameras.iter().map(camera_json).collect::<Vec<_>>() }),
-            })
+            let body = match caller.role {
+                Role::Admin => json!({ "can_edit_destination": caller.developer, "cameras": cameras.iter().map(camera_json).collect::<Vec<_>>() }),
+                Role::TenkoManager => json!({ "cameras": cameras.iter().map(camera_json_for_tenko_manager).collect::<Vec<_>>() }),
+            };
+            Ok(Reply { status: 200, body })
         }
         Op::CreateCamera(c) => {
             let new = NewCamera {
@@ -603,6 +637,15 @@ mod tests {
         Caller {
             tenant: Uuid::parse_str(TENANT).unwrap(),
             developer,
+            role: Role::Admin,
+        }
+    }
+
+    fn tenko_manager() -> Caller {
+        Caller {
+            tenant: Uuid::parse_str(TENANT).unwrap(),
+            developer: false,
+            role: Role::TenkoManager,
         }
     }
 
@@ -697,6 +740,130 @@ mod tests {
         ]))
         .unwrap();
         assert!(!c.developer);
+    }
+
+    #[test]
+    fn caller_accepts_tenko_manager_device_role() {
+        let c = caller(headers(&[
+            ("X-Device-Role", "device-tenko-manager"),
+            ("X-Tenant-ID", TENANT),
+        ]))
+        .unwrap();
+        assert_eq!(c, tenko_manager());
+        // 席の鍵には宛先を書かせない (X-User-Developer が付いていても developer にしない)
+        let c = caller(headers(&[
+            ("X-Device-Role", "device-tenko-manager"),
+            ("X-Tenant-ID", TENANT),
+            ("X-User-Developer", "1"),
+        ]))
+        .unwrap();
+        assert_eq!(c, tenko_manager());
+        // テナントの検査は管理者と同じ
+        assert_eq!(
+            caller(headers(&[("X-Device-Role", "device-tenko-manager")]))
+                .unwrap_err()
+                .status,
+            401
+        );
+        assert_eq!(
+            caller(headers(&[
+                ("X-Device-Role", "device-tenko-manager"),
+                ("X-Tenant-ID", "not-a-uuid")
+            ]))
+            .unwrap_err()
+            .status,
+            400
+        );
+    }
+
+    #[test]
+    fn caller_rejects_other_or_ambiguous_roles() {
+        for pairs in [
+            // 席の鍵以外の端末の鍵
+            &[("X-Device-Role", "device-kiosk"), ("X-Tenant-ID", TENANT)][..],
+            &[("X-Device-Role", "device-bp-station"), ("X-Tenant-ID", TENANT)][..],
+            &[("X-Device-Role", "Device-Tenko-Manager"), ("X-Tenant-ID", TENANT)][..],
+            &[("X-Device-Role", ""), ("X-Tenant-ID", TENANT)][..],
+            // 両方ある (auth-worker はどちらか片方しか付けない) — 管理者を名乗っても拒否
+            &[
+                ("X-User-Role", "admin"),
+                ("X-Device-Role", "device-tenko-manager"),
+                ("X-Tenant-ID", TENANT),
+            ][..],
+            &[
+                ("X-User-Role", "admin"),
+                ("X-Device-Role", "device-kiosk"),
+                ("X-Tenant-ID", TENANT),
+            ][..],
+            &[
+                ("X-User-Role", "viewer"),
+                ("X-Device-Role", "device-tenko-manager"),
+                ("X-Tenant-ID", TENANT),
+            ][..],
+            // 画面のログインの manager は無い (users.role は admin / viewer / payroll)
+            &[("X-User-Role", "manager"), ("X-Tenant-ID", TENANT)][..],
+        ] {
+            assert_eq!(caller(headers(pairs)).unwrap_err().status, 403, "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn tenko_manager_can_only_list_cameras() {
+        let m = tenko_manager();
+        assert!(matches!(
+            parse("GET", "/cameras", "", "", &m, 60_000),
+            Ok(Op::ListCameras)
+        ));
+        let id = "00000000-0000-4000-8000-0000000000aa";
+        let clip = format!("/clips/{TENANT}/{id}/20261023T125800_20261023T125930.mp4");
+        let patch = format!("/cameras/{id}");
+        let events = format!("camera_id={id}&date=2026-10-23");
+        let clip_body = format!(r#"{{"camera_id":"{id}","from":"2026-10-23T12:58:00","to":"2026-10-23T12:59:00"}}"#);
+        for (method, path, query, body) in [
+            ("POST", "/cameras", "", r#"{"name":"入口"}"#),
+            ("PATCH", patch.as_str(), "", r#"{"name":"入口"}"#),
+            ("GET", "/device-candidates", "", ""),
+            ("POST", "/clips", "", clip_body.as_str()),
+            ("GET", clip.as_str(), "", ""),
+            ("GET", "/events", events.as_str(), ""),
+            ("GET", "/cameras/", "", ""),
+            ("GET", patch.as_str(), "", ""),
+            ("DELETE", "/cameras", "", ""),
+            ("GET", "/nothing", "", ""),
+        ] {
+            assert_eq!(status(parse(method, path, query, body, &m, 60_000)), 403, "{method} {path}");
+        }
+        // 管理者は今までどおり (同じ口が通る)
+        assert!(matches!(
+            parse("GET", "/device-candidates", "", "", &admin(false), 60_000),
+            Ok(Op::DeviceCandidates { .. })
+        ));
+    }
+
+    #[test]
+    fn tenko_manager_camera_json_has_no_recording_settings() {
+        let row = CameraRow {
+            id: Uuid::parse_str("00000000-0000-4000-8000-0000000000aa").unwrap(),
+            name: "入口".to_owned(),
+            vpc_binding: Some("CAM_TS_NS320W_55".to_owned()),
+            rec_username: Some("viewer".to_owned()),
+            has_password: true,
+            device_ids: vec!["dev-1".to_owned(), "dev-2".to_owned()],
+            rec_scanned_until_ms: Some(1_761_191_880_000),
+        };
+        assert_eq!(
+            camera_json_for_tenko_manager(&row),
+            json!({
+                "id": "00000000-0000-4000-8000-0000000000aa",
+                "name": "入口",
+                "device_ids": ["dev-1", "dev-2"],
+            })
+        );
+        // 管理者の 1 件は今までどおり録画の設定まで返す
+        let full = camera_json(&row);
+        for k in ["vpc_binding", "rec_username", "has_password", "recording", "rec_scanned_until"] {
+            assert!(full.get(k).is_some(), "{k}");
+        }
     }
 
     #[test]

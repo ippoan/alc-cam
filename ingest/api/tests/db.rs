@@ -11,7 +11,7 @@
 
 use alc_worker_db::PgClient;
 use cam_ingest_api::pg::{self, ClipRecord};
-use cam_ingest_api::{execute, parse, Caller};
+use cam_ingest_api::{execute, parse, Caller, Role};
 use serde_json::{json, Value};
 use tokio::sync::OnceCell;
 use tokio_postgres::{Client, Config, NoTls};
@@ -172,7 +172,20 @@ fn random_binding() -> String {
 }
 
 fn caller(tenant: Uuid, developer: bool) -> Caller {
-    Caller { tenant, developer }
+    Caller {
+        tenant,
+        developer,
+        role: Role::Admin,
+    }
+}
+
+/// 運行管理者席の鍵 (auth-worker の端末用の proxy から届く呼び手)
+fn tenko_manager(tenant: Uuid) -> Caller {
+    Caller {
+        tenant,
+        developer: false,
+        role: Role::TenkoManager,
+    }
 }
 
 /// 口を通す (parse → execute)。応答の (status, body)
@@ -401,6 +414,54 @@ async fn cameras_crud_and_devices() {
     )
     .await;
     assert_eq!(s, 404);
+}
+
+#[tokio::test]
+async fn tenko_manager_lists_own_tenant_cameras_without_recording_settings() {
+    let a = tenant().await;
+    let b = tenant().await;
+    let mut pg = rt().await;
+    let (s, cam) = call(
+        &mut pg,
+        &caller(a, true),
+        "POST",
+        "/cameras",
+        "",
+        json!({"name": "A の入口", "vpc_binding": random_binding(), "rec_username": "u", "rec_password": "p", "device_ids": ["dev-b", "dev-a"]}),
+    )
+    .await;
+    assert_eq!(s, 201, "{cam}");
+    let id = cam["id"].clone();
+
+    // 席の鍵の一覧は id・name・device_ids だけ (録画の設定と can_edit_destination は返さない)
+    let (s, list) = call(&mut pg, &tenko_manager(a), "GET", "/cameras", "", Value::Null).await;
+    assert_eq!(s, 200, "{list}");
+    assert_eq!(list.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["cameras"]);
+    let mine: Vec<&Value> = list["cameras"].as_array().unwrap().iter().filter(|c| c["id"] == id).collect();
+    assert_eq!(
+        mine,
+        vec![&json!({"id": id, "name": "A の入口", "device_ids": ["dev-a", "dev-b"]})]
+    );
+    for c in list["cameras"].as_array().unwrap() {
+        assert_eq!(c.as_object().unwrap().len(), 3, "{c}");
+    }
+
+    // 別のテナントの席の鍵からは見えない
+    let (s, other) = call(&mut pg, &tenko_manager(b), "GET", "/cameras", "", Value::Null).await;
+    assert_eq!(s, 200);
+    assert_eq!(other, json!({"cameras": []}));
+
+    // 一覧以外は 403 で、何も変わらない
+    let (s, _) = call(&mut pg, &tenko_manager(a), "PATCH", &format!("/cameras/{}", id.as_str().unwrap()), "", json!({"name": "x"})).await;
+    assert_eq!(s, 403);
+    let (s, _) = call(&mut pg, &tenko_manager(a), "POST", "/cameras", "", json!({"name": "x"})).await;
+    assert_eq!(s, 403);
+    let (s, _) = call(&mut pg, &tenko_manager(a), "GET", "/device-candidates", "", Value::Null).await;
+    assert_eq!(s, 403);
+    let (_, admin_list) = call(&mut pg, &caller(a, false), "GET", "/cameras", "", Value::Null).await;
+    assert_eq!(admin_list["cameras"].as_array().unwrap().len(), 1);
+    assert_eq!(admin_list["cameras"][0]["name"], "A の入口");
+    assert_eq!(admin_list["cameras"][0]["has_password"], true);
 }
 
 #[tokio::test]
