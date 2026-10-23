@@ -19,6 +19,21 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # SD 録画の切り出しの Worker (ingest/、wasm32 専用の別 workspace)。デプロイはしない (手で wrangler deploy)
+  ingest:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ingest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ingest
+      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo install -q worker-build@0.8.7 && worker-build --release
+
   windows:
     runs-on: windows-latest
     steps:

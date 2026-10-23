@@ -1,0 +1,44 @@
+# カメラの SD 録画から、指定した時間帯を 1 本の MP4 にして R2 に置く Worker (src/lib.rs)。
+# ★ 外から直接届く口は持たない: workers_dev / preview_urls を false、route を書かない。
+#   呼び手は auth-worker の Service Binding だけ (振り分け表 ALC_BINDING_ROUTES の /api/cam-clips/)。
+name = "alc-cam-sd-ingest"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+account_id = "24b45709d060d957340180e995f0d373"
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "cargo install -q worker-build@0.8.7 && worker-build --release"
+
+# 切り出しは本体を wasm で 16MiB ずつ R2 のマルチパートへ写すので、長い時間帯では CPU を使う (1 時間 ≈ 1.5GB)
+[limits]
+cpu_ms = 300000
+
+[observability]
+enabled = true
+
+# CAM_AUTH (カメラの管理画面の user:pass) は secret。`wrangler secret put CAM_AUTH` で入れる (値は repo に無い)
+[vars]
+CAM_NAME = "TS-NS320W-55"
+CAM_KINDS = "Schedule"
+CAM_VPC_BINDING = "CAM_HTTP"
+# 一度に切り出せる長さの上限 (秒)
+MAX_CLIP_SECS = "7200"
+# auth-worker から届く path の頭
+PUBLIC_PATH_PREFIX = "/api/cam-clips"
+# カメラの持ち主のテナント。auth-worker が付け直す X-Tenant-ID と比べる (空なら確かめない)
+CAM_TENANT_ID = ""
+
+[[r2_buckets]]
+binding = "RECORDINGS"
+bucket_name = "alc-cam-recordings"
+# `wrangler dev --remote` で使う別バケット。素の `wrangler dev` では R2 は手元の模擬 (remote を付けない) なので、
+# 本番の録画に確認用の書き込みが混ざらない (VPC だけは remote = true で実物のカメラに届く)
+preview_bucket_name = "alc-cam-recordings-preview"
+
+# カメラ (TS-NS320W-55) の管理画面 (HTTP 80)。宛先は VPC Service 側に閉じる (ohishi-data の Tunnel 経由)
+[[vpc_services]]
+binding = "CAM_HTTP"
+service_id = "01a166ef-0929-7330-af52-3da25f41c42e"
+remote = true

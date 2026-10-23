@@ -5,7 +5,7 @@
 //! `components/rtsp_client` (C 実装) と同じ: DESCRIBE → SETUP (interleaved=0-1) → PLAY。
 
 mod client;
-mod digest;
+pub mod digest;
 pub mod h264;
 mod response;
 mod sdp;

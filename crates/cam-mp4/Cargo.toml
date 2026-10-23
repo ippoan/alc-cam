@@ -1,0 +1,10 @@
+# MP4 を再エンコードせずに切ってつなぐ。I/O を持たない: moov (目次) のバイト列を受け取り、
+# 出力の頭 (ftyp + moov + mdat ヘッダ) と「元ファイルのどこを写すか」の一覧を返す。
+# 本体の写しは呼び手 (Worker なら R2 の範囲読み出し) が行う。
+[package]
+name = "cam-mp4"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
