@@ -166,10 +166,9 @@ async fn tenant() -> Uuid {
     id
 }
 
-/// テストごとに重ならない私設の宛先 (同じ DB を何度流しても部分 unique に当たらないよう乱数)
-fn random_ip() -> String {
-    let b = Uuid::new_v4().into_bytes();
-    format!("10.{}.{}.{}", b[0], b[1], b[2].max(1))
+/// テストごとに重ならない宛先 (VPC Service の binding 名。同じ DB を何度流しても部分 unique に当たらないよう乱数)
+fn random_binding() -> String {
+    format!("CAM_TEST_{}", Uuid::new_v4().simple().to_string().to_uppercase())
 }
 
 fn caller(tenant: Uuid, developer: bool) -> Caller {
@@ -241,11 +240,17 @@ async fn cameras_crud_and_devices() {
         .get(0);
     assert!(!active, "ingest が作るカメラは ONVIF の死活監視の対象外");
 
+    // developer でなければ宛先 (vpc_binding) 付きでは作れない (403 で、行は増えない)
+    let (s, _) = call(&mut pg, &admin_only, "POST", "/cameras", "", json!({"name": "勝手に", "vpc_binding": random_binding()})).await;
+    assert_eq!(s, 403);
+    let (_, list) = call(&mut pg, &admin_only, "GET", "/cameras", "", Value::Null).await;
+    assert!(list["cameras"].as_array().unwrap().iter().all(|c| c["name"] != "勝手に"));
+
     // developer は宛先・資格情報付きで作れる。パスワードは返さず、暗号化して保存する
-    let ip = random_ip();
-    let (s, cam) = call(&mut pg, &dev, "POST", "/cameras", "", json!({"name": "事務所", "rec_ip": ip, "rec_username": "admin", "rec_password": "pw-1", "device_ids": ["dev-c"]})).await;
+    let binding = random_binding();
+    let (s, cam) = call(&mut pg, &dev, "POST", "/cameras", "", json!({"name": "事務所", "vpc_binding": binding, "rec_username": "admin", "rec_password": "pw-1", "device_ids": ["dev-c"]})).await;
     assert_eq!(s, 201, "{cam}");
-    assert_eq!(cam["rec_ip"], json!(ip));
+    assert_eq!(cam["vpc_binding"], json!(binding));
     assert_eq!(cam["recording"], true);
     assert_eq!(cam["has_password"], true);
     assert!(cam.get("rec_password").is_none() && cam.get("rec_password_encrypted").is_none());
@@ -257,7 +262,7 @@ async fn cameras_crud_and_devices() {
         alc_worker_crypto::secret::decrypt_secret(&enc, KEY).unwrap(),
         "pw-1"
     );
-    assert_eq!(src.rec_ip.as_deref(), Some(ip.as_str()));
+    assert_eq!(src.vpc_binding.as_deref(), Some(binding.as_str()));
 
     // 一覧: テナントの全行 (既存の ONVIF の行を含む)。can_edit_destination は developer のときだけ
     let (s, list) = call(&mut pg, &admin_only, "GET", "/cameras", "", Value::Null).await;
@@ -276,7 +281,7 @@ async fn cameras_crud_and_devices() {
         .iter()
         .find(|c| c["id"] == json!(onvif))
         .unwrap();
-    assert_eq!(onvif_json["rec_ip"], Value::Null);
+    assert_eq!(onvif_json["vpc_binding"], Value::Null);
     assert_eq!(onvif_json["device_ids"], json!([]));
     assert_eq!(
         call(&mut pg, &dev, "GET", "/cameras", "", Value::Null)
@@ -293,7 +298,7 @@ async fn cameras_crud_and_devices() {
         "PATCH",
         &path,
         "",
-        json!({"name": "事務所 2", "rec_ip": ip, "device_ids": ["dev-x", "dev-y"]}),
+        json!({"name": "事務所 2", "vpc_binding": binding, "device_ids": ["dev-x", "dev-y"]}),
     )
     .await;
     assert_eq!(s, 200, "{after}");
@@ -306,7 +311,7 @@ async fn cameras_crud_and_devices() {
         "PATCH",
         &path,
         "",
-        json!({"name": "変わらない", "rec_ip": random_ip()}),
+        json!({"name": "変わらない", "vpc_binding": random_binding()}),
     )
     .await;
     assert_eq!(s, 403);
@@ -316,7 +321,7 @@ async fn cameras_crud_and_devices() {
         "PATCH",
         &path,
         "",
-        json!({"rec_ip": null}),
+        json!({"vpc_binding": null}),
     )
     .await;
     assert_eq!(s, 403);
@@ -325,8 +330,8 @@ async fn cameras_crud_and_devices() {
         .unwrap()
         .remove(0);
     assert_eq!(
-        (now.name.as_str(), now.rec_ip.as_deref()),
-        ("事務所 2", Some(ip.as_str()))
+        (now.name.as_str(), now.vpc_binding.as_deref()),
+        ("事務所 2", Some(binding.as_str()))
     );
 
     // パスワード: "" は変えない、値は変える、null は消す
@@ -380,8 +385,8 @@ async fn cameras_crud_and_devices() {
     assert_eq!(c["has_password"], false);
     assert_eq!(c["device_ids"], json!([]));
 
-    // developer は取り込みをやめられる (rec_ip: null)
-    let (s, c) = call(&mut pg, &dev, "PATCH", &path, "", json!({"rec_ip": null})).await;
+    // developer は取り込みをやめられる (vpc_binding: null)
+    let (s, c) = call(&mut pg, &dev, "PATCH", &path, "", json!({"vpc_binding": null})).await;
     assert_eq!(s, 200);
     assert_eq!(c["recording"], false);
 
@@ -409,7 +414,7 @@ async fn other_tenant_rows_are_invisible() {
         "POST",
         "/cameras",
         "",
-        json!({"name": "A のカメラ", "rec_ip": random_ip(), "device_ids": ["dev-a"]}),
+        json!({"name": "A のカメラ", "vpc_binding": random_binding(), "device_ids": ["dev-a"]}),
     )
     .await;
     assert_eq!(s, 201);
@@ -492,14 +497,14 @@ async fn same_destination_in_another_tenant_is_409() {
     let a = tenant().await;
     let b = tenant().await;
     let mut pg = rt().await;
-    let ip = random_ip();
+    let binding = random_binding();
     let (s, _) = call(
         &mut pg,
         &caller(a, true),
         "POST",
         "/cameras",
         "",
-        json!({"name": "A", "rec_ip": ip}),
+        json!({"name": "A", "vpc_binding": binding}),
     )
     .await;
     assert_eq!(s, 201);
@@ -509,14 +514,14 @@ async fn same_destination_in_another_tenant_is_409() {
         "POST",
         "/cameras",
         "",
-        json!({"name": "B", "rec_ip": ip}),
+        json!({"name": "B", "vpc_binding": binding}),
     )
     .await;
     assert_eq!(s, 409);
     // 他テナントの情報 (宛先・名前・id) を返さない
     let text = body.to_string();
     assert!(
-        !text.contains(&ip) && !text.contains(&a.to_string()),
+        !text.contains(&binding) && !text.contains(&a.to_string()),
         "{text}"
     );
     // PATCH で同じ宛先にしても 409
@@ -535,7 +540,7 @@ async fn same_destination_in_another_tenant_is_409() {
         "PATCH",
         &format!("/cameras/{}", cb["id"].as_str().unwrap()),
         "",
-        json!({"rec_ip": ip}),
+        json!({"vpc_binding": binding}),
     )
     .await;
     assert_eq!(s, 409);
@@ -642,7 +647,7 @@ async fn clips_are_recorded() {
         "POST",
         "/cameras",
         "",
-        json!({"name": "C", "rec_ip": random_ip()}),
+        json!({"name": "C", "vpc_binding": random_binding()}),
     )
     .await;
     let id = Uuid::parse_str(cam["id"].as_str().unwrap()).unwrap();

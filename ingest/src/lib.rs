@@ -1,13 +1,13 @@
 //! カメラの SD 録画から、指定した時間帯を 1 本の MP4 にして R2 に置く Worker。
 //!
-//!   auth-worker ─Service Binding─▶ この Worker ─VPC Network (CAM_NET, Tunnel)─▶ カメラ (cameras.rec_ip)
+//!   auth-worker ─Service Binding─▶ この Worker ─VPC Service (カメラごとの CAM_*, Tunnel)─▶ カメラ
 //!                                       │ 重なる録画 (約 4 分ごと) を R2 にそろえ、moov を読み、
 //!                                       │ 範囲を切ってつなぐ (再エンコードなし。crates/cam-mp4)
 //!                                       └▶ R2 `clips/<tenant>/<camera_id>/<開始>_<終了>.mp4`
 //!
 //! 口 (path は `PUBLIC_PATH_PREFIX` = `/api/cam-clips` を剥がした後。中身は api/ の `cam_ingest_api`):
-//! - `GET /cameras`・`POST /cameras`・`PATCH /cameras/{id}` — カメラの台帳 (alc_api.cameras)。宛先 (`rec_ip`) を書けるのは
-//!   `X-User-Developer: 1` (開発者の Google ログイン) のときだけ
+//! - `GET /cameras`・`POST /cameras`・`PATCH /cameras/{id}` — カメラの台帳 (alc_api.cameras)。宛先 (`vpc_binding`、
+//!   VPC Service の binding 名。DB の列は `rec_ip`) を書けるのは `X-User-Developer: 1` (開発者の Google ログイン) のときだけ
 //! - `GET /device-candidates?days=30` — 映している端末を選ぶための、直近のイベントの端末の一覧
 //! - `POST /clips` に `{"camera_id": "...", "from": "...", "to": "..."}` (ISO 8601。時差が無ければ JST)
 //! - `GET /clips/<tenant>/<camera_id>/<開始>_<終了>.mp4` で取り出す (Range 対応 = シークできる)
@@ -16,7 +16,7 @@
 //! から Service Binding で届き、JWT の検証は auth-worker が済ませて `X-Tenant-ID` / `X-User-Role` /
 //! `X-User-Developer` を付け直す (alc 系の分割 Worker と同じ)。
 //!
-//! カメラの宛先・資格情報は応答にもログにも出さない (切り出しの失敗の文からも消す)。
+//! カメラの資格情報は応答にもログにも出さない (宛先の IP は VPC Service の側に在り、Worker は持たない)。
 
 // worker 本体は wasm32 専用。native の `cargo test` / `clippy` (workspace) では空の crate にして、api/ だけを検査させる
 #![cfg(target_arch = "wasm32")]
@@ -26,9 +26,9 @@ mod clip;
 mod db;
 mod raw;
 
-use cam_ingest_api::dest::Dest;
+use cam_ingest_api::dest::VpcBinding;
 use cam_ingest_api::pg::{self, ClipRecord};
-use cam_ingest_api::{clip_r2_key, raw_r2_prefix, redact, ApiError, Caller, Op, Reply};
+use cam_ingest_api::{clip_r2_key, raw_r2_prefix, ApiError, Caller, Op, Reply};
 use cam_sd::jst_iso;
 use camera::Camera;
 use uuid::Uuid;
@@ -91,8 +91,11 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
 }
 
-/// 台帳と端末の候補の口 (鍵は DB の transaction の外で先に引く)
+/// 台帳と端末の候補の口 (鍵は DB の transaction の外で先に引く)。書く binding がこの Worker に無ければ 400
 async fn run(env: &Env, caller: &Caller, op: Op) -> std::result::Result<Reply, ApiError> {
+    if op.vpc_binding().is_some_and(|b| !camera::has_binding(env, b)) {
+        return Err(ApiError::new(400, "その VPC binding はこの Worker に無い (wrangler.toml の [[vpc_services]] に足して deploy してください)"));
+    }
     let key = if op.needs_key() { Some(sso_key(env).await?) } else { None };
     let mut pg = db::connect(env).await?;
     cam_ingest_api::execute(op, caller, &mut pg, key.as_deref()).await
@@ -102,7 +105,7 @@ fn db_error(e: &tokio_postgres::Error) -> ApiError {
     ApiError::new(500, format!("DB の処理に失敗しました ({})", alc_worker_db::kind(e)))
 }
 
-/// 手動の切り出し。カメラの宛先・資格情報は DB から読み、宛先は fetch の直前にもう一度検査する。
+/// 手動の切り出し。カメラの binding 名・資格情報は DB から読み、binding 名は fetch の直前にもう一度検査する。
 /// 結果 (ready / failed) は cam_clips に残す (カメラ・R2 の await は transaction の外)
 async fn create_clip(env: &Env, caller: &Caller, camera_id: Uuid, from_ms: i64, to_ms: i64) -> std::result::Result<Reply, ApiError> {
     let tenant = caller.tenant;
@@ -110,14 +113,19 @@ async fn create_clip(env: &Env, caller: &Caller, camera_id: Uuid, from_ms: i64, 
     let Some(src) = pg::clip_source(&mut pg, tenant, camera_id).await.map_err(|e| db_error(&e))? else {
         return Err(ApiError::new(404, "そのカメラはありません"));
     };
-    let Some(rec_ip) = src.rec_ip else {
+    let Some(name) = src.vpc_binding else {
         return Err(ApiError::new(409, "このカメラは録画を取り込む設定になっていません"));
     };
-    // 登録の時に検査した値でも、ここでもう一度通す。落ちたら fetch しない (宛先は応答にもログにも出さない)
-    let Some(dest) = Dest::parse(&rec_ip) else {
-        console_error!("alc-cam: camera {camera_id} has an invalid destination");
-        return Err(ApiError::new(500, "カメラの宛先の設定が正しくありません"));
+    // 登録の時に検査した値でも、ここでもう一度通す。落ちたら fetch しない
+    let Some(binding) = VpcBinding::parse(&name) else {
+        console_error!("alc-cam: camera {camera_id} has an invalid vpc binding");
+        return Err(ApiError::new(500, "カメラの VPC binding の設定が正しくありません"));
     };
+    // 登録の後に wrangler.toml から binding を外した場合
+    if !camera::has_binding(env, binding.as_str()) {
+        console_error!("alc-cam: camera {camera_id}: vpc binding {} is not bound", binding.as_str());
+        return Err(ApiError::new(500, "その VPC binding はこの Worker に無い"));
+    }
     let (Some(user), Some(enc)) = (src.rec_username, src.rec_password_encrypted) else {
         return Err(ApiError::new(409, "カメラのユーザー名・パスワードが設定されていません"));
     };
@@ -129,14 +137,14 @@ async fn create_clip(env: &Env, caller: &Caller, camera_id: Uuid, from_ms: i64, 
 
     let r2_key = clip_r2_key(tenant, camera_id, from_ms, to_ms);
     let made: std::result::Result<clip::Made, clip::Fail> = async {
-        let mut cam = Camera::new(env, &dest, user, pass)?;
+        let mut cam = Camera::new(env, &binding, user, pass)?;
         let bucket = env.bucket("RECORDINGS")?;
         let sd_root = cam.sd_root().await?;
         let target = clip::Target { sd_root, key: r2_key.clone(), raw_prefix: raw_r2_prefix(tenant, camera_id) };
         clip::make(&target, &mut cam, &bucket, from_ms, to_ms).await
     }
     .await;
-    let made = made.map_err(|clip::Fail(status, message)| ApiError::new(status, redact(&message, &dest)));
+    let made = made.map_err(|clip::Fail(status, message)| ApiError::new(status, message));
 
     let record = match &made {
         Ok(m) => ClipRecord { camera_id, from_ms, to_ms, r2_key: r2_key.clone(), size_bytes: i64::try_from(m.size).ok(), status: "ready", error: None },

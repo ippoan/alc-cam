@@ -3,12 +3,14 @@
 //!
 //! 1 リクエストの流れ (Worker の `fetch`):
 //! 1. [`caller`] — auth-worker が付け直したヘッダから呼び手を決める (role が admin・tenant が UUID)
-//! 2. [`parse`] — method・path・本文から [`Op`] を作る。入力の検査と、宛先 (`rec_ip`) の検査 ([`dest`])、
+//! 2. [`parse`] — method・path・本文から [`Op`] を作る。入力の検査と、宛先 (`vpc_binding`) の形の検査 ([`dest`])、
 //!    「宛先を書けるのは developer だけ」の検査 (POST の分) はここで終わる (DB に触らない)
 //! 3. [`execute`] — カメラの台帳と端末の候補の口を DB で実行する (PATCH の「宛先を変えるか」は今の値と比べる)。
 //!    切り出し (`CreateClip` / `GetClip`) は Worker が [`pg`] の関数とカメラ・R2 を組み合わせて行う
 //!
-//! 応答・ログに宛先 (`rec_ip`)・資格情報を出さない。一覧の応答は `rec_ip` を返すが、パスワードは返さない。
+//! 宛先 (`vpc_binding`) は VPC Service の binding 名 (宛先の IP は Cloudflare 側に在り、Worker は持たない)。DB では
+//! `cameras.rec_ip` 列に入る ([`pg`])。その binding がこの Worker に在るかは Worker が確かめる ([`Op::vpc_binding`])。
+//! 応答・ログに資格情報を出さない。一覧の応答は `vpc_binding` を返すが、パスワードは返さない。
 
 pub mod dest;
 pub mod pg;
@@ -19,7 +21,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::dest::Dest;
+use crate::dest::VpcBinding;
 use crate::pg::{CameraRow, Change, NewCamera, PatchCamera, UpdateOutcome};
 
 /// 端末の候補を集計する日数の既定と上限
@@ -63,7 +65,7 @@ pub struct Reply {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Caller {
     pub tenant: Uuid,
-    /// 開発者の Google ログイン (`X-User-Developer: 1`)。宛先 (`rec_ip`) を書けるのはこのときだけ
+    /// 開発者の Google ログイン (`X-User-Developer: 1`)。宛先 (`vpc_binding`) を書けるのはこのときだけ
     pub developer: bool,
 }
 
@@ -107,7 +109,7 @@ pub enum Op {
 /// `POST /cameras` の入力 (パスワードは平文のまま。暗号化は [`execute`] が鍵を受けて行う)
 pub struct CameraInput {
     name: String,
-    rec_ip: Option<Dest>,
+    vpc_binding: Option<VpcBinding>,
     rec_username: Option<String>,
     rec_password: Option<String>,
     device_ids: Vec<String>,
@@ -116,7 +118,7 @@ pub struct CameraInput {
 /// `PATCH /cameras/{id}` の入力 (省略 = 変えない)
 pub struct CameraPatchInput {
     name: Change<String>,
-    rec_ip: Change<Option<Dest>>,
+    vpc_binding: Change<Option<VpcBinding>>,
     rec_username: Change<Option<String>>,
     rec_password: Change<Option<String>>,
     device_ids: Option<Vec<String>>,
@@ -130,6 +132,17 @@ impl Op {
             Op::UpdateCamera(_, p) => matches!(p.rec_password, Change::Set(Some(_))),
             _ => false,
         }
+    }
+
+    /// 書こうとしている binding 名 (null 化は除く)。Worker はこれが env に在るかを [`execute`] の前に確かめ、
+    /// 無ければ 400 にする (この crate は env を持たない)
+    pub fn vpc_binding(&self) -> Option<&str> {
+        match self {
+            Op::CreateCamera(c) => c.vpc_binding.as_ref(),
+            Op::UpdateCamera(_, p) => p.vpc_binding.value().and_then(Option::as_ref),
+            _ => None,
+        }
+        .map(VpcBinding::as_str)
     }
 }
 
@@ -146,7 +159,7 @@ struct CameraBody {
     #[serde(default, deserialize_with = "present")]
     name: Option<Option<String>>,
     #[serde(default, deserialize_with = "present")]
-    rec_ip: Option<Option<String>>,
+    vpc_binding: Option<Option<String>>,
     #[serde(default, deserialize_with = "present")]
     rec_username: Option<Option<String>>,
     #[serde(default, deserialize_with = "present")]
@@ -174,9 +187,9 @@ fn name_of(v: Option<String>) -> Result<String, ApiError> {
     Ok(n)
 }
 
-/// 宛先。null は「取り込まない」
-fn rec_ip_of(v: Option<String>) -> Result<Option<Dest>, ApiError> {
-    v.map(|s| Dest::parse(&s).ok_or_else(|| bad("rec_ip は私設帯 (10/8・172.16/12・192.168/16) の IPv4 にしてください (ポート・名前は不可)"))).transpose()
+/// 宛先 (VPC Service の binding 名)。null は「取り込まない」
+fn vpc_binding_of(v: Option<String>) -> Result<Option<VpcBinding>, ApiError> {
+    v.map(|s| VpcBinding::parse(&s).ok_or_else(|| bad("vpc_binding は CAM_ と大文字英数・_ の名前 (64 文字まで) にしてください"))).transpose()
 }
 
 /// ユーザー名。null と空は「無し」
@@ -217,12 +230,12 @@ fn device_ids_of(v: Vec<String>) -> Result<Vec<String>, ApiError> {
 }
 
 fn camera_input(body: &str, caller: &Caller) -> Result<CameraInput, ApiError> {
-    let b: CameraBody = serde_json::from_str(body).map_err(|_| bad("本文は {\"name\", \"rec_ip\", \"rec_username\", \"rec_password\", \"device_ids\"} の JSON にしてください"))?;
-    let rec_ip = rec_ip_of(b.rec_ip.flatten())?;
-    if rec_ip.is_some() && !caller.developer {
+    let b: CameraBody = serde_json::from_str(body).map_err(|_| bad("本文は {\"name\", \"vpc_binding\", \"rec_username\", \"rec_password\", \"device_ids\"} の JSON にしてください"))?;
+    let vpc_binding = vpc_binding_of(b.vpc_binding.flatten())?;
+    if vpc_binding.is_some() && !caller.developer {
         return Err(ApiError::new(
             403,
-            "宛先 (rec_ip) を書けるのはシステム管理者だけです",
+            "宛先 (vpc_binding) を書けるのはシステム管理者だけです",
         ));
     }
     let rec_password = b.rec_password.flatten().filter(|p| !p.is_empty());
@@ -231,7 +244,7 @@ fn camera_input(body: &str, caller: &Caller) -> Result<CameraInput, ApiError> {
     }
     Ok(CameraInput {
         name: name_of(b.name.flatten())?,
-        rec_ip,
+        vpc_binding,
         rec_username: username_of(b.rec_username.flatten())?,
         rec_password,
         device_ids: device_ids_of(b.device_ids.unwrap_or_default())?,
@@ -239,14 +252,14 @@ fn camera_input(body: &str, caller: &Caller) -> Result<CameraInput, ApiError> {
 }
 
 fn camera_patch(body: &str) -> Result<CameraPatchInput, ApiError> {
-    let b: CameraBody = serde_json::from_str(body).map_err(|_| bad("本文は {\"name\", \"rec_ip\", \"rec_username\", \"rec_password\", \"device_ids\"} の JSON にしてください"))?;
+    let b: CameraBody = serde_json::from_str(body).map_err(|_| bad("本文は {\"name\", \"vpc_binding\", \"rec_username\", \"rec_password\", \"device_ids\"} の JSON にしてください"))?;
     let name = match b.name {
         None => Change::Keep,
         Some(v) => Change::Set(name_of(v)?),
     };
-    let rec_ip = match b.rec_ip {
+    let vpc_binding = match b.vpc_binding {
         None => Change::Keep,
-        Some(v) => Change::Set(rec_ip_of(v)?),
+        Some(v) => Change::Set(vpc_binding_of(v)?),
     };
     let rec_username = match b.rec_username {
         None => Change::Keep,
@@ -264,7 +277,7 @@ fn camera_patch(body: &str) -> Result<CameraPatchInput, ApiError> {
     };
     Ok(CameraPatchInput {
         name,
-        rec_ip,
+        vpc_binding,
         rec_username,
         rec_password,
         device_ids: b.device_ids.map(device_ids_of).transpose()?,
@@ -373,27 +386,22 @@ pub fn sd_root(listing_xml: &str) -> Option<String> {
     dirs.next().is_none().then_some(root)
 }
 
-/// 失敗の文から宛先を消す (カメラへの fetch の失敗の文に URL が混ざっても出さない)
-pub fn redact(message: &str, dest: &Dest) -> String {
-    message.replace(&dest.canonical(), "<camera>")
-}
-
 fn camera_json(c: &CameraRow) -> Value {
     json!({
         "id": c.id,
         "name": c.name,
-        "rec_ip": c.rec_ip,
+        "vpc_binding": c.vpc_binding,
         "rec_username": c.rec_username,
         "has_password": c.has_password,
-        "recording": c.rec_ip.is_some(),
+        "recording": c.vpc_binding.is_some(),
         "device_ids": c.device_ids,
         "rec_scanned_until": c.rec_scanned_until_ms.map(jst_iso),
     })
 }
 
 fn db_error(e: &tokio_postgres::Error) -> ApiError {
-    if pg::is_rec_ip_conflict(e) {
-        return ApiError::new(409, "その宛先は既に使われています");
+    if pg::is_vpc_binding_conflict(e) {
+        return ApiError::new(409, "その VPC binding は既に使われています");
     }
     ApiError::new(
         500,
@@ -433,7 +441,7 @@ pub async fn execute(
         Op::CreateCamera(c) => {
             let new = NewCamera {
                 name: c.name,
-                rec_ip: c.rec_ip.map(|d| d.canonical()),
+                vpc_binding: c.vpc_binding.map(VpcBinding::into_string),
                 rec_username: c.rec_username,
                 rec_password_encrypted: encrypt(c.rec_password, key)?,
                 device_ids: c.device_ids,
@@ -453,9 +461,9 @@ pub async fn execute(
             };
             let patch = PatchCamera {
                 name: p.name,
-                rec_ip: match p.rec_ip {
+                vpc_binding: match p.vpc_binding {
                     Change::Keep => Change::Keep,
-                    Change::Set(d) => Change::Set(d.map(|d| d.canonical())),
+                    Change::Set(d) => Change::Set(d.map(VpcBinding::into_string)),
                 },
                 rec_username: p.rec_username,
                 rec_password_encrypted,
@@ -472,7 +480,7 @@ pub async fn execute(
                 UpdateOutcome::NotFound => Err(ApiError::new(404, "そのカメラはありません")),
                 UpdateOutcome::Forbidden => Err(ApiError::new(
                     403,
-                    "宛先 (rec_ip) を書けるのはシステム管理者だけです",
+                    "宛先 (vpc_binding) を書けるのはシステム管理者だけです",
                 )),
             }
         }
@@ -621,8 +629,8 @@ mod tests {
     }
 
     #[test]
-    fn writing_rec_ip_needs_developer() {
-        let body = r#"{"name":"入口","rec_ip":"192.168.1.64"}"#;
+    fn writing_vpc_binding_needs_developer() {
+        let body = r#"{"name":"入口","vpc_binding":"CAM_TS_NS320W_55"}"#;
         assert_eq!(
             status(parse("POST", "/cameras", "", body, &admin(false), 0)),
             403
@@ -631,13 +639,13 @@ mod tests {
             status(parse("POST", "/cameras", "", body, &admin(true), 0)),
             200
         );
-        // rec_ip が null / 無しなら developer でなくても作れる
+        // vpc_binding が null / 無しなら developer でなくても作れる
         assert_eq!(
             status(parse(
                 "POST",
                 "/cameras",
                 "",
-                r#"{"name":"入口","rec_ip":null}"#,
+                r#"{"name":"入口","vpc_binding":null}"#,
                 &admin(false),
                 0
             )),
@@ -654,13 +662,13 @@ mod tests {
             )),
             200
         );
-        // 宛先の検査は developer でも通す
+        // 名前の検査は developer でも通す (IP・小文字は不可。旧い項目名 rec_ip は知らない項目で 400)
         assert_eq!(
             status(parse(
                 "POST",
                 "/cameras",
                 "",
-                r#"{"name":"x","rec_ip":"8.8.8.8"}"#,
+                r#"{"name":"x","vpc_binding":"192.168.1.64"}"#,
                 &admin(true),
                 0
             )),
@@ -671,12 +679,48 @@ mod tests {
                 "POST",
                 "/cameras",
                 "",
-                r#"{"name":"x","rec_ip":"192.168.1.64:80"}"#,
+                r#"{"name":"x","vpc_binding":"cam_a"}"#,
                 &admin(true),
                 0
             )),
             400
         );
+        assert_eq!(
+            status(parse(
+                "POST",
+                "/cameras",
+                "",
+                r#"{"name":"x","rec_ip":"192.168.1.64"}"#,
+                &admin(true),
+                0
+            )),
+            400
+        );
+    }
+
+    #[test]
+    fn vpc_binding_to_check_in_env() {
+        let dev = admin(true);
+        let binding = |method: &str, path: &str, body: &str| {
+            parse(method, path, "", body, &dev, 0)
+                .unwrap()
+                .vpc_binding()
+                .map(str::to_owned)
+        };
+        let path = format!("/cameras/{TENANT}");
+        assert_eq!(
+            binding("POST", "/cameras", r#"{"name":"x","vpc_binding":"CAM_A"}"#).as_deref(),
+            Some("CAM_A")
+        );
+        assert_eq!(binding("POST", "/cameras", r#"{"name":"x"}"#), None);
+        assert_eq!(
+            binding("PATCH", &path, r#"{"vpc_binding":"CAM_B"}"#).as_deref(),
+            Some("CAM_B")
+        );
+        // null 化と省略は env を見ない
+        assert_eq!(binding("PATCH", &path, r#"{"vpc_binding":null}"#), None);
+        assert_eq!(binding("PATCH", &path, r#"{"name":"y"}"#), None);
+        assert_eq!(binding("GET", "/cameras", ""), None);
     }
 
     #[test]
@@ -897,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_and_redaction() {
+    fn keys() {
         let t = Uuid::parse_str(TENANT).unwrap();
         let from = parse_time("2026-10-23T12:58:00+09:00").unwrap();
         let to = parse_time("2026-10-23T12:59:30+09:00").unwrap();
@@ -906,10 +950,5 @@ mod tests {
             format!("clips/{TENANT}/{TENANT}/20261023T125800_20261023T125930.mp4")
         );
         assert_eq!(raw_r2_prefix(t, t), format!("{TENANT}/{TENANT}"));
-        let d = Dest::parse("192.168.1.64").unwrap();
-        assert_eq!(
-            redact("fetch http://192.168.1.64/x failed", &d),
-            "fetch http://<camera>/x failed"
-        );
     }
 }

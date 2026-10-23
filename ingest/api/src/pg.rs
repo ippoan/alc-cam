@@ -17,11 +17,11 @@ pub enum Change<T> {
 }
 
 impl<T> Change<T> {
-    fn set(&self) -> bool {
+    pub(crate) fn set(&self) -> bool {
         matches!(self, Change::Set(_))
     }
 
-    fn value(&self) -> Option<&T> {
+    pub(crate) fn value(&self) -> Option<&T> {
         match self {
             Change::Keep => None,
             Change::Set(v) => Some(v),
@@ -34,7 +34,7 @@ impl<T> Change<T> {
 pub struct CameraRow {
     pub id: Uuid,
     pub name: String,
-    pub rec_ip: Option<String>,
+    pub vpc_binding: Option<String>,
     pub rec_username: Option<String>,
     pub has_password: bool,
     pub device_ids: Vec<String>,
@@ -44,8 +44,8 @@ impl TxOutput for CameraRow {}
 
 pub struct NewCamera {
     pub name: String,
-    /// 検査済みの正準形
-    pub rec_ip: Option<String>,
+    /// 検査済みの binding 名
+    pub vpc_binding: Option<String>,
     pub rec_username: Option<String>,
     pub rec_password_encrypted: Option<String>,
     pub device_ids: Vec<String>,
@@ -53,8 +53,8 @@ pub struct NewCamera {
 
 pub struct PatchCamera {
     pub name: Change<String>,
-    /// 検査済みの正準形。`Set(None)` = 取り込みをやめる
-    pub rec_ip: Change<Option<String>>,
+    /// 検査済みの binding 名。`Set(None)` = 取り込みをやめる
+    pub vpc_binding: Change<Option<String>>,
     pub rec_username: Change<Option<String>>,
     pub rec_password_encrypted: Change<Option<String>>,
     /// `Some` なら結び付ける端末を差し替える
@@ -86,7 +86,7 @@ impl TxOutput for Candidate {}
 /// 切り出しに要るカメラの値 (宛先は fetch の直前にもう一度検査する)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipSource {
-    pub rec_ip: Option<String>,
+    pub vpc_binding: Option<String>,
     pub rec_username: Option<String>,
     pub rec_password_encrypted: Option<String>,
 }
@@ -104,13 +104,14 @@ pub struct ClipRecord {
     pub error: Option<String>,
 }
 
-/// 他テナントを含めて同じ宛先が既に在る (部分 unique `cameras_rec_ip_key`)
-pub fn is_rec_ip_conflict(e: &Error) -> bool {
+/// 他テナントを含めて同じ binding が既に在る (部分 unique `cameras_rec_ip_key`。同じカメラを 2 テナントに置けない)
+pub fn is_vpc_binding_conflict(e: &Error) -> bool {
     e.as_db_error().is_some_and(|d| {
         d.code() == &SqlState::UNIQUE_VIOLATION && d.constraint() == Some("cameras_rec_ip_key")
     })
 }
 
+// ★ 列 `rec_ip` に入っているのは IP ではなく VPC Service の binding 名 (API の `vpc_binding`。migration はしていない)
 /// 一覧の文。`$2` が NULL なら全行、UUID ならその 1 行
 const SELECT_CAMERAS: &str = "\
 SELECT c.id, c.name, c.rec_ip, c.rec_username, c.rec_password_encrypted IS NOT NULL,
@@ -126,7 +127,7 @@ fn camera_row(r: &Row) -> CameraRow {
     CameraRow {
         id: r.get(0),
         name: r.get(1),
-        rec_ip: r.get(2),
+        vpc_binding: r.get(2),
         rec_username: r.get(3),
         has_password: r.get(4),
         device_ids: r.get(5),
@@ -172,7 +173,7 @@ pub async fn create_camera(
                     &[
                         (&tenant, Type::UUID),
                         (&c.name, Type::TEXT),
-                        (&c.rec_ip, Type::TEXT),
+                        (&c.vpc_binding, Type::TEXT),
                         (&c.rec_username, Type::TEXT),
                         (&c.rec_password_encrypted, Type::TEXT),
                     ],
@@ -206,11 +207,11 @@ pub async fn update_camera(
                 return Ok(UpdateOutcome::NotFound);
             };
             let current: Option<String> = current.get(0);
-            if p.rec_ip.value().is_some_and(|new| *new != current) && !developer {
+            if p.vpc_binding.value().is_some_and(|new| *new != current) && !developer {
                 return Ok(UpdateOutcome::Forbidden);
             }
             let (set_name, name) = (p.name.set(), p.name.value().cloned());
-            let (set_ip, ip) = (p.rec_ip.set(), p.rec_ip.value().cloned().flatten());
+            let (set_ip, ip) = (p.vpc_binding.set(), p.vpc_binding.value().cloned().flatten());
             let (set_user, user) = (p.rec_username.set(), p.rec_username.value().cloned().flatten());
             let (set_pass, pass) = (p.rec_password_encrypted.set(), p.rec_password_encrypted.value().cloned().flatten());
             tx.execute_typed(
@@ -317,7 +318,7 @@ pub async fn clip_source(
                     &[(&tenant, Type::UUID), (&camera_id, Type::UUID)],
                 )
                 .await?;
-            Ok(row.map(|r| ClipSource { rec_ip: r.get(0), rec_username: r.get(1), rec_password_encrypted: r.get(2) }))
+            Ok(row.map(|r| ClipSource { vpc_binding: r.get(0), rec_username: r.get(1), rec_password_encrypted: r.get(2) }))
         })
     })
     .await
