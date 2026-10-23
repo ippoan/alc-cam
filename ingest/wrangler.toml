@@ -53,19 +53,22 @@ binding = "SSO_ENCRYPTION_KEY"
 store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
 secret_name = "sso-encryption-key"
 
-# カメラへの口 (Workers VPC の VPC Network)。URL の host (cameras.rec_ip) がそのまま宛先になり、
-# binding は宛先を絞らない — 宛先は src/camera.rs が api/src/dest.rs の検査 (私設帯の IPv4・ポート 80・転送を追わない)
-# を通したものだけにする。本番 (トップレベル) にだけ置く (scripts/check-exposure.sh が検査する)
-# tunnel_id での直接 bind は Connectivity Directory Admin が要り、CI のトークン (Bind まで) では deploy できないので
-# アカウントの私設網 (cf1:network。Tunnel の経路で拠点のカメラへ届く) に bind する
-[[vpc_networks]]
-binding = "CAM_NET"
-network_id = "cf1:network"
+# カメラへの口 (Workers VPC の VPC Service)。カメラ 1 台に 1 つ。宛先 (カメラの IP・ポート 80) は VPC Service の側に
+# 固定され (ohishi-data の Tunnel 経由)、Worker は binding を名前で引くだけ (src/camera.rs)。DB の cameras.rec_ip 列に
+# 入るのはこの binding 名。binding 名は CAM_ + 大文字英数と _ (api/src/dest.rs が検査する)。
+# 本番 (トップレベル) にだけ置く (scripts/check-exposure.sh が検査する)。VPC Network (宛先を絞らない) は使わない
+# (CI のトークンは Connectivity Directory Bind までで、VPC Network は deploy できない。ippoan/alc-cam#2)
+#
+# カメラを足すとき: ダッシュボードの Workers VPC で VPC Service (HTTP、宛先 = カメラの IP、ポート 80) を作り、
+# ここに 1 表足して merge → CI が本番へ出す。画面でそのカメラの「VPC binding」に binding 名を入れる
+[[vpc_services]]
+binding = "CAM_TS_NS320W_55"
+service_id = "01a166ef-0929-7330-af52-3da25f41c42e"
 remote = true
 
 # ローカル (`wrangler dev --env local`) 専用。deploy しない。
-# Hyperdrive も VPC も持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL (.dev.vars) の段で繋ぐ。
-# R2 は手元の模擬。カメラには届かないので切り出しの口は失敗する (台帳の口の確認用)
+# Hyperdrive も VPC Service も持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL (.dev.vars) の段で繋ぐ。
+# R2 は手元の模擬。カメラには届かないので切り出しの口は失敗し、vpc_binding を書く登録は 400 になる (台帳の口の確認用)
 [env.local]
 name = "alc-cam-sd-ingest-local"
 workers_dev = false

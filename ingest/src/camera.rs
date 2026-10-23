@@ -1,16 +1,14 @@
-//! VPC Network (binding `CAM_NET`) 越しにカメラへ投げる。Digest は 401 の challenge を受けてから付け直す。
+//! カメラごとの VPC Service (wrangler.toml の `[[vpc_services]]`、binding 名は `cameras.rec_ip` 列) 越しにカメラへ投げる。
+//! Digest は 401 の challenge を受けてから付け直す。
 //!
-//! VPC Network は URL の host がそのまま宛先になり、binding は宛先を絞らない。宛先は検査済みの [`Dest`]
-//! (私設帯の IPv4・ポート 80) からだけ組み立て、転送 (3xx) は追わずに失敗にする (`redirect: manual`。
+//! 宛先の IP・ポートは Cloudflare 側の VPC Service に固定されている。URL の host は Host ヘッダになるだけなので、
+//! 名前解決できない名前 ([`BASE`]) を置く。転送 (3xx) は追わずに失敗にする (`redirect: manual`。
 //! `redirect: "error"` は workerd が受け付けない)。
 
-use cam_ingest_api::dest::Dest;
+use cam_ingest_api::dest::VpcBinding;
 use cam_sd::{digest, list_path};
 use wasm_bindgen::prelude::*;
 use worker::{Env, Fetcher, Headers, Method, Request, RequestInit, RequestRedirect, Response, Result};
-
-/// VPC Network の binding 名 (wrangler.toml の `[[vpc_networks]]`)
-pub const CAM_NET_BINDING: &str = "CAM_NET";
 
 /// VPC の binding。JS 側の型名が公開されていないので、型名は見ずに Fetcher として受ける
 /// (`src/tcp.rs` を持つ alc 系 Worker と同じ扱い。無ければ `get_binding` が Err)
@@ -51,19 +49,27 @@ impl JsCast for VpcHttp {
     }
 }
 
+/// URL の host は VPC Service の宛先には効かず Host ヘッダになるだけ。公開ホスト名を書くと VPC の外へ
+/// 出ていく罠があるので (cf-flickr-cam-worker #17)、名前解決できない名前を置く
+const BASE: &str = "http://camera.vpc.internal";
+
+/// その binding がこの Worker に在るか (登録の時に確かめる)
+pub fn has_binding(env: &Env, name: &str) -> bool {
+    env.get_binding::<VpcHttp>(name).is_ok()
+}
+
 pub struct Camera {
     fetcher: Fetcher,
-    base: String,
     user: String,
     pass: String,
     nc: u32,
 }
 
 impl Camera {
-    /// `dest` は fetch の直前の検査 ([`Dest::parse`]) を通したもの
-    pub fn new(env: &Env, dest: &Dest, user: String, pass: String) -> Result<Self> {
-        let vpc: VpcHttp = env.get_binding(CAM_NET_BINDING)?;
-        Ok(Self { fetcher: Fetcher::unchecked_from_js(vpc.0), base: dest.base_url(), user, pass, nc: 0 })
+    /// `binding` は fetch の直前の検査 ([`VpcBinding::parse`]) を通したもの。env に無ければ Err
+    pub fn new(env: &Env, binding: &VpcBinding, user: String, pass: String) -> Result<Self> {
+        let vpc: VpcHttp = env.get_binding(binding.as_str())?;
+        Ok(Self { fetcher: Fetcher::unchecked_from_js(vpc.0), user, pass, nc: 0 })
     }
 
     /// SD のいちばん上のフォルダ (カメラ名。`<カメラ名>/<種類>/<日付>/<時>/` の頭)。決め方は `cam_ingest_api::sd_root`。
@@ -86,7 +92,7 @@ impl Camera {
     }
 
     async fn send(&mut self, method: Method, path: &str, body: Option<String>) -> Result<Response> {
-        let first = self.fetch(build(&self.base, method.clone(), path, body.clone(), None)?).await?;
+        let first = self.fetch(build(method.clone(), path, body.clone(), None)?).await?;
         if first.status_code() != 401 {
             return Ok(first);
         }
@@ -98,14 +104,14 @@ impl Camera {
         self.nc += 1;
         let cnonce = format!("{:016x}", (js_sys::Math::random() * 1e16) as u64);
         let auth = digest::authorization(&challenge, method.as_ref(), path, &self.user, &self.pass, self.nc, &cnonce);
-        let res = self.fetch(build(&self.base, method, path, body, Some(&auth))?).await?;
+        let res = self.fetch(build(method, path, body, Some(&auth))?).await?;
         if res.status_code() == 401 {
             return Err("カメラの認証に失敗しました (カメラのユーザー名・パスワードを確かめてください)".into());
         }
         Ok(res)
     }
 
-    /// 転送 (3xx) は追わずに失敗にする (宛先を検査した IP の外へ出ない)
+    /// 転送 (3xx) は追わずに失敗にする (VPC Service の宛先の外へ出ない)
     async fn fetch(&self, req: Request) -> Result<Response> {
         let res = self.fetcher.fetch_request(req).await.map_err(|e| worker::Error::from(format!("カメラに届きません ({e})")))?;
         if (300..400).contains(&res.status_code()) {
@@ -115,7 +121,7 @@ impl Camera {
     }
 }
 
-fn build(base: &str, method: Method, path: &str, body: Option<String>, auth: Option<&str>) -> Result<Request> {
+fn build(method: Method, path: &str, body: Option<String>, auth: Option<&str>) -> Result<Request> {
     let headers = Headers::new();
     if let Some(a) = auth {
         headers.set("Authorization", a)?;
@@ -129,5 +135,5 @@ fn build(base: &str, method: Method, path: &str, body: Option<String>, auth: Opt
     if let Some(b) = body {
         init.with_body(Some(b.into()));
     }
-    Request::new_with_init(&format!("{base}{path}"), &init)
+    Request::new_with_init(&format!("{BASE}{path}"), &init)
 }

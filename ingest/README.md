@@ -4,7 +4,7 @@
 Worker `alc-cam-sd-ingest`。再エンコードはしない。
 
 ```
-auth-worker (/api/cam-clips/) ─Service Binding─▶ alc-cam-sd-ingest ─Workers VPC Network (CAM_NET, cf1:network → Tunnel)─▶ カメラ (cameras.rec_ip:80、Digest)
+auth-worker (/api/cam-clips/) ─Service Binding─▶ alc-cam-sd-ingest ─Workers VPC Service (カメラごとの CAM_*, Tunnel)─▶ カメラ (:80、Digest)
                                      ├▶ Hyperdrive ─▶ alc_api.cameras / cam_camera_devices / cam_clips (テナントの RLS)
                                      ├▶ R2 alc-cam-recordings/<tenant>/<camera_id>/<SD のカメラ名>/<種類>/<YYYYMMDD>/<HH>/<元ファイル>.mp4
                                      └▶ R2 alc-cam-recordings/clips/<tenant>/<camera_id>/<開始>_<終了>.mp4   (切り出した 1 本)
@@ -13,9 +13,9 @@ auth-worker (/api/cam-clips/) ─Service Binding─▶ alc-cam-sd-ingest ─Work
 口 (中身は `ingest/api`。宛先・資格情報は応答にもログにも出さない。パスワードは返さない):
 
 ```
-GET   /api/cam-clips/cameras                 → {"can_edit_destination": bool, "cameras": [{id, name, rec_ip, rec_username, has_password, recording, device_ids, rec_scanned_until}]}
-POST  /api/cam-clips/cameras                 {name, rec_ip?, rec_username?, rec_password?, device_ids?} → 201 (active = false で作る)
-PATCH /api/cam-clips/cameras/{id}            同じ項目 (省略 = 変えない、rec_ip: null = 取り込みをやめる、rec_password: "" = 変えない)
+GET   /api/cam-clips/cameras                 → {"can_edit_destination": bool, "cameras": [{id, name, vpc_binding, rec_username, has_password, recording, device_ids, rec_scanned_until}]}
+POST  /api/cam-clips/cameras                 {name, vpc_binding?, rec_username?, rec_password?, device_ids?} → 201 (active = false で作る)
+PATCH /api/cam-clips/cameras/{id}            同じ項目 (省略 = 変えない、vpc_binding: null = 取り込みをやめる、rec_password: "" = 変えない)
 GET   /api/cam-clips/device-candidates?days=30   直近 days 日 (1〜90) にイベントを出した端末と kind ごとの件数
 POST  /api/cam-clips/clips                   {"camera_id": "...", "from": "2026-10-23T12:58:00+09:00", "to": "2026-10-23T12:59:30+09:00"}
 → 201 {"clip_id": …, "key": "clips/<tenant>/<camera_id>/20261023T125800_20261023T125930.mp4", "size": …,
@@ -30,17 +30,30 @@ GET   /api/cam-clips/clips/<tenant>/<camera_id>/20261023T125800_20261023T125930.
 - 手順: SD のいちばん上のフォルダ (カメラ名) を一覧で確かめ、重なる元ファイルを SD の一覧 (`camera-cgi/admin/sdcard.cgi`)
   で探し、R2 に無ければカメラから (`/action/stream?subject=recdownload`、パスに `/mnt/mmc`) 丸ごと取って置く →
   R2 の範囲読み出しで末尾の moov を読む → `crates/cam-mp4` で切ってつなぐ計画を立て → 16MiB ずつ R2 のマルチパートに写す
-- カメラの宛先・ユーザー名・パスワード (暗号化。鍵は Secrets Store の `SSO_ENCRYPTION_KEY`) は `alc_api.cameras` の
-  `rec_*` 列に持つ。repo には無い
+- カメラの宛先 (VPC Service の binding 名)・ユーザー名・パスワード (暗号化。鍵は Secrets Store の `SSO_ENCRYPTION_KEY`) は
+  `alc_api.cameras` の `rec_*` 列に持つ (binding 名は `rec_ip` 列に入る。列名は IP のままで migration はしていない)。
+  カメラの IP は Cloudflare の VPC Service の側に在り、repo にも DB にも無い
 - 外から直接は届かない (workers_dev / route なし。`ingest/scripts/check-exposure.sh` が CI で検査)。auth-worker の振り分け表
   `ALC_BINDING_ROUTES` から届き、JWT の検証は auth-worker が済ませる。Worker は付け直された `X-User-Role` が `admin` で
-  なければ 403、`X-Tenant-ID` が無ければ 401・UUID でなければ 400。宛先 (`rec_ip`) を書くのは `X-User-Developer: 1`
+  なければ 403、`X-Tenant-ID` が無ければ 401・UUID でなければ 400。宛先 (`vpc_binding`) を書くのは `X-User-Developer: 1`
   (開発者の Google ログイン) のときだけで、それ以外は 403
-- **宛先の検査** (`ingest/api/src/dest.rs`): VPC Network の binding は宛先を絞らないので、登録の時とカメラへ fetch する直前の
-  両方で、私設帯 (10/8・172.16/12・192.168/16) の IPv4 のリテラルだけを通す (名前・IPv6・ポート・loopback・link-local は不可)。
-  URL は `http://<IP>` (ポート 80)、転送 (3xx) は追わない。同じ宛先を別のテナントが持っていれば 409
+- **宛先の検査** (`ingest/api/src/dest.rs`): 宛先の IP・ポートは VPC Service の側に固定されるので、Worker が見るのは binding 名
+  だけ。登録の時とカメラへ fetch する直前の両方で `^CAM_[A-Z0-9_]{1,60}$` (`CAM_HYPERDRIVE` は除く) に合うことと、その binding が
+  この Worker に在ることを確かめる (無ければ登録時 400・切り出し時 500)。URL は `http://camera.vpc.internal/...` (host は
+  Host ヘッダになるだけ。公開名を書くと VPC の外へ出る)、転送 (3xx) は追わない。同じ binding を別のテナントが持っていれば 409
 
-確認 (`wrangler dev --env local`: Hyperdrive・VPC を持たず、DB は `DATABASE_URL`、R2 は手元の模擬。カメラには届かない):
+### カメラを足す (システム管理者)
+
+1. Cloudflare のダッシュボードの Workers VPC で VPC Service を作る (種類 HTTP、宛先 = カメラの IP、ポート 80、
+   ohishi-data の Tunnel)。CI のトークンは VPC Service の bind までで、作るのは人の手
+2. `ingest/wrangler.toml` のトップレベルに `[[vpc_services]]` を 1 表足す (`binding = "CAM_<型番など>"`、
+   `service_id` = 1 の id、`remote = true`) → PR を merge すると CI が本番へ出す
+3. 画面でそのカメラの「VPC binding」に 2 の binding 名を入れる (書けるのは開発者の Google ログインのときだけ)
+
+今の binding: `CAM_TS_NS320W_55` (TS-NS320W-55)
+
+確認 (`wrangler dev --env local`: Hyperdrive・VPC Service を持たず、DB は `DATABASE_URL`、R2 は手元の模擬。カメラには届かず、
+`vpc_binding` を書く登録は 400 になる):
 
 ```bash
 cd ingest

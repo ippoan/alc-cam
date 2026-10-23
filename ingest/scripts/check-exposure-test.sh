@@ -53,10 +53,12 @@ mutate "本番の vars に ALLOW_INSECURE_DB" \
   's = s.replace("MAX_CLIP_SECS = \"7200\"", "ALLOW_INSECURE_DB = \"1\"\nMAX_CLIP_SECS = \"7200\"", 1)'
 mutate "local の vars に DATABASE_URL" \
   's = s.replace("[env.local.vars]\n", "[env.local.vars]\nDATABASE_URL = \"postgresql://x\"\n", 1)'
-mutate "本番に vpc_services を足す" \
-  's = s.replace("[build]", "[[vpc_services]]\nbinding = \"CAM_HTTP\"\nservice_id = \"x\"\nremote = true\n\n[build]", 1)'
-mutate "local に vpc_networks (宛先を絞らない binding) を足す" \
+mutate "本番に vpc_networks (宛先を絞らない binding) を足す" \
+  's = s.replace("[build]", "[[vpc_networks]]\nbinding = \"CAM_NET\"\nnetwork_id = \"cf1:network\"\nremote = true\n\n[build]", 1)'
+mutate "local に vpc_networks を足す" \
   's = s.replace("[env.local.vars]", "[[env.local.vpc_networks]]\nbinding = \"CAM_NET\"\nnetwork_id = \"cf1:network\"\nremote = true\n\n[env.local.vars]", 1)'
+mutate "local に vpc_services (拠点のカメラへ届く binding) を足す" \
+  's = s.replace("[env.local.vars]", "[[env.local.vpc_services]]\nbinding = \"CAM_X\"\nservice_id = \"x\"\nremote = true\n\n[env.local.vars]", 1)'
 mutate "local に hyperdrive (本番の DB へ届く binding) を足す" \
   's = s.replace("[env.local.vars]", "[[env.local.hyperdrive]]\nbinding = \"CAM_HYPERDRIVE\"\nid = \"x\"\n\n[env.local.vars]", 1)'
 mutate "local に durable_objects を足す" \
