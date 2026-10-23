@@ -56,9 +56,11 @@ secret_name = "sso-encryption-key"
 # カメラへの口 (Workers VPC の VPC Network)。URL の host (cameras.rec_ip) がそのまま宛先になり、
 # binding は宛先を絞らない — 宛先は src/camera.rs が api/src/dest.rs の検査 (私設帯の IPv4・ポート 80・転送を追わない)
 # を通したものだけにする。本番 (トップレベル) にだけ置く (scripts/check-exposure.sh が検査する)
+# tunnel_id での直接 bind は Connectivity Directory Admin が要り、CI のトークン (Bind まで) では deploy できないので
+# アカウントの私設網 (cf1:network。Tunnel の経路で拠点のカメラへ届く) に bind する
 [[vpc_networks]]
 binding = "CAM_NET"
-tunnel_id = "589ac3b8-a73b-4cb8-b2ba-61719490b47d"
+network_id = "cf1:network"
 remote = true
 
 # ローカル (`wrangler dev --env local`) 専用。deploy しない。
