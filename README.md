@@ -1,17 +1,22 @@
 # alc-cam
 
-拠点のカメラ (Tapo C212 等の RTSP) を、**Chrome 拡張のサイドパネルを開いている間だけ** WebRTC (P2P) で
-見る側へ届ける。alc-gw (Go の常駐アプリ) を置かない拠点向けの、カメラ中継規約の 3 つ目の device 実装。
+拠点のカメラ (Tapo C212 等の RTSP) を、**Chrome が動いている間ずっと** (拡張の background service worker が常時 cam-room に居て)
+WebRTC (P2P) で見る側へ届ける。alc-gw (Go の常駐アプリ) を置かない拠点向けの、カメラ中継規約の 3 つ目の device 実装。
 
 ```
 カメラ ─RTSP─▶ alc-cam-host (Rust, native messaging) ══WebRTC P2P (H.264 そのまま)══▶ 見る側
                      ▲ stdin/stdout                                                    (alc-app の TenkoCameraView)
                      │                                                                  ▲
-               Chrome 拡張 (サイドパネル) ──WebSocket── cf-alc-signaling /cam-room/<カメラID> ──┘
+      Chrome 拡張 (background service worker) ──WebSocket── cf-alc-signaling /cam-room/<カメラID> ──┘
                                               (SDP だけ。role=device&proto=2)
 ```
 
-- 拡張は TCP を張れないので、RTSP と WebRTC は Rust の host が持つ。host は拡張が起動し、パネルを閉じると終わる (サービス常駐しない)
+- 拡張は TCP を張れないので、RTSP と WebRTC は Rust の host が持つ。host は見る人が来たときに拡張が起動し、最後の 1 人が離れると終わる (サービス常駐しない)
+- 配信の本体は拡張の background service worker (`extension/background.js`)。設定が保存済みなら Chrome の起動と同時に cam-room に繋ぎ、
+  パネルを開いていなくても、閉じても配信は続く。サイドパネルは設定と状態の表示だけ (やり取りは `chrome.storage`)
+- 常時接続の保ち方: 20 秒ごとに `{"type":"ping"}` ちょうどを送る (cam-room は `setWebSocketAutoResponse` で `{"type":"pong"}` を返し、DO は hibernate したまま)。
+  この送受信が service worker も生かす。pong が 60 秒来なければ繋ぎ直し、切れたら 1s→60s のバックオフ。
+  service worker が止まっても 30 秒ごとの alarm で起き直し、設定から繋ぎ直す (状態をメモリに頼らない)。Chrome 116 以降
 - シグナリングは `cf-alc-signaling` の `/cam-room` を使う。部屋の名前は `alc_api.cameras.id` (拡張の「拠点 ID」に入れる)。見る側は既存の alc-app のまま
 - **1 台のカメラを最大 4 人が同時に見られる** (cam-room v2。DO が見る人ごとに `viewer_id` を付ける)。
   RTSP はカメラにつき 1 本で、最初の 1 人で開き最後の 1 人が離れたら TEARDOWN、映像は見る人ごとの PeerConnection へ複製する。
@@ -25,7 +30,7 @@
 |---|---|
 | `host/` | `alc-cam-host` (str0m で WebRTC、暗号は pure Rust)。`hub.rs` が見る人への複製。`install.ps1` は Windows への登録 |
 | `crates/cam-rtsp/` | RTSP (Digest・TCP interleaved) → H.264 Annex B。I/O を持たない |
-| `extension/` | 拠点側の Chrome 拡張 (MV3・サイドパネル)。ID は `key` で `icmmpdjddlphkbokdalofdjpkcgfiggd` に固定 |
+| `extension/` | 拠点側の Chrome 拡張 (MV3)。配信は `background.js` (service worker)、`panel.*` は設定と状態表示。ID は `key` で `icmmpdjddlphkbokdalofdjpkcgfiggd` に固定 |
 | `test/` | 偽カメラ・cam-room のローカル版・見る側のページと、それらを通す `e2e.mjs` |
 | `crates/cam-sd/` | カメラの SD 録画の一覧・取り出し・時刻の扱い (I/O を持たない) |
 | `crates/cam-mp4/` | MP4 を再エンコードせずに切ってつなぐ (moov を読み、出力の頭と写す区間を返す。I/O を持たない) |
@@ -36,13 +41,16 @@
 1. Actions の成果物 (またはタグの Release) の `alc-cam-windows.zip` を展開
 2. `powershell -ExecutionPolicy Bypass -File install.ps1` (管理者不要。`%LOCALAPPDATA%\alc-cam` と HKCU に登録)
 3. `chrome://extensions` → デベロッパーモード → 「パッケージ化されていない拡張機能を読み込む」→ `extension/`
-4. ツールバーのアイコン → サイドパネル → 設定に拠点 ID (= `alc_api.cameras.id`)・カメラの RTSP URL (stream2) を入れて保存 → 開始
+4. ツールバーのアイコン → サイドパネル → 設定に拠点 ID (= `alc_api.cameras.id`)・カメラの RTSP URL (stream2) を入れて保存。
+   保存した時点で配信が始まる (以後は Chrome を起動するだけで繋ぐ)。パネルは閉じてよい。止めるときはパネルの「停止」
 
 見る側は alc-app の拠点カメラ画面で同じカメラを開く。
 
 版を上げるとき: `host/Cargo.toml` と `extension/manifest.json` の `version` を揃えて上げ、merge 後に `v<版>` のタグを打つと
 CI が `alc-cam-windows.zip` を Release に付ける。拠点 PC では zip を展開し直して `install.ps1` を再実行し、
 `chrome://extensions` で拡張を再読み込みする (host と拡張は対で入れ替える)。
+0.2.x → 0.3.0 では設定 (`chrome.storage.local`) はそのまま引き継がれ、再読み込みした時点で background が繋ぐ。
+旧版の「パネルを開いたら自動で開始」は無くなり、代わりに既定で常時配信 (止めるのはパネルの「停止」)。
 
 ## SD 録画の時間指定の切り出し (ingest/)
 
@@ -96,10 +104,13 @@ node make-fixture.mjs   # 偽カメラの H.264 を作る (branded Chrome の We
 node e2e.mjs            # 偽カメラ → host → 拡張 → cam-room → 見る側 を通す
 ```
 
-`e2e.mjs` が確かめること: 見る人が来るまでカメラに触らない / Digest 認証 / 見る側で H.264 がデコードされる /
-2 人目が途中から入っても映り、そのあいだ RTSP は 1 本 / 片方が離れてももう片方は流れ続ける /
-最後の 1 人が離れたらカメラへ TEARDOWN / 入り直しで再び映る / v1 の部屋 (古い DO) でも 1 人なら映る /
-パネルを閉じたら host が終わる。`signaling.mjs` は cam-room の v2 (と `v1Sites` に入れた部屋の v1) を写している。
+`e2e.mjs` が確かめること: パネルを開かずに設定だけで cam-room に繋ぐ / 見る人が来るまでカメラにも host にも触らない /
+Digest 認証 / 見る側で H.264 がデコードされる / 2 人目が途中から入っても映り、そのあいだ RTSP は 1 本 /
+片方が離れてももう片方は流れ続ける / 最後の 1 人が離れたらカメラへ TEARDOWN し host も止める / 入り直しで再び映る /
+パネルの状態表示と、パネルを閉じても映り続けること / keepalive の ping が `{"type":"ping"}` ちょうど /
+service worker を CDP で止めても起き直して繋ぎ直し、見ている人に再び映る / 設定を変えたら繋ぎ直す (v1 の部屋でも 1 人なら映る) /
+「停止」で cam-room から抜ける。`signaling.mjs` は cam-room の v2 (と `v1Sites` に入れた部屋の v1)、
+keepalive の自動応答 (完全一致の ping にだけ pong) を写している。
 
 ## 未確認・未対応
 
