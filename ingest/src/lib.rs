@@ -5,11 +5,12 @@
 //!                                       │ 範囲を切ってつなぐ (再エンコードなし。crates/cam-mp4)
 //!                                       └▶ R2 `clips/<カメラ名>/<開始>_<終了>.mp4`
 //!
-//! - `POST <prefix>/clips` に `{"from": "...", "to": "..."}` (ISO 8601。時差が無ければ JST)
-//! - `GET <prefix>/clips/<カメラ名>/<開始>_<終了>.mp4` で取り出す (Range 対応 = シークできる)
+//! - `POST /api/cam-clips/clips` に `{"from": "...", "to": "..."}` (ISO 8601。時差が無ければ JST)
+//! - `GET /api/cam-clips/clips/<カメラ名>/<開始>_<終了>.mp4` で取り出す (Range 対応 = シークできる)
 //!
-//! 外から直接届く口は持たない (workers_dev / route なし)。呼び手の認証は auth-worker が済ませる
-//! (alc 系の分割 Worker と同じ: JWT を検証するのは auth-worker だけ)。
+//! 外から直接届く口は持たない (workers_dev / route なし)。auth-worker の振り分け表 (`ALC_BINDING_ROUTES`)
+//! から Service Binding で届き、JWT の検証は auth-worker が済ませて `X-Tenant-ID` / `X-User-Role` を付け直す
+//! (alc 系の分割 Worker と同じ)。ここでは role が admin か、テナントがこのカメラの持ち主かだけを見る。
 
 mod camera;
 mod clip;
@@ -26,6 +27,8 @@ pub(crate) struct Config {
     binding: String,
     max_clip_ms: i64,
     prefix: String,
+    /// 空なら確かめない (カメラの持ち主のテナントが決まるまでの間)
+    tenant: String,
 }
 
 impl Config {
@@ -37,6 +40,7 @@ impl Config {
             binding: var("CAM_VPC_BINDING", "CAM_HTTP"),
             max_clip_ms: var("MAX_CLIP_SECS", "7200").parse::<i64>().unwrap_or(7200) * 1000,
             prefix: var("PUBLIC_PATH_PREFIX", ""),
+            tenant: var("CAM_TENANT_ID", ""),
         }
     }
 }
@@ -59,10 +63,20 @@ fn fail(status: u16, message: &str) -> Result<Response> {
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let cfg = Config::from_env(&env);
     let full = req.path();
-    // auth-worker から来るときは公開側の接頭辞 (/alc-cam-clips) が付いたまま
+    // auth-worker からは振り分け表の path (/api/cam-clips/...) のまま届く
     let path = if cfg.prefix.is_empty() { full.as_str() } else { full.strip_prefix(cfg.prefix.as_str()).unwrap_or(&full) }.to_string();
+    if path == "/health" {
+        return Response::ok("ok");
+    }
+    // auth-worker が付け直したヘッダだけを信じる (この Worker に外から直接届く口は無い)
+    let header = |k: &str| req.headers().get(k).ok().flatten().unwrap_or_default();
+    if header("X-User-Role") != "admin" {
+        return fail(403, "管理者だけが使えます");
+    }
+    if !cfg.tenant.is_empty() && header("X-Tenant-ID") != cfg.tenant {
+        return fail(403, "このカメラのテナントではありません");
+    }
     match (req.method(), path.as_str()) {
-        (Method::Get, "/health") => Response::ok("ok"),
         (Method::Post, "/clips") => {
             let Ok(body) = req.json::<ClipRequest>().await else {
                 return fail(400, "本文は {\"from\": \"...\", \"to\": \"...\"} の JSON にしてください");

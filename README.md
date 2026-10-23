@@ -43,16 +43,16 @@
 Worker `alc-cam-sd-ingest`。再エンコードはしない。
 
 ```
-auth-worker ─Service Binding─▶ alc-cam-sd-ingest ─Workers VPC (HTTP, ohishi-data の Tunnel)─▶ カメラの管理画面 (Digest)
+auth-worker (/api/cam-clips/) ─Service Binding─▶ alc-cam-sd-ingest ─Workers VPC (HTTP, ohishi-data の Tunnel)─▶ カメラの管理画面 (Digest)
                                      ├▶ R2 alc-cam-recordings/<カメラ名>/<種類>/<YYYYMMDD>/<HH>/<元ファイル>.mp4  (元ファイルの置き場)
                                      └▶ R2 alc-cam-recordings/clips/<カメラ名>/<開始>_<終了>.mp4             (切り出した 1 本)
 ```
 
 ```
-POST /alc-cam-clips/clips   {"from": "2026-10-23T12:58:00+09:00", "to": "2026-10-23T12:59:30+09:00"}
+POST /api/cam-clips/clips   {"from": "2026-10-23T12:58:00+09:00", "to": "2026-10-23T12:59:30+09:00"}
 → 201 {"key": "clips/TS-NS320W-55/20261023T125800_20261023T125930.mp4", "size": …,
        "actual_from": "2026-10-23T12:57:58.257+09:00", "actual_to": "…", "sources": [元ファイル…], "reused": false}
-GET  /alc-cam-clips/clips/TS-NS320W-55/20261023T125800_20261023T125930.mp4   (Range 対応 = シークできる)
+GET  /api/cam-clips/clips/TS-NS320W-55/20261023T125800_20261023T125930.mp4   (Range 対応 = シークできる)
 ```
 
 - 時刻は ISO 8601。時差が無ければ JST。1 回 120 分まで (`MAX_CLIP_SECS`)。同じ時間帯は作り直さず 200 で返す
@@ -62,7 +62,9 @@ GET  /alc-cam-clips/clips/TS-NS320W-55/20261023T125800_20261023T125930.mp4   (Ra
   (`/action/stream?subject=recdownload`、パスに `/mnt/mmc`) 丸ごと取って置く → R2 の範囲読み出しで末尾の
   moov を読む → `crates/cam-mp4` で切ってつなぐ計画を立て → 16MiB ずつ R2 のマルチパートに写す
 - 資格情報は Worker の secret `CAM_AUTH` (`user:pass`)。repo には無い
-- 外から直接は届かない (workers_dev / route なし)。呼び手の認証は auth-worker が済ませる
+- 外から直接は届かない (workers_dev / route なし)。auth-worker の振り分け表 `ALC_BINDING_ROUTES` から届き、
+  JWT の検証は auth-worker が済ませる。Worker は付け直された `X-User-Role` が `admin` か、`X-Tenant-ID` が
+  `CAM_TENANT_ID` (カメラの持ち主。空なら確かめない) と同じかだけを見て、外れたら 403
 
 確認 (VPC は実物のカメラ、R2 は手元の模擬):
 
@@ -70,7 +72,7 @@ GET  /alc-cam-clips/clips/TS-NS320W-55/20261023T125800_20261023T125930.mp4   (Ra
 cd ingest
 printf 'CAM_AUTH="user:pass"\n' > .dev.vars   # 終わったら消す
 npx wrangler@4.152.0 dev
-curl -X POST localhost:8787/alc-cam-clips/clips -d '{"from":"2026-10-23T12:58:00","to":"2026-10-23T12:59:30"}'
+curl -X POST localhost:8787/api/cam-clips/clips -H 'X-User-Role: admin' -d '{"from":"2026-10-23T12:58:00","to":"2026-10-23T12:59:30"}'
 ```
 
 wrangler 4.58 では手元の dev から VPC に繋がらない (preview セッションの作成が 400)。

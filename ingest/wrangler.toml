@@ -1,6 +1,6 @@
 # カメラの SD 録画から、指定した時間帯を 1 本の MP4 にして R2 に置く Worker (src/lib.rs)。
 # ★ 外から直接届く口は持たない: workers_dev / preview_urls を false、route を書かない。
-#   呼び手は auth-worker の Service Binding だけ (公開側の接頭辞は PUBLIC_PATH_PREFIX)。
+#   呼び手は auth-worker の Service Binding だけ (振り分け表 ALC_BINDING_ROUTES の /api/cam-clips/)。
 name = "alc-cam-sd-ingest"
 main = "build/index.js"
 compatibility_date = "2026-09-01"
@@ -25,7 +25,10 @@ CAM_KINDS = "Schedule"
 CAM_VPC_BINDING = "CAM_HTTP"
 # 一度に切り出せる長さの上限 (秒)
 MAX_CLIP_SECS = "7200"
-PUBLIC_PATH_PREFIX = "/alc-cam-clips"
+# auth-worker から届く path の頭
+PUBLIC_PATH_PREFIX = "/api/cam-clips"
+# カメラの持ち主のテナント。auth-worker が付け直す X-Tenant-ID と比べる (空なら確かめない)
+CAM_TENANT_ID = ""
 
 [[r2_buckets]]
 binding = "RECORDINGS"
