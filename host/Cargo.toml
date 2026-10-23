@@ -14,4 +14,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 暗号は pure Rust (Windows へのクロスビルドで OpenSSL / aws-lc を持ち込まない)
 str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"] }
+# 自己更新 (GitHub Release だけ)。TLS は rustls + ring (OpenSSL / aws-lc は持ち込まない)
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+sha2 = "0.10"
 

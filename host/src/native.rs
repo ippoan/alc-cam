@@ -35,6 +35,8 @@ pub enum In {
         viewer_id: String,
         candidate: Value,
     },
+    /// GitHub の最新 Release を見て、新しければ exe を入れ替える (次の起動から新版)。config は要らない
+    UpdateCheck,
 }
 
 /// host → 拡張
@@ -48,6 +50,8 @@ pub enum Out {
     /// 見る人ごとの接続の状態
     Peer { viewer_id: String, ok: bool, message: String },
     Log { message: String },
+    /// 自己更新の状況。`state` は checking / latest / installed / failed / unsupported (checking 以外で終わり)
+    Update { state: &'static str, current: &'static str, latest: Option<String>, message: String },
 }
 
 /// 1 通読む。stdin が閉じたら `Ok(None)` (= 拡張が閉じた。host は終わる)
@@ -90,6 +94,7 @@ mod tests {
         data.extend(frame(r#"{"type":"start"}"#));
         data.extend(frame(r#"{"type":"start","viewer_id":"v1"}"#));
         data.extend(frame(r#"{"type":"sdp_answer","viewer_id":"v2","sdp":"v=0"}"#));
+        data.extend(frame(r#"{"type":"update_check"}"#));
         data.extend(frame(r#"{"type":"nope"}"#));
         let mut r = data.as_slice();
         assert_eq!(read(&mut r).unwrap(), Some(Ok(In::Config { rtsp_url: "rtsp://c/s".into(), stun: "s:1".into() })));
@@ -97,6 +102,7 @@ mod tests {
         assert_eq!(read(&mut r).unwrap(), Some(Ok(In::Start { viewer_id: String::new() })));
         assert_eq!(read(&mut r).unwrap(), Some(Ok(In::Start { viewer_id: "v1".into() })));
         assert_eq!(read(&mut r).unwrap(), Some(Ok(In::SdpAnswer { viewer_id: "v2".into(), sdp: "v=0".into() })));
+        assert_eq!(read(&mut r).unwrap(), Some(Ok(In::UpdateCheck)));
         assert!(matches!(read(&mut r).unwrap(), Some(Err(_))));
         assert_eq!(read(&mut r).unwrap(), None);
     }
@@ -108,5 +114,10 @@ mod tests {
         let len = u32::from_ne_bytes(out[..4].try_into().unwrap()) as usize;
         assert_eq!(&out[4..], br#"{"type":"sdp_offer","viewer_id":"v1","sdp":"v=0"}"#);
         assert_eq!(len, out.len() - 4);
+
+        let mut out = Vec::new();
+        let m = Out::Update { state: "installed", current: "0.3.0", latest: Some("0.3.1".into()), message: String::new() };
+        write(&mut out, &m).unwrap();
+        assert_eq!(&out[4..], br#"{"type":"update","state":"installed","current":"0.3.0","latest":"0.3.1","message":""}"#);
     }
 }

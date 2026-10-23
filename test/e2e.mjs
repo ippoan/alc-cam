@@ -208,6 +208,19 @@ try {
   await d.close();
   await waitFor(() => !hostRunning(), 15_000, 'host 終了 (v1)');
 
+  // host の自己更新: 見る人が居なくても「今すぐ確認」で確認のためだけに host を起こし、答えが来たら止める
+  // (Linux の host は入れ替えないので unsupported が返る。GitHub には出ない)
+  const upd = await ctx.newPage();
+  await upd.goto(`chrome-extension://${EXT_ID}/panel.html`);
+  await upd.click('#update-check');
+  results.update = await waitFor(async () => {
+    const t = await upd.evaluate(() => document.getElementById('st-update').textContent);
+    return t.includes('Windows だけ') ? t : null;
+  }, 10_000, 'パネルに host の更新状況');
+  await upd.close();
+  await waitFor(() => !hostRunning(), 10_000, '確認のためだけの host が終わる');
+  results.afterUpdateCheck = { hostRunning: hostRunning() };
+
   // 「停止」(enabled=false) で cam-room から抜ける
   const leftBefore = signaling.log.filter((l) => l === 'device left').length;
   await setStorage({ enabled: false });
@@ -241,6 +254,8 @@ const checks = results.error ? {} : {
   // service worker を止めても繋ぎ直して映る
   reconnectsAfterSwStop: results.afterSwRestart.cDelta > 0,
   stoppedByToggle: !!results.stoppedByToggle,
+  // 更新の確認は host の版を添えてパネルに出て、確認のためだけの host は残らない
+  updateCheck: results.update?.startsWith('v0.3.0') && results.afterUpdateCheck?.hostRunning === false,
   // データチャネルで caps が届き、押している間ステップが続き (左も上も)、要求は常に 1 本・Digest が通る
   ptzCaps: results.ptzCaps?.dirs?.length === 4 && results.ptzCaps.zoom === false,
   ptzSteps: ['move=left', 'move=up'].every((m) => results.ptz.stats.calls.filter((c) => c.startsWith(m)).length >= 2),
