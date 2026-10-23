@@ -24,6 +24,8 @@
 | `crates/cam-rtsp/` | RTSP (Digest・TCP interleaved) → H.264 Annex B。I/O を持たない |
 | `extension/` | 拠点側の Chrome 拡張 (MV3・サイドパネル)。ID は `key` で `icmmpdjddlphkbokdalofdjpkcgfiggd` に固定 |
 | `test/` | 偽カメラ・cam-room のローカル版・見る側のページと、それらを通す `e2e.mjs` |
+| `crates/cam-sd/` | カメラの SD 録画の一覧と取り出しの手順 (I/O を持たない) |
+| `ingest/` | SD 録画を R2 へ取り込む Worker `alc-cam-sd-ingest` (wasm32、別 workspace) |
 
 ## 拠点 PC への入れ方 (Windows)
 
@@ -33,6 +35,33 @@
 4. ツールバーのアイコン → サイドパネル → 設定に拠点 ID・カメラの RTSP URL (stream2) を入れて保存 → 開始
 
 見る側は alc-app の拠点カメラ画面で同じ拠点 ID を開く。
+
+## SD 録画の取り込み (ingest/)
+
+カメラの SD に録られた録画を、Worker `alc-cam-sd-ingest` が 15 分ごとに R2 (`alc-cam-recordings`) へ取り込む。
+
+```
+cron ─▶ alc-cam-sd-ingest ─Workers VPC (HTTP Service, ohishi-data の Tunnel)─▶ カメラの管理画面 (Digest)
+              └─▶ R2 alc-cam-recordings/<カメラ名>/<種類>/<YYYYMMDD>/<HH>/<ファイル名>.mp4
+```
+
+- 一覧は `camera-cgi/admin/sdcard.cgi?action=generate`、本体は `POST /action/stream?subject=recdownload`
+  (パスの頭に `/mnt/mmc`)。手順の細部と実機での確認は `crates/cam-sd/src/lib.rs` の先頭
+- 昨日と今日 (JST) を古い順に見て、R2 に同じ大きさで在るものは飛ばす。1 回 12 本 (約 1.2GB)・600 秒で打ち切り、残りは次へ
+- 本体は wasm を通さず `FixedLengthStream` で R2 へ流す。VPC 越しで約 11MB/s (100MB を 9 秒)
+- 資格情報は Worker の secret `CAM_AUTH` (`user:pass`)。repo には無い
+
+確認 (VPC は実物のカメラ、R2 は手元の模擬):
+
+```bash
+cd ingest
+printf 'CAM_AUTH="user:pass"\n' > .dev.vars   # 終わったら消す
+npx wrangler@4.152.0 dev --test-scheduled --var MAX_FILES_PER_RUN:1 --var SCAN_DAYS:1
+curl 'http://localhost:8787/cdn-cgi/handler/scheduled?cron=*/15+*+*+*+*'
+```
+
+`--var DRAIN_ONLY:1` を付けると R2 に書かず読み捨て、届いたバイト数と時間だけログに出す (経路の切り分け用)。
+wrangler 4.58 では手元の dev から VPC に繋がらない (preview セッションの作成が 400)。
 
 ## 開発
 

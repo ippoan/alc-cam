@@ -1,0 +1,10 @@
+# カメラ (I-O DATA TS-NS320W 系) の SD 録画を取り出す手順。I/O を持たない
+# (ingest/ の Worker とテストが同じものを使う)。Digest 認証は cam-rtsp のものを使う。
+[package]
+name = "cam-sd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+cam-rtsp = { path = "../cam-rtsp" }

@@ -1,0 +1,41 @@
+# カメラの SD 録画を定期的に R2 へ取り込む Worker (src/lib.rs)。
+# ★ 外から届く口は持たない: workers_dev / preview_urls を false、route を書かない。動くのは cron だけ。
+name = "alc-cam-sd-ingest"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+account_id = "24b45709d060d957340180e995f0d373"
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "cargo install -q worker-build@0.8.7 && worker-build --release"
+
+# 1 回で最大 MAX_FILES_PER_RUN 本 (約 100MB/本)・RUN_BUDGET_SECS 秒。メインストリームの 24 時間録画は
+# 約 15 本/時なので、15 分ごとに 12 本で追いつく
+[triggers]
+crons = ["*/15 * * * *"]
+
+[observability]
+enabled = true
+
+# CAM_AUTH (カメラの管理画面の user:pass) は secret。`wrangler secret put CAM_AUTH` で入れる (値は repo に無い)
+[vars]
+CAM_NAME = "TS-NS320W-55"
+CAM_KINDS = "Schedule"
+CAM_VPC_BINDING = "CAM_HTTP"
+MAX_FILES_PER_RUN = "12"
+RUN_BUDGET_SECS = "600"
+SCAN_DAYS = "2"
+
+[[r2_buckets]]
+binding = "RECORDINGS"
+bucket_name = "alc-cam-recordings"
+# `wrangler dev --remote` で使う別バケット。素の `wrangler dev` では R2 は手元の模擬 (remote を付けない) なので、
+# 本番の録画に確認用の書き込みが混ざらない (VPC だけは remote = true で実物のカメラに届く)
+preview_bucket_name = "alc-cam-recordings-preview"
+
+# カメラ (TS-NS320W-55) の管理画面 (HTTP 80)。宛先は VPC Service 側に閉じる (ohishi-data の Tunnel 経由)
+[[vpc_services]]
+binding = "CAM_HTTP"
+service_id = "01a166ef-0929-7330-af52-3da25f41c42e"
+remote = true

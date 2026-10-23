@@ -2,8 +2,11 @@
 #   host/            native messaging の常駐 alc-cam-host (RTSP → WebRTC、再エンコードなし)
 #   crates/cam-rtsp  RTSP (TCP interleaved) → H.264 Annex B のアクセスユニット (I/O を持たない)
 #   extension/       拠点側の Chrome 拡張 (cf-alc-signaling の /cam-room に device として繋ぎ、host と中継する)
+#   crates/cam-sd    カメラの SD 録画の一覧と取り出しの手順 (I/O を持たない)
+#   ingest/          SD 録画を定期的に R2 へ取り込む Worker `alc-cam-sd-ingest` (wasm32 専用なので別 workspace)
 [workspace]
-members = ["host", "crates/cam-rtsp"]
+members = ["host", "crates/cam-rtsp", "crates/cam-sd"]
+exclude = ["ingest"]
 resolver = "2"
 
 [profile.release]
