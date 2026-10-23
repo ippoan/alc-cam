@@ -1,6 +1,10 @@
 # カメラの SD 録画から、指定した時間帯を 1 本の MP4 にして R2 に置く Worker (src/lib.rs)。
 # ★ 外から直接届く口は持たない: workers_dev / preview_urls を false、route を書かない。
 #   呼び手は auth-worker の Service Binding だけ (振り分け表 ALC_BINDING_ROUTES の /api/cam-clips/)。
+#   scripts/check-exposure.sh が CI で毎回これを検査する。
+# ★ 表の順を変えない・[build] より前に表を足さない・[env.local] と [env.local.vars] の間に表を挟まない
+#   (scripts/check-exposure-test.sh の陰性対照は、[build] と [env.local.vars] の直前に行を挿して崩す作り)。
+#   新しい表は [build] より後、[env.local] より前に置く。
 name = "alc-cam-sd-ingest"
 main = "build/index.js"
 compatibility_date = "2026-09-01"
@@ -15,30 +19,60 @@ command = "cargo install -q worker-build@0.8.7 && worker-build --release"
 [limits]
 cpu_ms = 300000
 
+# 本番の DB は aws:ap-northeast-1。Worker をその近くで動かす (cron と `wrangler dev --remote` には効かない)
+[placement]
+region = "aws:ap-northeast-1"
+
 [observability]
 enabled = true
 
-# CAM_AUTH (カメラの管理画面の user:pass) は secret。`wrangler secret put CAM_AUTH` で入れる (値は repo に無い)
+# vars は env に継承されないので、env.local にも同じものを書く
 [vars]
-CAM_NAME = "TS-NS320W-55"
-CAM_KINDS = "Schedule"
-CAM_VPC_BINDING = "CAM_HTTP"
 # 一度に切り出せる長さの上限 (秒)
 MAX_CLIP_SECS = "7200"
 # auth-worker から届く path の頭
 PUBLIC_PATH_PREFIX = "/api/cam-clips"
-# カメラの持ち主のテナント。auth-worker が付け直す X-Tenant-ID と比べる (空なら確かめない)
-CAM_TENANT_ID = ""
 
 [[r2_buckets]]
 binding = "RECORDINGS"
 bucket_name = "alc-cam-recordings"
-# `wrangler dev --remote` で使う別バケット。素の `wrangler dev` では R2 は手元の模擬 (remote を付けない) なので、
-# 本番の録画に確認用の書き込みが混ざらない (VPC だけは remote = true で実物のカメラに届く)
+# `wrangler dev --remote` で使う別バケット (本番の録画に確認用の書き込みを混ぜない)
 preview_bucket_name = "alc-cam-recordings-preview"
 
-# カメラ (TS-NS320W-55) の管理画面 (HTTP 80)。宛先は VPC Service 側に閉じる (ohishi-data の Tunnel 経由)
-[[vpc_services]]
-binding = "CAM_HTTP"
-service_id = "01a166ef-0929-7330-af52-3da25f41c42e"
+# 本番の DB: Cloudflare Hyperdrive の binding CAM_HYPERDRIVE (src/db.rs)。設定は実行用ロールのもの 1 つを
+# 複数の worker で共有する (worker ごとに作らない。id は ippoan/alc-vein-worker・ippoan/alc-lineworks-worker と同じ)。
+# 接続先・資格情報・TLS は設定の側に在り、ここに書くのは設定の ID だけ。
+# env.local には置かない (binding は env に継承されない。scripts/check-exposure.sh が検査する)。
+[[hyperdrive]]
+binding = "CAM_HYPERDRIVE"
+id = "6bdf446634034f989d4e094d5510b162"
+
+# cameras.rec_password_encrypted の暗号化・復号の鍵 (auth-worker・alc-lineworks と同じ Secrets Store の secret。値は repo に無い)
+[[secrets_store_secrets]]
+binding = "SSO_ENCRYPTION_KEY"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "sso-encryption-key"
+
+# カメラへの口 (Workers VPC の VPC Network)。URL の host (cameras.rec_ip) がそのまま宛先になり、
+# binding は宛先を絞らない — 宛先は src/camera.rs が api/src/dest.rs の検査 (私設帯の IPv4・ポート 80・転送を追わない)
+# を通したものだけにする。本番 (トップレベル) にだけ置く (scripts/check-exposure.sh が検査する)
+[[vpc_networks]]
+binding = "CAM_NET"
+tunnel_id = "589ac3b8-a73b-4cb8-b2ba-61719490b47d"
 remote = true
+
+# ローカル (`wrangler dev --env local`) 専用。deploy しない。
+# Hyperdrive も VPC も持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL (.dev.vars) の段で繋ぐ。
+# R2 は手元の模擬。カメラには届かないので切り出しの口は失敗する (台帳の口の確認用)
+[env.local]
+name = "alc-cam-sd-ingest-local"
+workers_dev = false
+preview_urls = false
+
+[env.local.vars]
+MAX_CLIP_SECS = "7200"
+PUBLIC_PATH_PREFIX = "/api/cam-clips"
+
+[[env.local.r2_buckets]]
+binding = "RECORDINGS"
+bucket_name = "alc-cam-recordings-preview"

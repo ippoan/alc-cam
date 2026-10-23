@@ -1,7 +1,8 @@
 # カメラの SD 録画から、指定した時間帯を 1 本の MP4 にして R2 に置く Worker `alc-cam-sd-ingest`。
-# wasm32 専用なので root の workspace から外し、ここを自分の workspace にする (lock も ingest/Cargo.lock)。
-# 手順 (一覧・取り出し・Digest・時刻) は crates/cam-sd、MP4 の切ってつなぐ部分は crates/cam-mp4 に在り、
-# ここが持つのは VPC への fetch と R2 の読み書き・HTTP の口だけ。
+# root の workspace から外し、ここを自分の workspace にする (lock も ingest/Cargo.lock)。
+# 直下の package が worker (wasm32 専用)、口の中身 (認可・入力と宛先の検査・SQL) は api/ (native でもビルドでき、
+# 実 DB のテストを持つ)。手順 (一覧・取り出し・Digest・時刻) は crates/cam-sd、MP4 の切ってつなぐ部分は crates/cam-mp4。
+# ここが持つのはカメラへの fetch と R2 の読み書き・Secrets Store・workers-rs への載せ方だけ。
 [package]
 name = "alc-cam-sd-ingest"
 version = "0.1.0"
@@ -12,19 +13,31 @@ publish = false
 crate-type = ["cdylib"]
 
 [workspace]
+members = ["api"]
+
+# alc-worker-db・alc-worker-crypto は ippoan/alc-worker-kit から引く。git 依存・rev 固定で、2 つとも同じ rev
+# (ippoan/alc-lineworks-worker と同じ rev)。**書くのはここ 1 か所だけ** (worker と api は `workspace = true` で継承する)。
+# 出どころが 2 つになると `PgClient` などが別の型になる。rev を上げるときは一緒に上げ、Cargo.lock も一緒に更新する。
+[workspace.dependencies]
+alc-worker-crypto = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2" }
+alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2" }
 
 # 使わない依存は入れない
 [dependencies]
+alc-worker-crypto = { workspace = true }
+alc-worker-db = { workspace = true }
+cam-ingest-api = { path = "api" }
 cam-mp4 = { path = "../crates/cam-mp4" }
 cam-sd = { path = "../crates/cam-sd" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 js-sys = "0.3"
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
+uuid = "1"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["ReadableStream"] }
-worker = "=0.8.7"
+worker = { version = "=0.8.7", features = ["tokio-postgres"] }
 
 [profile.release]
 opt-level = "s"
