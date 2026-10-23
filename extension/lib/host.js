@@ -1,5 +1,5 @@
-// native messaging の alc-cam-host (Rust)。このページが開いている間だけ Chrome が起動し、
-// ページが閉じる (= port が切れる) と host の stdin が閉じて終了する。
+// native messaging の alc-cam-host (Rust)。background が見る人が来たときに connectNative で起動し、
+// 最後の見る人が離れて port を切る (または service worker が止まる) と host の stdin が閉じて終了する。
 // メッセージは docs/host-protocol.md の表のとおり。
 
 export const HOST_NAME = 'org.ippoan.alc_cam_host';

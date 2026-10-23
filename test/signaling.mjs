@@ -5,6 +5,9 @@
 //   device からの sdp_offer/ice_candidate は viewer_id の admin へだけ、viewer_id を外して渡す
 // - 見る側 (admin) へのメッセージは v1 と同じ (viewer_id を知らない)
 // - `v1Sites` に入れた部屋は device の proto を無視して v1 として扱う (古い DO の代わり)
+// - keepalive: `{"type":"ping"}` ちょうどには `{"type":"pong"}` ちょうどを返し、log に残さない
+//   (本物は setWebSocketAutoResponse で runtime が返し DO は起きない)。数は keepalive に数える。
+//   1 文字でも違う ping は従来の `ping` 分岐 (log に `device: ping` が残る = 本物なら DO を起こす)
 // 本物との違い: admin の token を検証しない (ローカル確認用)。
 //   import { startSignaling } from './signaling.mjs'
 
@@ -17,11 +20,22 @@ import { WebSocketServer } from 'ws';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const MAX_ADMINS = 4;
+// cf-alc-signaling src/keepalive.ts の KEEPALIVE_PING / KEEPALIVE_PONG と同じ
+const KEEPALIVE_PING = '{"type":"ping"}';
+const KEEPALIVE_PONG = '{"type":"pong"}';
 
 export function startSignaling({ port, v1Sites = [] }) {
   /** siteId → { device, v2, admins: Map<viewer_id, ws> } */
   const rooms = new Map();
   const log = [];
+  const keepalive = { device: 0, admin: 0 };
+  // 完全一致の ping に runtime と同じく応じる (true = 応じた)
+  const autoResponse = (ws, data, role) => {
+    if (data.toString() !== KEEPALIVE_PING) return false;
+    keepalive[role]++;
+    ws.send(KEEPALIVE_PONG);
+    return true;
+  };
   const send = (ws, msg) => ws?.readyState === 1 && ws.send(JSON.stringify(msg));
   const withId = (room, msg, viewerId) => (room.v2 ? { ...msg, viewer_id: viewerId } : msg);
 
@@ -61,6 +75,7 @@ export function startSignaling({ port, v1Sites = [] }) {
       send(ws, withId(room, { type: 'peer_joined', role: 'admin' }, viewerId));
     }
     ws.on('message', (data) => {
+      if (autoResponse(ws, data, 'device')) return;
       const msg = parse(ws, data);
       if (!msg) return;
       log.push(`device: ${msg.type}${msg.viewer_id ? ` → ${msg.viewer_id}` : ''}`);
@@ -94,6 +109,7 @@ export function startSignaling({ port, v1Sites = [] }) {
     send(room.device, withId(room, { type: 'peer_joined', role: 'admin' }, viewerId));
     if (room.device) send(ws, { type: 'peer_joined', role: 'device' });
     ws.on('message', (data) => {
+      if (autoResponse(ws, data, 'admin')) return;
       const msg = parse(ws, data);
       if (!msg) return;
       log.push(`admin ${viewerId}: ${msg.type}`);
@@ -128,5 +144,5 @@ export function startSignaling({ port, v1Sites = [] }) {
   }
 
   server.listen(port, '127.0.0.1');
-  return { log, close: () => server.close() };
+  return { log, keepalive, close: () => server.close() };
 }

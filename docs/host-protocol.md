@@ -1,8 +1,9 @@
 # 拡張 ⇄ alc-cam-host のメッセージ
 
 Chrome の native messaging (4 バイトの長さ + UTF-8 JSON、`host/src/native.rs`)。
-host は拡張のサイドパネルが `connectNative('org.ippoan.alc_cam_host')` した時に起動し、
-パネルが閉じて stdin が閉じると終わる。stdout にはこの枠以外を書かない (ログは stderr)。
+host は拡張の background service worker が、見る人が来た時に `connectNative('org.ippoan.alc_cam_host')` して起動し、
+最後の見る人が離れて約 5 秒後に port を切る (stdin が閉じる) と終わる。service worker が止まった時も stdin が閉じて終わり、
+起き直した service worker が見る人の居る部屋に繋ぎ直せば、また起動する。stdout にはこの枠以外を書かない (ログは stderr)。
 
 1 台のカメラを複数人 (上限 4) が同時に見られる。見る人は cam-room の DO が付ける `viewer_id` で区別する
 (cam-room の v2。拡張は `?role=device&proto=2` で入る)。`viewer_id` が無い (古い拡張・v1 の部屋) ときは
@@ -51,7 +52,7 @@ host は拡張のサイドパネルが `connectNative('org.ippoan.alc_cam_host')
 
 カメラ中継規約 (ippoan/alc-gw の `docs/camera-relay-convention.md`) との対応:
 映像のみ・H.264 パススルー・STUN のみ (TURN なし)・device 側 non-trickle・見る人の出入りで
-RTSP と PeerConnection を起こす/畳む、はすべて同じ。違いは「拡張を開いている間だけ device が居る」ことと、
+RTSP と PeerConnection を起こす/畳む、はすべて同じ。違いは device (拡張の service worker) が Chrome の動いている間だけ居ることと、
 cam-room v2 で見る人を複数持てることだけ。上り帯域は 人数 × stream2 になる。
 
 ## 見る側 ⇄ host: 首振り (データチャネル `ptz`)
@@ -59,7 +60,7 @@ cam-room v2 で見る人を複数持てることだけ。上り帯域は 人数 
 host の offer には映像のほかにデータチャネル `ptz` (ordered・reliable) が 1 本入っている。繋がると見る側の
 `RTCPeerConnection` に `datachannel` イベントで届く。映像と同じ P2P の経路で、**拡張・cam-room は関わらない**
 (cam-room に入れる人 = admin と運行管理者席は全員操作できる)。中身は 1 通 1 個の JSON 文字列。
-古い host (0.2.0 まで) は `ptz` を出さないので、見る側は届かなければボタンを出さない。
+首振りより前の host は `ptz` を出さないので、見る側は届かなければボタンを出さない。
 
 host → 見る側:
 

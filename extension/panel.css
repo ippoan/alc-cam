@@ -26,7 +26,7 @@ details { border-top: 1px solid var(--line); padding-top: 8px; }
 summary { cursor: pointer; color: var(--muted); }
 form { display: grid; gap: 8px; margin-top: 8px; }
 label { display: grid; gap: 2px; color: var(--muted); }
-label.check { display: flex; gap: 6px; align-items: center; }
+.note { margin: 0 0 8px; color: var(--muted); }
 input, select { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); color: var(--fg); min-width: 0; }
 .row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
 #saved { color: var(--ok); }
