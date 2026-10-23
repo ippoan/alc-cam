@@ -11,6 +11,9 @@
 //! - `GET /device-candidates?days=30` — 映している端末を選ぶための、直近のイベントの端末の一覧
 //! - `POST /clips` に `{"camera_id": "...", "from": "...", "to": "..."}` (ISO 8601。時差が無ければ JST)
 //! - `GET /clips/<tenant>/<camera_id>/<開始>_<終了>.mp4` で取り出す (Range 対応 = シークできる)
+//! - `GET /events?camera_id=<uuid>&date=YYYY-MM-DD` — そのカメラの JST の 1 日のイベントと、切り出し済みならその clip
+//!
+//! cron (wrangler.toml の `[triggers]`、1 時間ごと): 結び付けた端末のイベントの前後 10 秒を自動で切り出す (src/auto.rs)
 //!
 //! 外から直接届く口は持たない (workers_dev / route なし)。auth-worker の振り分け表 (`ALC_BINDING_ROUTES`)
 //! から Service Binding で届き、JWT の検証は auth-worker が済ませて `X-Tenant-ID` / `X-User-Role` /
@@ -21,6 +24,7 @@
 // worker 本体は wasm32 専用。native の `cargo test` / `clippy` (workspace) では空の crate にして、api/ だけを検査させる
 #![cfg(target_arch = "wasm32")]
 
+mod auto;
 mod camera;
 mod clip;
 mod db;
@@ -32,7 +36,7 @@ use cam_ingest_api::{clip_r2_key, raw_r2_prefix, ApiError, Caller, Op, Reply};
 use cam_sd::jst_iso;
 use camera::Camera;
 use uuid::Uuid;
-use worker::{console_error, event, Context, Env, Headers, Method, Range, Request, Response, Result};
+use worker::{console_error, event, Context, Env, Headers, Method, Range, Request, Response, Result, ScheduleContext, ScheduledEvent};
 
 /// 暗号化の鍵 (Secrets Store。auth-worker・alc-lineworks と同じ secret)
 const SSO_ENCRYPTION_KEY_BINDING: &str = "SSO_ENCRYPTION_KEY";
@@ -89,6 +93,12 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         Ok(r) => json(r.status, &r.body),
         Err(e) => fail(&e),
     }
+}
+
+/// 1 時間ごとの自動切り出し (wrangler.toml の `[triggers]`、本番だけ)。中身は src/auto.rs
+#[event(scheduled)]
+async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    auto::run(&env).await;
 }
 
 /// 台帳と端末の候補の口 (鍵は DB の transaction の外で先に引く)。書く binding がこの Worker に無ければ 400
@@ -165,6 +175,7 @@ async fn create_clip(env: &Env, caller: &Caller, camera_id: Uuid, from_ms: i64, 
             "actual_to": jst_iso(m.actual_to_ms),
             "sources": m.sources,
             "reused": m.reused,
+            "truncated": cam_ingest_api::truncated(from_ms, to_ms, m.actual_from_ms, m.actual_to_ms),
         }),
     })
 }

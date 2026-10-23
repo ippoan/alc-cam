@@ -382,3 +382,279 @@ pub async fn record_clip(pg: &mut PgClient, tenant: Uuid, c: ClipRecord) -> Resu
     })
     .await
 }
+
+// ---- cron の自動切り出し (`crate::auto`) と、その日のイベントの口 ----
+
+/// 録画を取り込むカメラを持つテナント。テナントの確定前なので nil のテナントの transaction で、SECURITY DEFINER の
+/// 関数 (migration 187) だけを読む (RLS の表は 1 行も見えない)
+pub async fn recording_tenants(pg: &mut PgClient) -> Result<Vec<Uuid>, Error> {
+    pg.tenant_tx(Uuid::nil(), move |tx| {
+        Box::pin(async move {
+            let rows = tx.query_typed("SELECT alc_api.list_cam_recording_tenant_ids()", &[]).await?;
+            Ok(rows.iter().map(|r| r.get::<_, Uuid>(0)).collect())
+        })
+    })
+    .await
+}
+
+/// cron が切り出すカメラ (`rec_ip IS NOT NULL`) と、切り出しに要る値
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingCamera {
+    pub id: Uuid,
+    pub source: ClipSource,
+    pub scanned_until_ms: Option<i64>,
+}
+impl TxOutput for RecordingCamera {}
+
+pub async fn recording_cameras(pg: &mut PgClient, tenant: Uuid) -> Result<Vec<RecordingCamera>, Error> {
+    pg.tenant_tx(tenant, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(
+                    "SELECT id, rec_ip, rec_username, rec_password_encrypted, (extract(epoch FROM rec_scanned_until) * 1000)::int8
+                       FROM alc_api.cameras WHERE tenant_id = $1 AND rec_ip IS NOT NULL ORDER BY id",
+                    &[(&tenant, Type::UUID)],
+                )
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| RecordingCamera {
+                    id: r.get(0),
+                    source: ClipSource { vpc_binding: r.get(1), rec_username: r.get(2), rec_password_encrypted: r.get(3) },
+                    scanned_until_ms: r.get(4),
+                })
+                .collect())
+        })
+    })
+    .await
+}
+
+/// イベントの元 (hub_measurements の 4 種と指静脈の登録)。`$1` テナント、`$3`/`$4` は UNIX ms の `[from, to)`。
+/// 時刻の比較は ms を interval で足す (浮動小数の to_timestamp で境目がずれないように)
+macro_rules! events_cte {
+    () => {
+        "WITH ev AS (
+    SELECT 'hub_measurements'::text AS source_table, h.id, h.kind, COALESCE(h.recorded_at, h.created_at) AS at, h.device_id
+      FROM alc_api.hub_measurements h
+     WHERE h.tenant_id = $1
+       AND h.kind IN ('alcohol', 'blood_pressure', 'timecard', 'license')
+       AND COALESCE(h.recorded_at, h.created_at) >= 'epoch'::timestamptz + $3::int8 * interval '1 millisecond'
+       AND COALESCE(h.recorded_at, h.created_at) < 'epoch'::timestamptz + $4::int8 * interval '1 millisecond'
+    UNION ALL
+    SELECT 'vein_enroll_events', v.id, 'vein_enroll', v.created_at, v.registered_device_id
+      FROM alc_api.vein_enroll_events v
+     WHERE v.tenant_id = $1 AND v.registered_device_id IS NOT NULL
+       AND v.created_at >= 'epoch'::timestamptz + $3::int8 * interval '1 millisecond'
+       AND v.created_at < 'epoch'::timestamptz + $4::int8 * interval '1 millisecond'
+)
+"
+    };
+}
+
+/// 結び付けた端末の、まだそのカメラで切っていないイベント
+const SELECT_AUTO_EVENTS: &str = concat!(
+    events_cte!(),
+    "SELECT ev.source_table, ev.id, ev.kind, (extract(epoch FROM ev.at) * 1000)::int8, ev.device_id
+  FROM ev
+ WHERE ev.device_id IN (SELECT d.device_id FROM alc_api.cam_camera_devices d WHERE d.tenant_id = $1 AND d.camera_id = $2)
+   AND NOT EXISTS (SELECT 1 FROM alc_api.cam_clip_events e
+                    WHERE e.tenant_id = $1 AND e.camera_id = $2 AND e.source_table = ev.source_table AND e.source_id = ev.id)
+ ORDER BY ev.at, ev.source_table, ev.id"
+);
+
+/// その日の口: 結び付けた端末のイベント (と、結び付けを外した後も切り出し済みのイベント) と、切り出し済みならその clip
+const SELECT_DAY_EVENTS: &str = concat!(
+    events_cte!(),
+    "SELECT ev.source_table, ev.id, ev.kind, (extract(epoch FROM ev.at) * 1000)::int8, ev.device_id,
+       c.id, c.r2_key, c.status, c.error
+  FROM ev
+  LEFT JOIN alc_api.cam_clip_events e
+         ON e.tenant_id = $1 AND e.camera_id = $2 AND e.source_table = ev.source_table AND e.source_id = ev.id
+  LEFT JOIN alc_api.cam_clips c ON c.tenant_id = e.tenant_id AND c.id = e.clip_id
+ WHERE ev.device_id IN (SELECT d.device_id FROM alc_api.cam_camera_devices d WHERE d.tenant_id = $1 AND d.camera_id = $2)
+    OR e.clip_id IS NOT NULL
+ ORDER BY ev.at, ev.source_table, ev.id"
+);
+
+/// 開発端末の軸の transaction の頭で流す (transaction 単位。COMMIT で消える)
+const SET_DEVICE_DEV: &str = "SELECT set_config('app.device_dev', '1', true)";
+
+/// 拾ったイベント (`[from, to)`、本番の行と開発端末の行。軸ごとに別の transaction)
+pub async fn auto_events(
+    pg: &mut PgClient,
+    tenant: Uuid,
+    camera_id: Uuid,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Vec<crate::auto::Event>, Error> {
+    let mut all = Vec::new();
+    for is_dev in [false, true] {
+        let rows = pg
+            .tenant_tx(tenant, move |tx| {
+                Box::pin(async move {
+                    if is_dev {
+                        tx.query_typed(SET_DEVICE_DEV, &[]).await?;
+                    }
+                    let rows = tx
+                        .query_typed(
+                            SELECT_AUTO_EVENTS,
+                            &[(&tenant, Type::UUID), (&camera_id, Type::UUID), (&from_ms, Type::INT8), (&to_ms, Type::INT8)],
+                        )
+                        .await?;
+                    Ok(rows
+                        .iter()
+                        .map(|r| crate::auto::Event {
+                            source_table: r.get(0),
+                            source_id: r.get(1),
+                            kind: r.get(2),
+                            at_ms: r.get(3),
+                            device_id: r.get(4),
+                            is_dev,
+                        })
+                        .collect::<Vec<_>>())
+                })
+            })
+            .await?;
+        all.extend(rows);
+    }
+    Ok(all)
+}
+
+/// 切り出しに含めたイベントを残す (is_dev=false は通常の transaction、true は開発端末の軸の transaction)。
+/// 同じカメラ・元の表・元の行が既に在れば何もしない
+pub async fn record_clip_events(
+    pg: &mut PgClient,
+    tenant: Uuid,
+    camera_id: Uuid,
+    clip_id: Uuid,
+    events: Vec<crate::auto::Event>,
+) -> Result<(), Error> {
+    for is_dev in [false, true] {
+        let mine: Vec<&crate::auto::Event> = events.iter().filter(|e| e.is_dev == is_dev).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let tables: Vec<String> = mine.iter().map(|e| e.source_table.clone()).collect();
+        let ids: Vec<Uuid> = mine.iter().map(|e| e.source_id).collect();
+        let kinds: Vec<String> = mine.iter().map(|e| e.kind.clone()).collect();
+        let ats: Vec<i64> = mine.iter().map(|e| e.at_ms).collect();
+        let devices: Vec<String> = mine.iter().map(|e| e.device_id.clone()).collect();
+        pg.tenant_tx(tenant, move |tx| {
+            Box::pin(async move {
+                if is_dev {
+                    tx.query_typed(SET_DEVICE_DEV, &[]).await?;
+                }
+                tx.execute_typed(
+                    "INSERT INTO alc_api.cam_clip_events (tenant_id, camera_id, clip_id, source_table, source_id, kind, occurred_at, device_id, is_dev)
+                     SELECT $1, $2, $3, t, i, k, 'epoch'::timestamptz + a * interval '1 millisecond', d, $9
+                       FROM unnest($4::text[], $5::uuid[], $6::text[], $7::int8[], $8::text[]) AS x(t, i, k, a, d)
+                     ON CONFLICT (tenant_id, camera_id, source_table, source_id) DO NOTHING",
+                    &[
+                        (&tenant, Type::UUID),
+                        (&camera_id, Type::UUID),
+                        (&clip_id, Type::UUID),
+                        (&tables, Type::TEXT_ARRAY),
+                        (&ids, Type::UUID_ARRAY),
+                        (&kinds, Type::TEXT_ARRAY),
+                        (&ats, Type::INT8_ARRAY),
+                        (&devices, Type::TEXT_ARRAY),
+                        (&is_dev, Type::BOOL),
+                    ],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+/// 走査済み時刻を書く
+pub async fn set_scanned_until(pg: &mut PgClient, tenant: Uuid, camera_id: Uuid, until_ms: i64) -> Result<(), Error> {
+    pg.tenant_tx(tenant, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                "UPDATE alc_api.cameras SET rec_scanned_until = 'epoch'::timestamptz + $3::int8 * interval '1 millisecond'
+                  WHERE tenant_id = $1 AND id = $2",
+                &[(&tenant, Type::UUID), (&camera_id, Type::UUID), (&until_ms, Type::INT8)],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// 切り出し済みの clip (その日の口)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipRef {
+    pub clip_id: Uuid,
+    pub key: String,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+/// その日の口の 1 行
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayEvent {
+    pub event: crate::auto::Event,
+    pub clip: Option<ClipRef>,
+}
+impl TxOutput for DayEvent {}
+
+/// カメラの `[from, to)` のイベント (本番と開発端末。時刻の順)
+pub async fn day_events(
+    pg: &mut PgClient,
+    tenant: Uuid,
+    camera_id: Uuid,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Vec<DayEvent>, Error> {
+    let mut all = Vec::new();
+    for is_dev in [false, true] {
+        let rows = pg
+            .tenant_tx(tenant, move |tx| {
+                Box::pin(async move {
+                    if is_dev {
+                        tx.query_typed(SET_DEVICE_DEV, &[]).await?;
+                    }
+                    let rows = tx
+                        .query_typed(
+                            SELECT_DAY_EVENTS,
+                            &[(&tenant, Type::UUID), (&camera_id, Type::UUID), (&from_ms, Type::INT8), (&to_ms, Type::INT8)],
+                        )
+                        .await?;
+                    Ok(rows
+                        .iter()
+                        .map(|r| DayEvent {
+                            event: crate::auto::Event {
+                                source_table: r.get(0),
+                                source_id: r.get(1),
+                                kind: r.get(2),
+                                at_ms: r.get(3),
+                                device_id: r.get(4),
+                                is_dev,
+                            },
+                            clip: r.get::<_, Option<Uuid>>(5).map(|clip_id| ClipRef {
+                                clip_id,
+                                key: r.get(6),
+                                status: r.get(7),
+                                error: r.get(8),
+                            }),
+                        })
+                        .collect::<Vec<_>>())
+                })
+            })
+            .await?;
+        all.extend(rows);
+    }
+    all.sort_by(|a, b| {
+        a.event
+            .at_ms
+            .cmp(&b.event.at_ms)
+            .then_with(|| a.event.source_table.cmp(&b.event.source_table))
+            .then_with(|| a.event.source_id.cmp(&b.event.source_id))
+    });
+    Ok(all)
+}

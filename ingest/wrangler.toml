@@ -19,6 +19,10 @@ command = "cargo install -q worker-build@0.8.7 && worker-build --release"
 [limits]
 cpu_ms = 300000
 
+# 1 時間ごとに、結び付けた端末のイベントの前後 10 秒を自動で切り出す (src/auto.rs)。env.local は止める
+[triggers]
+crons = ["0 * * * *"]
+
 # 本番の DB は aws:ap-northeast-1。Worker をその近くで動かす (cron と `wrangler dev --remote` には効かない)
 [placement]
 region = "aws:ap-northeast-1"
@@ -32,6 +36,8 @@ enabled = true
 MAX_CLIP_SECS = "7200"
 # auth-worker から届く path の頭
 PUBLIC_PATH_PREFIX = "/api/cam-clips"
+# cron の 1 回で切るまとまりのカメラあたりの上限 (超えた分は次の回へ)
+AUTO_CLIP_MAX_GROUPS = "40"
 
 [[r2_buckets]]
 binding = "RECORDINGS"
@@ -77,7 +83,12 @@ preview_urls = false
 [env.local.vars]
 MAX_CLIP_SECS = "7200"
 PUBLIC_PATH_PREFIX = "/api/cam-clips"
+AUTO_CLIP_MAX_GROUPS = "40"
 
 [[env.local.r2_buckets]]
 binding = "RECORDINGS"
 bucket_name = "alc-cam-recordings-preview"
+
+# triggers は env に継承されないが、明示して止める (`--test-scheduled` の /__scheduled では手で叩ける)
+[env.local.triggers]
+crons = []

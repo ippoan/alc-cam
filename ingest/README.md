@@ -21,7 +21,28 @@ POST  /api/cam-clips/clips                   {"camera_id": "...", "from": "2026-
 → 201 {"clip_id": …, "key": "clips/<tenant>/<camera_id>/20261023T125800_20261023T125930.mp4", "size": …,
        "actual_from": "2026-10-23T12:57:58.257+09:00", "actual_to": "…", "sources": [元ファイル…], "reused": false}
 GET   /api/cam-clips/clips/<tenant>/<camera_id>/20261023T125800_20261023T125930.mp4   (Range 対応 = シークできる。他テナントのキーは 404)
+GET   /api/cam-clips/events?camera_id=<uuid>&date=2026-10-23   (JST の 1 日)
+→ 200 [{"source_table", "source_id", "kind", "occurred_at", "device_id", "is_dev", "clip": {"clip_id", "key", "status", "error"} | null}]
 ```
+
+- `POST /clips` の応答の `truncated` は、要求より短い範囲しか取れなかった (`actual_from` > `from` か `actual_to` < `to`) とき true
+
+### 自動の切り出し (cron、1 時間ごと)
+
+`[triggers] crons = ["0 * * * *"]` (本番だけ。`env.local` は空)。中身は `ingest/api/src/auto.rs` (純関数と 1 カメラ分の流れ)
+と `ingest/src/auto.rs` (カメラと R2)。
+
+- テナント (`list_cam_recording_tenant_ids()`) → `rec_ip IS NOT NULL` のカメラの順に巡る
+- 範囲は `[rec_scanned_until (NULL なら 2 時間前), now)`。結び付けた端末 (`cam_camera_devices`) の `hub_measurements`
+  (alcohol / blood_pressure / timecard / license、時刻は `COALESCE(recorded_at, created_at)`) と `vein_enroll_events` を、
+  本番の行と開発端末の行 (`app.device_dev='1'` の transaction) の両方から拾う。`cam_clip_events` に在るものは除く
+- 各イベントの前後 10 秒。重なる・接する窓は 1 本にまとめる
+- 切ってよいのは、まとまりの終わりが SD の一覧の「最後の閉じたファイルの終わり」(= 一覧で次のファイル、書き込み途中の
+  `_!` を含む、の開始。後ろに何も無ければその開始) 以内のときだけ。越えたまとまりと以降、カメラあたり
+  `AUTO_CLIP_MAX_GROUPS` (40) を超えた分は次の回へ回し、`rec_scanned_until` をその頭 (最初のイベント - 10 秒) にする
+- 同じ SD ファイルにかかるまとまりは R2 の元ファイルを使い回す (1 回の中で取り寄せは 1 ファイル 1 回)
+- R2 → `cam_clips` (ready / failed) → `cam_clip_events` の順に書く。失敗しても再試行しない
+- SD の一覧が取れなかった回は何も書かず、`rec_scanned_until` も進めない
 
 - 時刻は ISO 8601。時差が無ければ JST。1 回 120 分まで (`MAX_CLIP_SECS`)。同じ時間帯は作り直さず 200 で返す。
   結果 (ready / failed) は `cam_clips` に残す

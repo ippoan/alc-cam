@@ -3,8 +3,9 @@
 
 use std::collections::HashMap;
 
+use cam_ingest_api::auto::{listed_files, ListedFile};
 use cam_mp4::{parse_moov, plan_clip, BoxHeader, Moov, Source};
-use cam_sd::{file_start_ms, hours_to_scan, list_path, overlapping, parse_listing, safe_segment, wanted, Recording};
+use cam_sd::{hours_to_scan, list_path, overlapping, parse_listing, Recording};
 use futures_util::StreamExt;
 use worker::{console_log, Bucket, Data, HttpMetadata, MultipartUpload, Range, Result, UploadedPart};
 
@@ -45,15 +46,6 @@ impl From<cam_mp4::Error> for Fail {
     }
 }
 
-struct Found {
-    start_ms: i64,
-    kind: String,
-    date: String,
-    hour: String,
-    name: String,
-    size: u64,
-}
-
 /// 切り出しの置き場
 pub struct Target {
     /// SD のいちばん上のフォルダ (カメラ名)
@@ -64,44 +56,65 @@ pub struct Target {
     pub raw_prefix: String,
 }
 
+/// `[from, to)` の時のフォルダ (`lead_ms` だけ前から) の SD のファイル。書き込み途中 (`closed = false`) も含めて開始の順
+pub async fn list(cam: &mut Camera, sd_root: &str, from_ms: i64, to_ms: i64, lead_ms: i64) -> Result<Vec<ListedFile>> {
+    let mut dirs = Vec::new();
+    for (date, hour) in hours_to_scan(from_ms, to_ms, lead_ms) {
+        for kind in KINDS {
+            let dir = format!("{sd_root}/{kind}/{date}/{hour}");
+            let files = parse_listing(&cam.get_text(&list_path(&dir)).await?).files;
+            dirs.push((kind.to_string(), date.clone(), hour.clone(), files));
+        }
+    }
+    Ok(listed_files(dirs))
+}
+
+/// SD 上の場所
+pub fn recording<'a>(sd_root: &'a str, f: &'a ListedFile) -> Recording<'a> {
+    Recording { camera: sd_root, kind: &f.kind, date: &f.date, hour: &f.hour, name: &f.name }
+}
+
+/// 同じキーの切り出しが既に在ればそれ
+async fn existing(bucket: &Bucket, key: &str) -> Result<Option<Made>> {
+    let Some(o) = bucket.head(key.to_string()).await? else { return Ok(None) };
+    let meta = o.custom_metadata().unwrap_or_default();
+    let get = |k: &str| meta.get(k).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let sources = meta.get("sources").map(|s| s.split(',').map(String::from).collect()).unwrap_or_default();
+    Ok(Some(Made { key: key.to_string(), size: o.size(), actual_from_ms: get("actual_from_ms"), actual_to_ms: get("actual_to_ms"), sources, reused: true }))
+}
+
+/// 手動の切り出し: 一覧 → 重なる閉じたファイルを R2 にそろえる → 切る
 pub async fn make(target: &Target, cam: &mut Camera, bucket: &Bucket, from_ms: i64, to_ms: i64) -> std::result::Result<Made, Fail> {
-    let key = target.key.clone();
-    if let Some(o) = bucket.head(key.clone()).await? {
-        let meta = o.custom_metadata().unwrap_or_default();
-        let get = |k: &str| meta.get(k).and_then(|v| v.parse().ok()).unwrap_or(0);
-        let sources = meta.get("sources").map(|s| s.split(',').map(String::from).collect()).unwrap_or_default();
-        return Ok(Made { key, size: o.size(), actual_from_ms: get("actual_from_ms"), actual_to_ms: get("actual_to_ms"), sources, reused: true });
+    if let Some(m) = existing(bucket, &target.key).await? {
+        return Ok(m);
     }
 
     // 1. 重なる録画を探す
-    let mut found = Vec::new();
-    for (date, hour) in hours_to_scan(from_ms, to_ms, LEAD_MS) {
-        for kind in KINDS {
-            let dir = format!("{}/{kind}/{date}/{hour}", target.sd_root);
-            for f in parse_listing(&cam.get_text(&list_path(&dir)).await?).files {
-                if !(wanted(&f.name) && f.name.ends_with(".mp4") && safe_segment(&f.name)) {
-                    continue;
-                }
-                if let Some(start_ms) = file_start_ms(&f.name) {
-                    found.push(Found { start_ms, kind: kind.to_string(), date: date.clone(), hour: hour.clone(), name: f.name, size: f.size });
-                }
-            }
-        }
-    }
-    found.sort_by_key(|f| f.start_ms);
+    let found: Vec<ListedFile> = list(cam, &target.sd_root, from_ms, to_ms, LEAD_MS).await?.into_iter().filter(|f| f.closed).collect();
     let starts: Vec<i64> = found.iter().map(|f| f.start_ms).collect();
-    let picked: Vec<&Found> = overlapping(&starts, from_ms, to_ms, LAST_LEN_MS).into_iter().map(|i| &found[i]).collect();
+    let picked: Vec<&ListedFile> = overlapping(&starts, from_ms, to_ms, LAST_LEN_MS).into_iter().map(|i| &found[i]).collect();
     if picked.is_empty() {
         return Err(Fail(404, "その時間帯の録画が SD にありません".into()));
     }
 
-    // 2. 元ファイルを R2 にそろえ、目次を読む
+    // 2. 元ファイルを R2 にそろえる
+    for f in &picked {
+        raw::ensure(cam, bucket, &target.raw_prefix, &recording(&target.sd_root, f), f.size).await?;
+    }
+    cut(target, bucket, &picked, from_ms, to_ms).await
+}
+
+/// R2 にそろえた元ファイル (`picked`、開始の順) から `[from, to)` を切って `target.key` に置く (既に在れば作り直さない)
+pub async fn cut(target: &Target, bucket: &Bucket, picked: &[&ListedFile], from_ms: i64, to_ms: i64) -> std::result::Result<Made, Fail> {
+    let key = target.key.clone();
+    if let Some(m) = existing(bucket, &key).await? {
+        return Ok(m);
+    }
+    // 目次を読む
     let mut moovs = Vec::with_capacity(picked.len());
     let mut keys = Vec::with_capacity(picked.len());
-    for f in &picked {
-        let rec = Recording { camera: &target.sd_root, kind: &f.kind, date: &f.date, hour: &f.hour, name: &f.name };
-        raw::ensure(cam, bucket, &target.raw_prefix, &rec, f.size).await?;
-        let raw_key = raw::key(&target.raw_prefix, &rec);
+    for f in picked {
+        let raw_key = raw::key(&target.raw_prefix, &recording(&target.sd_root, f));
         moovs.push(read_moov(bucket, &raw_key, f.size).await?);
         keys.push(raw_key);
     }
