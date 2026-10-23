@@ -1,0 +1,99 @@
+name: Deploy
+
+# SD 録画の切り出しの Worker alc-cam-sd-ingest (ingest/) のデプロイ (Refs ippoan/alc-cam#2)。ci.yml とは別 workflow。
+#   - main への push       → 本番 (wrangler.toml のトップレベル)。staging は無い
+#   - workflow_dispatch    → 本番 (初回と手動のやり直し)
+#   - pull_request         → wrangler deploy --dry-run だけ (secret 不要。この workflow 自体の検証)
+# 手元の wrangler の OAuth では Secrets Store の binding (SSO_ENCRYPTION_KEY) を付けられないので、
+# org の CLOUDFLARE_API_TOKEN で CI から出す (ippoan/alc-lineworks-worker が同じ binding を通している)。
+# wrangler の出力はファイルに取り、mask してから伏せて出す。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ingest/**'
+      - '.github/workflows/deploy.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'ingest/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-ingest
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # README と揃える (4.58 系は VPC に繋がらない)
+  WRANGLER_VERSION: 4.152.0
+
+defaults:
+  run:
+    working-directory: ingest
+
+jobs:
+  dry-run:
+    name: wrangler deploy --dry-run
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ingest
+          shared-key: cam-ingest
+          save-if: false
+      # wrangler.toml の [build] command と同じ版
+      - run: cargo install -q worker-build@0.8.7 --locked
+      - name: 本番 (トップレベル)
+        run: npx -y "wrangler@${WRANGLER_VERSION}" deploy --dry-run
+
+  deploy-prod:
+    name: deploy production
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 公開範囲の検査が落ちたらデプロイしない (ci.yml は別 workflow で needs にできない)
+      - run: bash scripts/check-exposure.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ingest
+          shared-key: cam-ingest
+          save-if: false
+      - run: cargo install -q worker-build@0.8.7 --locked
+      - name: wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          log="$RUNNER_TEMP/deploy.log"
+          status=0
+          npx -y "wrangler@${WRANGLER_VERSION}" deploy --message "$GITHUB_SHA" >"$log" 2>&1 || status=$?
+          # 何かを出す前に mask を登録する
+          grep -oE '[0-9A-Fa-f]{32}' "$log" | sort -u | while read -r hex; do
+            echo "::add-mask::${hex}"
+          done
+          sed -E -e 's#[A-Za-z0-9.-]+\.workers\.dev#<workers-dev>#g' -e 's#[0-9A-Fa-f]{32}#<account>#g' "$log"
+          [ "$status" = 0 ] || exit "$status"
+          # 本番は workers_dev = false なので workers.dev の URL は出ないはず (出たら公開されている)
+          if grep -qE '[A-Za-z0-9.-]+\.workers\.dev' "$log"; then
+            echo "::error::本番に workers.dev の URL が付いた (workers_dev = false のはず。直ちに止めること)"
+            exit 1
+          fi
