@@ -1,15 +1,18 @@
 //! 時間指定の切り出し: 重なる録画を R2 にそろえ、目次 (moov) を読み、範囲を切ってつないだ 1 本を
-//! R2 `clips/<カメラ名>/<開始>_<終了>.mp4` に置く。同じ時間帯をもう一度頼まれたら作り直さない。
+//! R2 `clips/<tenant>/<camera_id>/<開始>_<終了>.mp4` に置く。同じ時間帯をもう一度頼まれたら作り直さない。
 
 use std::collections::HashMap;
 
 use cam_mp4::{parse_moov, plan_clip, BoxHeader, Moov, Source};
-use cam_sd::{file_start_ms, hours_to_scan, jst_compact, list_path, overlapping, parse_listing, safe_segment, wanted, Recording};
+use cam_sd::{file_start_ms, hours_to_scan, list_path, overlapping, parse_listing, safe_segment, wanted, Recording};
 use futures_util::StreamExt;
 use worker::{console_log, Bucket, Data, HttpMetadata, MultipartUpload, Range, Result, UploadedPart};
 
 use crate::camera::Camera;
-use crate::{raw, Config};
+use crate::raw;
+
+/// SD の録画の種類 (カメラ名の下のフォルダ)。スケジュール録画だけを見る
+const KINDS: [&str; 1] = ["Schedule"];
 
 /// R2 のマルチパートの 1 パートの大きさ。最後以外は同じ大きさ・5MiB 以上でないといけない
 const PART: usize = 16 * 1024 * 1024;
@@ -51,8 +54,18 @@ struct Found {
     size: u64,
 }
 
-pub async fn make(cfg: &Config, cam: &mut Camera, bucket: &Bucket, from_ms: i64, to_ms: i64) -> std::result::Result<Made, Fail> {
-    let key = format!("clips/{}/{}_{}.mp4", cfg.camera, jst_compact(from_ms), jst_compact(to_ms));
+/// 切り出しの置き場
+pub struct Target {
+    /// SD のいちばん上のフォルダ (カメラ名)
+    pub sd_root: String,
+    /// 切り出しの R2 のキー (`cam_ingest_api::clip_r2_key`)
+    pub key: String,
+    /// 元ファイルの R2 のキーの頭 (`cam_ingest_api::raw_r2_prefix`)
+    pub raw_prefix: String,
+}
+
+pub async fn make(target: &Target, cam: &mut Camera, bucket: &Bucket, from_ms: i64, to_ms: i64) -> std::result::Result<Made, Fail> {
+    let key = target.key.clone();
     if let Some(o) = bucket.head(key.clone()).await? {
         let meta = o.custom_metadata().unwrap_or_default();
         let get = |k: &str| meta.get(k).and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -63,14 +76,14 @@ pub async fn make(cfg: &Config, cam: &mut Camera, bucket: &Bucket, from_ms: i64,
     // 1. 重なる録画を探す
     let mut found = Vec::new();
     for (date, hour) in hours_to_scan(from_ms, to_ms, LEAD_MS) {
-        for kind in &cfg.kinds {
-            let dir = format!("{}/{kind}/{date}/{hour}", cfg.camera);
+        for kind in KINDS {
+            let dir = format!("{}/{kind}/{date}/{hour}", target.sd_root);
             for f in parse_listing(&cam.get_text(&list_path(&dir)).await?).files {
                 if !(wanted(&f.name) && f.name.ends_with(".mp4") && safe_segment(&f.name)) {
                     continue;
                 }
                 if let Some(start_ms) = file_start_ms(&f.name) {
-                    found.push(Found { start_ms, kind: kind.clone(), date: date.clone(), hour: hour.clone(), name: f.name, size: f.size });
+                    found.push(Found { start_ms, kind: kind.to_string(), date: date.clone(), hour: hour.clone(), name: f.name, size: f.size });
                 }
             }
         }
@@ -86,10 +99,11 @@ pub async fn make(cfg: &Config, cam: &mut Camera, bucket: &Bucket, from_ms: i64,
     let mut moovs = Vec::with_capacity(picked.len());
     let mut keys = Vec::with_capacity(picked.len());
     for f in &picked {
-        let rec = Recording { camera: &cfg.camera, kind: &f.kind, date: &f.date, hour: &f.hour, name: &f.name };
-        raw::ensure(cam, bucket, &rec, f.size).await?;
-        moovs.push(read_moov(bucket, &rec.r2_key(), f.size).await?);
-        keys.push(rec.r2_key());
+        let rec = Recording { camera: &target.sd_root, kind: &f.kind, date: &f.date, hour: &f.hour, name: &f.name };
+        raw::ensure(cam, bucket, &target.raw_prefix, &rec, f.size).await?;
+        let raw_key = raw::key(&target.raw_prefix, &rec);
+        moovs.push(read_moov(bucket, &raw_key, f.size).await?);
+        keys.push(raw_key);
     }
 
     // 3. 切ってつなぐ計画を立て、R2 に書く

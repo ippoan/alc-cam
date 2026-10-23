@@ -1,0 +1,24 @@
+# ingest の口の中身 (認可・入力の検査・宛先の検査・SQL)。native でも wasm32-unknown-unknown でもビルドできる
+# (fetch も R2 も持たない)。直下の Worker が workers-rs に載せ、tests/ が実 DB で確かめる。
+[package]
+name = "cam-ingest-api"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# 出どころは ingest/Cargo.toml の [workspace.dependencies] の 1 か所 (ここに git / path を書かない)
+alc-worker-crypto = { workspace = true }
+alc-worker-db = { workspace = true }
+cam-sd = { path = "../../crates/cam-sd" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 型付きの文の型 (`Type`)。接続は張らない (wasm 用の feature `js` は直下の worker と alc-worker-db が付ける)
+tokio-postgres = { version = "0.7", default-features = false, features = ["with-uuid-1"] }
+uuid = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+# tests/ の実 DB の接続 (runtime 付き)。dev-dependency なので wasm のビルドには入らない
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+uuid = { version = "1", features = ["v4"] }

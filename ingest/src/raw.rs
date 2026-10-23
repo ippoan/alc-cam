@@ -23,9 +23,15 @@ extern "C" {
     fn writable(this: &JsFixedLengthStream) -> JsValue;
 }
 
+/// 元ファイルの R2 のキー: `<tenant>/<camera_id>/` (`cam_ingest_api::raw_r2_prefix`) の後に SD と同じ並び
+pub fn key(prefix: &str, rec: &Recording<'_>) -> String {
+    format!("{prefix}/{}", rec.r2_key())
+}
+
 /// R2 に同じ大きさで在れば何もしない。無ければカメラから取って置く。戻り値は取りに行ったか
-pub async fn ensure(cam: &mut Camera, bucket: &Bucket, rec: &Recording<'_>, listed_size: u64) -> Result<bool> {
-    if bucket.head(rec.r2_key()).await?.is_some_and(|o| o.size() == listed_size) {
+pub async fn ensure(cam: &mut Camera, bucket: &Bucket, prefix: &str, rec: &Recording<'_>, listed_size: u64) -> Result<bool> {
+    let key = key(prefix, rec);
+    if bucket.head(key.clone()).await?.is_some_and(|o| o.size() == listed_size) {
         return Ok(false);
     }
     console_log!("alc-cam: fetch {} ({listed_size} bytes)", rec.name);
@@ -44,7 +50,7 @@ pub async fn ensure(cam: &mut Camera, bucket: &Bucket, rec: &Recording<'_>, list
     let pipe_to: js_sys::Function = js_sys::Reflect::get(body, &"pipeTo".into())?.into();
     let piping: js_sys::Promise = pipe_to.call1(body, &fixed.writable())?.into();
     let put = bucket
-        .put(rec.r2_key(), Data::ReadableStream(fixed.readable()))
+        .put(key, Data::ReadableStream(fixed.readable()))
         .http_metadata(HttpMetadata { content_type: Some("video/mp4".into()), ..Default::default() })
         .execute();
     let (put, piped) = futures_util::future::join(put, wasm_bindgen_futures::JsFuture::from(piping)).await;

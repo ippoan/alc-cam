@@ -1,135 +1,171 @@
 //! カメラの SD 録画から、指定した時間帯を 1 本の MP4 にして R2 に置く Worker。
 //!
-//!   auth-worker ─Service Binding─▶ この Worker ─VPC (HTTP Service, ohishi-data の Tunnel)─▶ カメラ
+//!   auth-worker ─Service Binding─▶ この Worker ─VPC Network (CAM_NET, Tunnel)─▶ カメラ (cameras.rec_ip)
 //!                                       │ 重なる録画 (約 4 分ごと) を R2 にそろえ、moov を読み、
 //!                                       │ 範囲を切ってつなぐ (再エンコードなし。crates/cam-mp4)
-//!                                       └▶ R2 `clips/<カメラ名>/<開始>_<終了>.mp4`
+//!                                       └▶ R2 `clips/<tenant>/<camera_id>/<開始>_<終了>.mp4`
 //!
-//! - `POST /api/cam-clips/clips` に `{"from": "...", "to": "..."}` (ISO 8601。時差が無ければ JST)
-//! - `GET /api/cam-clips/clips/<カメラ名>/<開始>_<終了>.mp4` で取り出す (Range 対応 = シークできる)
+//! 口 (path は `PUBLIC_PATH_PREFIX` = `/api/cam-clips` を剥がした後。中身は api/ の `cam_ingest_api`):
+//! - `GET /cameras`・`POST /cameras`・`PATCH /cameras/{id}` — カメラの台帳 (alc_api.cameras)。宛先 (`rec_ip`) を書けるのは
+//!   `X-User-Developer: 1` (開発者の Google ログイン) のときだけ
+//! - `GET /device-candidates?days=30` — 映している端末を選ぶための、直近のイベントの端末の一覧
+//! - `POST /clips` に `{"camera_id": "...", "from": "...", "to": "..."}` (ISO 8601。時差が無ければ JST)
+//! - `GET /clips/<tenant>/<camera_id>/<開始>_<終了>.mp4` で取り出す (Range 対応 = シークできる)
 //!
 //! 外から直接届く口は持たない (workers_dev / route なし)。auth-worker の振り分け表 (`ALC_BINDING_ROUTES`)
-//! から Service Binding で届き、JWT の検証は auth-worker が済ませて `X-Tenant-ID` / `X-User-Role` を付け直す
-//! (alc 系の分割 Worker と同じ)。ここでは role が admin か、テナントがこのカメラの持ち主かだけを見る。
+//! から Service Binding で届き、JWT の検証は auth-worker が済ませて `X-Tenant-ID` / `X-User-Role` /
+//! `X-User-Developer` を付け直す (alc 系の分割 Worker と同じ)。
+//!
+//! カメラの宛先・資格情報は応答にもログにも出さない (切り出しの失敗の文からも消す)。
+
+// worker 本体は wasm32 専用。native の `cargo test` / `clippy` (workspace) では空の crate にして、api/ だけを検査させる
+#![cfg(target_arch = "wasm32")]
 
 mod camera;
 mod clip;
+mod db;
 mod raw;
 
-use cam_sd::{jst_iso, parse_time, safe_segment};
+use cam_ingest_api::dest::Dest;
+use cam_ingest_api::pg::{self, ClipRecord};
+use cam_ingest_api::{clip_r2_key, raw_r2_prefix, redact, ApiError, Caller, Op, Reply};
+use cam_sd::jst_iso;
 use camera::Camera;
-use serde::Deserialize;
-use worker::{event, Context, Env, Headers, Method, Range, Request, Response, Result};
+use uuid::Uuid;
+use worker::{console_error, event, Context, Env, Headers, Method, Range, Request, Response, Result};
 
-pub(crate) struct Config {
-    pub camera: String,
-    pub kinds: Vec<String>,
-    binding: String,
-    max_clip_ms: i64,
-    prefix: String,
-    /// 空なら確かめない (カメラの持ち主のテナントが決まるまでの間)
-    tenant: String,
+/// 暗号化の鍵 (Secrets Store。auth-worker・alc-lineworks と同じ secret)
+const SSO_ENCRYPTION_KEY_BINDING: &str = "SSO_ENCRYPTION_KEY";
+
+fn json(status: u16, body: &serde_json::Value) -> Result<Response> {
+    Ok(Response::from_json(body)?.with_status(status))
 }
 
-impl Config {
-    fn from_env(env: &Env) -> Self {
-        let var = |k: &str, d: &str| env.var(k).map(|v| v.to_string()).unwrap_or_else(|_| d.to_string());
-        Self {
-            camera: var("CAM_NAME", ""),
-            kinds: var("CAM_KINDS", "Schedule").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-            binding: var("CAM_VPC_BINDING", "CAM_HTTP"),
-            max_clip_ms: var("MAX_CLIP_SECS", "7200").parse::<i64>().unwrap_or(7200) * 1000,
-            prefix: var("PUBLIC_PATH_PREFIX", ""),
-            tenant: var("CAM_TENANT_ID", ""),
-        }
-    }
+fn fail(e: &ApiError) -> Result<Response> {
+    json(e.status, &e.body())
 }
 
-#[derive(Deserialize)]
-struct ClipRequest {
-    from: String,
-    to: String,
-}
-
-fn json(status: u16, body: serde_json::Value) -> Result<Response> {
-    Ok(Response::from_json(&body)?.with_status(status))
-}
-
-fn fail(status: u16, message: &str) -> Result<Response> {
-    json(status, serde_json::json!({ "error": message }))
+/// Secrets Store の鍵。取れなければ 500
+async fn sso_key(env: &Env) -> std::result::Result<String, ApiError> {
+    let value = match env.secret_store(SSO_ENCRYPTION_KEY_BINDING) {
+        Ok(store) => store.get().await.ok().flatten(),
+        Err(_) => None,
+    };
+    value.ok_or_else(|| {
+        console_error!("alc-cam: no {SSO_ENCRYPTION_KEY_BINDING} value");
+        ApiError::new(500, "暗号化の鍵がありません")
+    })
 }
 
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    let cfg = Config::from_env(&env);
+    let var = |k: &str, d: &str| env.var(k).map(|v| v.to_string()).unwrap_or_else(|_| d.to_string());
+    let prefix = var("PUBLIC_PATH_PREFIX", "");
+    let max_clip_ms = var("MAX_CLIP_SECS", "7200").parse::<i64>().unwrap_or(7200) * 1000;
     let full = req.path();
     // auth-worker からは振り分け表の path (/api/cam-clips/...) のまま届く
-    let path = if cfg.prefix.is_empty() { full.as_str() } else { full.strip_prefix(cfg.prefix.as_str()).unwrap_or(&full) }.to_string();
+    let path = if prefix.is_empty() { full.as_str() } else { full.strip_prefix(prefix.as_str()).unwrap_or(&full) }.to_string();
     if path == "/health" {
         return Response::ok("ok");
     }
     // auth-worker が付け直したヘッダだけを信じる (この Worker に外から直接届く口は無い)
-    let header = |k: &str| req.headers().get(k).ok().flatten().unwrap_or_default();
-    if header("X-User-Role") != "admin" {
-        return fail(403, "管理者だけが使えます");
-    }
-    if !cfg.tenant.is_empty() && header("X-Tenant-ID") != cfg.tenant {
-        return fail(403, "このカメラのテナントではありません");
-    }
-    match (req.method(), path.as_str()) {
-        (Method::Post, "/clips") => {
-            let Ok(body) = req.json::<ClipRequest>().await else {
-                return fail(400, "本文は {\"from\": \"...\", \"to\": \"...\"} の JSON にしてください");
-            };
-            create_clip(&env, &cfg, &body).await
-        }
-        (Method::Get, p) if p.starts_with("/clips/") => get_clip(&env, &req, &p["/clips/".len()..]).await,
-        _ => fail(404, "Not Found"),
-    }
-}
-
-async fn create_clip(env: &Env, cfg: &Config, body: &ClipRequest) -> Result<Response> {
-    if !safe_segment(&cfg.camera) || cfg.kinds.iter().any(|k| !safe_segment(k)) {
-        return fail(500, "CAM_NAME / CAM_KINDS の設定が正しくありません");
-    }
-    let (Some(from), Some(to)) = (parse_time(&body.from), parse_time(&body.to)) else {
-        return fail(400, "時刻は 2026-10-23T12:58:00+09:00 の形にしてください (時差が無ければ JST)");
+    let caller = match cam_ingest_api::caller(|k| req.headers().get(k).ok().flatten()) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
     };
-    if from >= to {
-        return fail(400, "to は from より後にしてください");
-    }
-    if to - from > cfg.max_clip_ms {
-        return fail(400, &format!("一度に切り出せるのは {} 分までです", cfg.max_clip_ms / 60_000));
-    }
-    let auth = env.secret("CAM_AUTH")?.to_string();
-    let mut cam = Camera::new(env, &cfg.binding, &auth)?;
-    let bucket = env.bucket("RECORDINGS")?;
-    match clip::make(cfg, &mut cam, &bucket, from, to).await {
-        Ok(m) => json(
-            if m.reused { 200 } else { 201 },
-            serde_json::json!({
-                "key": m.key,
-                "size": m.size,
-                "from": jst_iso(from),
-                "to": jst_iso(to),
-                "actual_from": jst_iso(m.actual_from_ms),
-                "actual_to": jst_iso(m.actual_to_ms),
-                "sources": m.sources,
-                "reused": m.reused,
-            }),
-        ),
-        Err(clip::Fail(status, message)) => fail(status, &message),
+    let method = req.method();
+    let query = req.url()?.query().unwrap_or_default().to_string();
+    let body = if matches!(method, Method::Post | Method::Patch) { req.text().await? } else { String::new() };
+    let op = match cam_ingest_api::parse(method.as_ref(), &path, &query, &body, &caller, max_clip_ms) {
+        Ok(op) => op,
+        Err(e) => return fail(&e),
+    };
+    let result = match op {
+        Op::GetClip { key } => return get_clip(&env, &req, key).await,
+        Op::CreateClip { camera_id, from_ms, to_ms } => create_clip(&env, &caller, camera_id, from_ms, to_ms).await,
+        op => run(&env, &caller, op).await,
+    };
+    match result {
+        Ok(r) => json(r.status, &r.body),
+        Err(e) => fail(&e),
     }
 }
 
-/// `GET /clips/<カメラ名>/<開始>_<終了>.mp4`。Range (`bytes=a-b` / `bytes=a-`) に答える
-async fn get_clip(env: &Env, req: &Request, rest: &str) -> Result<Response> {
-    if rest.split('/').count() != 2 || !rest.split('/').all(safe_segment) {
-        return fail(400, "取り出す名前が正しくありません");
+/// 台帳と端末の候補の口 (鍵は DB の transaction の外で先に引く)
+async fn run(env: &Env, caller: &Caller, op: Op) -> std::result::Result<Reply, ApiError> {
+    let key = if op.needs_key() { Some(sso_key(env).await?) } else { None };
+    let mut pg = db::connect(env).await?;
+    cam_ingest_api::execute(op, caller, &mut pg, key.as_deref()).await
+}
+
+fn db_error(e: &tokio_postgres::Error) -> ApiError {
+    ApiError::new(500, format!("DB の処理に失敗しました ({})", alc_worker_db::kind(e)))
+}
+
+/// 手動の切り出し。カメラの宛先・資格情報は DB から読み、宛先は fetch の直前にもう一度検査する。
+/// 結果 (ready / failed) は cam_clips に残す (カメラ・R2 の await は transaction の外)
+async fn create_clip(env: &Env, caller: &Caller, camera_id: Uuid, from_ms: i64, to_ms: i64) -> std::result::Result<Reply, ApiError> {
+    let tenant = caller.tenant;
+    let mut pg = db::connect(env).await?;
+    let Some(src) = pg::clip_source(&mut pg, tenant, camera_id).await.map_err(|e| db_error(&e))? else {
+        return Err(ApiError::new(404, "そのカメラはありません"));
+    };
+    let Some(rec_ip) = src.rec_ip else {
+        return Err(ApiError::new(409, "このカメラは録画を取り込む設定になっていません"));
+    };
+    // 登録の時に検査した値でも、ここでもう一度通す。落ちたら fetch しない (宛先は応答にもログにも出さない)
+    let Some(dest) = Dest::parse(&rec_ip) else {
+        console_error!("alc-cam: camera {camera_id} has an invalid destination");
+        return Err(ApiError::new(500, "カメラの宛先の設定が正しくありません"));
+    };
+    let (Some(user), Some(enc)) = (src.rec_username, src.rec_password_encrypted) else {
+        return Err(ApiError::new(409, "カメラのユーザー名・パスワードが設定されていません"));
+    };
+    let key = sso_key(env).await?;
+    let pass = alc_worker_crypto::secret::decrypt_secret(&enc, &key).map_err(|e| {
+        console_error!("alc-cam: decrypt {e}");
+        ApiError::new(500, "カメラのパスワードを復号できません")
+    })?;
+
+    let r2_key = clip_r2_key(tenant, camera_id, from_ms, to_ms);
+    let made: std::result::Result<clip::Made, clip::Fail> = async {
+        let mut cam = Camera::new(env, &dest, user, pass)?;
+        let bucket = env.bucket("RECORDINGS")?;
+        let sd_root = cam.sd_root().await?;
+        let target = clip::Target { sd_root, key: r2_key.clone(), raw_prefix: raw_r2_prefix(tenant, camera_id) };
+        clip::make(&target, &mut cam, &bucket, from_ms, to_ms).await
     }
-    let key = format!("clips/{rest}");
+    .await;
+    let made = made.map_err(|clip::Fail(status, message)| ApiError::new(status, redact(&message, &dest)));
+
+    let record = match &made {
+        Ok(m) => ClipRecord { camera_id, from_ms, to_ms, r2_key: r2_key.clone(), size_bytes: i64::try_from(m.size).ok(), status: "ready", error: None },
+        Err(e) => ClipRecord { camera_id, from_ms, to_ms, r2_key: r2_key.clone(), size_bytes: None, status: "failed", error: Some(e.message.clone()) },
+    };
+    let clip_id = pg::record_clip(&mut pg, tenant, record).await.map_err(|e| db_error(&e))?;
+    let m = made?;
+    Ok(Reply {
+        status: if m.reused { 200 } else { 201 },
+        body: serde_json::json!({
+            "clip_id": clip_id,
+            "camera_id": camera_id,
+            "key": m.key,
+            "size": m.size,
+            "from": jst_iso(from_ms),
+            "to": jst_iso(to_ms),
+            "actual_from": jst_iso(m.actual_from_ms),
+            "actual_to": jst_iso(m.actual_to_ms),
+            "sources": m.sources,
+            "reused": m.reused,
+        }),
+    })
+}
+
+/// `GET /clips/<tenant>/<camera_id>/<開始>_<終了>.mp4` (キーの頭が呼び手のテナントであることは api が確かめた)。
+/// Range (`bytes=a-b` / `bytes=a-`) に答える
+async fn get_clip(env: &Env, req: &Request, key: String) -> Result<Response> {
     let bucket = env.bucket("RECORDINGS")?;
-    let Some(head) = bucket.head(key.clone()).await? else { return fail(404, "その切り出しはありません") };
+    let Some(head) = bucket.head(key.clone()).await? else { return fail(&ApiError::new(404, "その切り出しはありません")) };
     let size = head.size();
     let range = req.headers().get("Range")?.and_then(|r| parse_range(&r, size));
     let mut get = bucket.get(key);

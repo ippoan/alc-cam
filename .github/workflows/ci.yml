@@ -19,19 +19,47 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # SD 録画の切り出しの Worker (ingest/、wasm32 専用の別 workspace)。デプロイはしない (手で wrangler deploy)
+  # SD 録画の切り出しの Worker (ingest/、別 workspace。直下の worker は wasm32 専用、ingest/api は native でも動く)。
+  # デプロイはしない (手で wrangler deploy)。
+  # 先頭の check-exposure.sh は「外から素で届かない・VPC Network と Hyperdrive は本番にだけ」の検査、
+  # check-exposure-test.sh はその陰性対照 (wrangler.toml を崩すと exit 1 になること)。
   ingest:
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ingest
+    # 実 DB のテスト (ingest/api/tests/db.rs) の接続先。runner の中の使い捨ての DB
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
     steps:
       - uses: actions/checkout@v4
+      - name: 外から直接届かないことの検査 (wrangler.toml)
+        run: bash scripts/check-exposure.sh
+      - name: check-exposure.sh の陰性対照
+        run: bash scripts/check-exposure-test.sh
       - run: rustup target add wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ingest
-      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
+      # テストの準備が流す SQL を ippoan/alc-migrations から取る (版は scripts/ALC_MIGRATIONS_REV)
+      - run: bash scripts/fetch-migrations.sh
+      # 単体テスト (宛先の検査・認可・入力) と api/tests/db.rs (実 DB)。接続文字列は runner の中の使い捨ての DB のもので、secret ではない
+      - name: cargo test (api の単体・実 DB)
+        env:
+          CAM_TEST_ADMIN_DATABASE_URL: postgresql://postgres:test@localhost:5432/postgres
+        run: cargo test --locked --workspace
       - run: cargo install -q worker-build@0.8.7 && worker-build --release
 
   windows:
