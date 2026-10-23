@@ -12,6 +12,7 @@
 //! `cameras.rec_ip` 列に入る ([`pg`])。その binding がこの Worker に在るかは Worker が確かめる ([`Op::vpc_binding`])。
 //! 応答・ログに資格情報を出さない。一覧の応答は `vpc_binding` を返すが、パスワードは返さない。
 
+pub mod auto;
 pub mod dest;
 pub mod pg;
 
@@ -103,6 +104,12 @@ pub enum Op {
     /// R2 のキー (`clips/<tenant>/<camera_id>/<開始>_<終了>.mp4`)。頭のテナントは呼び手のもの
     GetClip {
         key: String,
+    },
+    /// カメラのその日 (JST) のイベントと切り出し。`[from, to)` は UNIX ms
+    Events {
+        camera_id: Uuid,
+        from_ms: i64,
+        to_ms: i64,
     },
 }
 
@@ -321,6 +328,29 @@ fn clip_input(body: &str, max_clip_ms: i64) -> Result<Op, ApiError> {
     })
 }
 
+/// `GET /events?camera_id=<uuid>&date=YYYY-MM-DD` (JST の 1 日)
+fn events_input(query: &str) -> Result<Op, ApiError> {
+    let get = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(k).and_then(|v| v.strip_prefix('=')));
+    let camera_id = get("camera_id")
+        .and_then(|v| Uuid::parse_str(v).ok())
+        .ok_or_else(|| bad("camera_id の形が正しくありません"))?;
+    let from_ms = get("date")
+        .filter(|d| d.len() == 10)
+        .and_then(|d| parse_time(&format!("{d}T00:00:00")))
+        .ok_or_else(|| bad("date は 2026-10-23 の形にしてください (JST の 1 日)"))?;
+    Ok(Op::Events {
+        camera_id,
+        from_ms,
+        to_ms: from_ms + 86_400_000,
+    })
+}
+
+/// 手動の切り出しが要求より短い範囲しか取れなかったか (頭が遅い・終わりが早い)。キーフレームに寄って
+/// 頭が前に出るのは短縮ではない
+pub fn truncated(from_ms: i64, to_ms: i64, actual_from_ms: i64, actual_to_ms: i64) -> bool {
+    actual_from_ms > from_ms || actual_to_ms < to_ms
+}
+
 /// `GET /clips/<tenant>/<camera_id>/<開始>_<終了>.mp4`。頭が呼び手のテナントでなければ 404
 fn clip_key(rest: &str, caller: &Caller) -> Result<String, ApiError> {
     let parts: Vec<&str> = rest.split('/').collect();
@@ -354,6 +384,7 @@ pub fn parse(
             days: days_of(query)?,
         }),
         ("POST", "/clips") => clip_input(body, max_clip_ms),
+        ("GET", "/events") => events_input(query),
         ("GET", p) if p.starts_with("/clips/") => Ok(Op::GetClip {
             key: clip_key(&p["/clips/".len()..], caller)?,
         }),
@@ -502,6 +533,45 @@ pub async fn execute(
                         },
                         "last_at": jst_iso(r.last_at_ms),
                         "is_dev": r.is_dev,
+                    })
+                })
+                .collect();
+            Ok(Reply {
+                status: 200,
+                body: Value::Array(list),
+            })
+        }
+        Op::Events {
+            camera_id,
+            from_ms,
+            to_ms,
+        } => {
+            if pg::clip_source(pg, tenant, camera_id)
+                .await
+                .map_err(|e| db_error(&e))?
+                .is_none()
+            {
+                return Err(ApiError::new(404, "そのカメラはありません"));
+            }
+            let rows = pg::day_events(pg, tenant, camera_id, from_ms, to_ms)
+                .await
+                .map_err(|e| db_error(&e))?;
+            let list: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "source_table": r.event.source_table,
+                        "source_id": r.event.source_id,
+                        "kind": r.event.kind,
+                        "occurred_at": jst_iso(r.event.at_ms),
+                        "device_id": r.event.device_id,
+                        "is_dev": r.event.is_dev,
+                        "clip": r.clip.as_ref().map(|c| json!({
+                            "clip_id": c.clip_id,
+                            "key": c.key,
+                            "status": c.status,
+                            "error": c.error,
+                        })),
                     })
                 })
                 .collect();
@@ -951,5 +1021,39 @@ mod tests {
             format!("clips/{TENANT}/{TENANT}/20261023T125800_20261023T125930.mp4")
         );
         assert_eq!(raw_r2_prefix(t, t), format!("{TENANT}/{TENANT}"));
+    }
+
+    #[test]
+    fn events_query() {
+        let c = admin(false);
+        let cam = "00000000-0000-4000-8000-0000000000aa";
+        let Ok(Op::Events { camera_id, from_ms, to_ms }) = parse("GET", "/events", &format!("camera_id={cam}&date=2026-10-23"), "", &c, 1) else {
+            panic!("events");
+        };
+        assert_eq!(camera_id.to_string(), cam);
+        // JST の 0 時から 24 時間
+        assert_eq!(from_ms, parse_time("2026-10-22T15:00:00Z").unwrap());
+        assert_eq!(to_ms - from_ms, 86_400_000);
+        assert_eq!(status(parse("GET", "/events", &format!("date=2026-10-23&camera_id={cam}"), "", &c, 1)), 200);
+        for q in [
+            "date=2026-10-23".to_owned(),
+            format!("camera_id={cam}"),
+            "camera_id=x&date=2026-10-23".to_owned(),
+            format!("camera_id={cam}&date=2026-1-3"),
+            format!("camera_id={cam}&date=2026-10-23T00:00:00"),
+            format!("camera_id={cam}&date=2026-13-01"),
+            format!("camera_idx={cam}&date=2026-10-23"),
+        ] {
+            assert_eq!(status(parse("GET", "/events", &q, "", &c, 1)), 400, "{q}");
+        }
+    }
+
+    #[test]
+    fn truncation() {
+        // 頭がキーフレームで前に出る・終わりが要求どおり → 短縮ではない
+        assert!(!truncated(1000, 2000, 900, 2000));
+        assert!(!truncated(1000, 2000, 1000, 2100));
+        assert!(truncated(1000, 2000, 1001, 2000));
+        assert!(truncated(1000, 2000, 900, 1999));
     }
 }

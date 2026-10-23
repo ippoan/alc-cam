@@ -769,3 +769,358 @@ async fn clips_are_recorded() {
         (from, from + 90_500)
     );
 }
+
+// ---- cron の自動切り出し (`cam_ingest_api::auto`) と GET /events ----
+
+use cam_ingest_api::auto::{run_camera, AutoCamera, ListedFile, Recorder};
+
+/// 2026-10-23 12:00:00 JST (時のフォルダの頭)
+const T: i64 = 1_792_724_400_000;
+const S: i64 = 1000;
+
+/// 端末のイベントを 1 行入れる (時刻は UNIX ms。`at_sql` が Some ならその式を recorded_at に)。
+/// 開発端末の行は RLS の WITH CHECK に合わせ、`app.device_dev='1'` を立てた transaction で入れる
+async fn hub_event(su: &Client, t: Uuid, device: &str, kind: &str, recorded: Option<i64>, created: i64, dev: bool) -> Uuid {
+    let id = Uuid::new_v4();
+    let at = |ms: i64| format!("'epoch'::timestamptz + {ms} * interval '1 millisecond'");
+    let recorded = recorded.map(at).unwrap_or_else(|| "NULL".into());
+    let set = if dev { "SELECT set_config('app.device_dev', '1', true);" } else { "" };
+    su.batch_execute(&format!(
+        "BEGIN; {set} INSERT INTO alc_api.hub_measurements (id, tenant_id, device_id, kind, payload, seq, recorded_at, created_at) \
+         VALUES ('{id}', '{t}', '{device}', '{kind}', '{{}}', {seq}, {recorded}, {created}); COMMIT;",
+        seq = id.as_u128() as i64 & i64::MAX,
+        created = at(created),
+    ))
+    .await
+    .unwrap();
+    id
+}
+
+async fn vein_event(su: &Client, t: Uuid, device: &str, created: i64, dev: bool) -> Uuid {
+    let emp: Uuid = su
+        .query_one("INSERT INTO alc_api.employees (tenant_id, nfc_id, name) VALUES ($1, $2, '乗務員') RETURNING id", &[&t, &format!("nfc-{}", Uuid::new_v4())])
+        .await
+        .unwrap()
+        .get(0);
+    let id = Uuid::new_v4();
+    let set = if dev { "SELECT set_config('app.device_dev', '1', true);" } else { "" };
+    su.batch_execute(&format!(
+        "BEGIN; {set} INSERT INTO alc_api.vein_enroll_events (id, tenant_id, employee_id, registered_device_id, created_at) \
+         VALUES ('{id}', '{t}', '{emp}', '{device}', 'epoch'::timestamptz + {created} * interval '1 millisecond'); COMMIT;"
+    ))
+    .await
+    .unwrap();
+    id
+}
+
+/// 録画を取り込むカメラを作る (結び付ける端末つき)
+async fn recording_camera(pg: &mut PgClient, t: Uuid, devices: &[&str]) -> Uuid {
+    let (s, cam) = call(pg, &caller(t, true), "POST", "/cameras", "", json!({"name": "C", "vpc_binding": random_binding(), "device_ids": devices})).await;
+    assert_eq!(s, 201, "{cam}");
+    Uuid::parse_str(cam["id"].as_str().unwrap()).unwrap()
+}
+
+/// `name` の頭の数字 = 12 時からの秒 (開始時刻)
+fn sd(secs: i64, closed: bool) -> ListedFile {
+    let start_ms = T + secs * S;
+    let c = cam_sd::jst_compact(start_ms);
+    let name = format!("Schedule{}_{}{}.mp4", &c[..8], &c[9..], if closed { "" } else { "_!" });
+    ListedFile { kind: "Schedule".into(), date: "20261023".into(), hour: "12".into(), name, size: 100, start_ms, closed }
+}
+
+/// カメラと R2 の差し替え: 一覧は決めた値、取り寄せと切り出しは呼ばれた順に覚える
+#[derive(Default)]
+struct Fake {
+    files: Vec<ListedFile>,
+    list_fails: bool,
+    fail_fetch: Vec<String>,
+    fail_cut: bool,
+    lists: usize,
+    fetches: Vec<String>,
+    cuts: Vec<(String, Vec<String>, i64, i64)>,
+}
+
+impl Recorder for Fake {
+    async fn list(&mut self, _from_ms: i64, _to_ms: i64) -> Result<Vec<ListedFile>, String> {
+        self.lists += 1;
+        if self.list_fails {
+            return Err("カメラに届きません".into());
+        }
+        Ok(self.files.clone())
+    }
+
+    async fn fetch_raw(&mut self, file: &ListedFile) -> Result<(), String> {
+        assert!(file.closed, "書き込み途中のファイルを取り寄せた");
+        self.fetches.push(file.name.clone());
+        if self.fail_fetch.contains(&file.name) {
+            return Err(format!("{} の取り出しが 500 で失敗", file.name));
+        }
+        Ok(())
+    }
+
+    async fn cut(&mut self, key: &str, files: &[&ListedFile], from_ms: i64, to_ms: i64) -> Result<u64, String> {
+        for f in files {
+            assert!(self.fetches.contains(&f.name), "R2 にそろえていないファイルから切った");
+        }
+        self.cuts.push((key.to_owned(), files.iter().map(|f| f.name.clone()).collect(), from_ms, to_ms));
+        if self.fail_cut {
+            return Err("moov が見つかりません".into());
+        }
+        Ok(4242)
+    }
+}
+
+/// cam_clips の (開始, 終了 (12 時からの秒), status, error) を開始の順に
+async fn clips_of(t: Uuid, cam: Uuid) -> Vec<(i64, i64, String, Option<String>)> {
+    admin()
+        .await
+        .query(
+            "SELECT (extract(epoch FROM started_at) * 1000)::int8, (extract(epoch FROM ended_at) * 1000)::int8, status, error
+               FROM alc_api.cam_clips WHERE tenant_id = $1 AND camera_id = $2 ORDER BY started_at",
+            &[&t, &cam],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| ((r.get::<_, i64>(0) - T) / S, (r.get::<_, i64>(1) - T) / S, r.get(2), r.get(3)))
+        .collect()
+}
+
+/// cam_clip_events の (元の行, is_dev, clip の開始 (12 時からの秒))
+async fn clip_events_of(t: Uuid, cam: Uuid) -> Vec<(Uuid, bool, i64)> {
+    admin()
+        .await
+        .query(
+            "SELECT e.source_id, e.is_dev, (extract(epoch FROM c.started_at) * 1000)::int8
+               FROM alc_api.cam_clip_events e JOIN alc_api.cam_clips c ON c.tenant_id = e.tenant_id AND c.id = e.clip_id
+              WHERE e.tenant_id = $1 AND e.camera_id = $2 ORDER BY e.occurred_at, e.source_id",
+            &[&t, &cam],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), (r.get::<_, i64>(2) - T) / S))
+        .collect()
+}
+
+async fn scanned_until(t: Uuid, cam: Uuid) -> Option<i64> {
+    admin()
+        .await
+        .query_one("SELECT (extract(epoch FROM rec_scanned_until) * 1000)::int8 FROM alc_api.cameras WHERE tenant_id = $1 AND id = $2", &[&t, &cam])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+#[tokio::test]
+async fn auto_events_are_picked_from_linked_devices_on_both_axes() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let su = admin().await;
+    let mut pg = rt().await;
+    let cam = recording_camera(&mut pg, t, &["prod-1", "dev-1"]).await;
+    let (from, to) = (T, T + 3600 * S);
+
+    let alcohol = hub_event(&su, t, "prod-1", "alcohol", Some(T + 10 * S), T + 99 * S, false).await;
+    // recorded_at が NULL なら created_at
+    let timecard = hub_event(&su, t, "prod-1", "timecard", None, T + 20 * S, false).await;
+    // 範囲の頭ちょうどは入る・終わりちょうどは入らない
+    let at_from = hub_event(&su, t, "prod-1", "blood_pressure", Some(from), from, false).await;
+    hub_event(&su, t, "prod-1", "license", Some(to), to, false).await;
+    // kind 外・結び付けていない端末・他テナントの同じ端末 id
+    hub_event(&su, t, "prod-1", "temperature", Some(T + 30 * S), T + 30 * S, false).await;
+    hub_event(&su, t, "prod-9", "alcohol", Some(T + 30 * S), T + 30 * S, false).await;
+    hub_event(&su, other, "prod-1", "alcohol", Some(T + 30 * S), T + 30 * S, false).await;
+    // 開発端末の行・指静脈の登録 (本番と開発端末)
+    let dev_license = hub_event(&su, t, "dev-1", "license", Some(T + 40 * S), T + 40 * S, true).await;
+    let vein = vein_event(&su, t, "prod-1", T + 50 * S, false).await;
+    let dev_vein = vein_event(&su, t, "dev-1", T + 60 * S, true).await;
+    vein_event(&su, other, "dev-1", T + 60 * S, true).await;
+
+    let got = pg::auto_events(&mut pg, t, cam, from, to).await.unwrap();
+    let mut seen: Vec<(Uuid, &str, &str, i64, bool)> =
+        got.iter().map(|e| (e.source_id, e.source_table.as_str(), e.kind.as_str(), (e.at_ms - T) / S, e.is_dev)).collect();
+    seen.sort_by_key(|x| x.3);
+    assert_eq!(
+        seen,
+        vec![
+            (at_from, "hub_measurements", "blood_pressure", 0, false),
+            (alcohol, "hub_measurements", "alcohol", 10, false),
+            (timecard, "hub_measurements", "timecard", 20, false),
+            (dev_license, "hub_measurements", "license", 40, true),
+            (vein, "vein_enroll_events", "vein_enroll", 50, false),
+            (dev_vein, "vein_enroll_events", "vein_enroll", 60, true),
+        ]
+    );
+
+    // cam_clip_events に入れたもの (本番・開発端末の両方) は次から拾わない。同じものをもう一度入れても落ちない
+    let clip = pg::record_clip(&mut pg, t, ClipRecord { camera_id: cam, from_ms: T, to_ms: T + 70 * S, r2_key: "clips/x".into(), size_bytes: Some(1), status: "ready", error: None }).await.unwrap();
+    let picked: Vec<_> = got.iter().filter(|e| [alcohol, dev_license].contains(&e.source_id)).cloned().collect();
+    pg::record_clip_events(&mut pg, t, cam, clip, picked.clone()).await.unwrap();
+    pg::record_clip_events(&mut pg, t, cam, clip, picked).await.unwrap();
+    let rest: Vec<Uuid> = pg::auto_events(&mut pg, t, cam, from, to).await.unwrap().iter().map(|e| e.source_id).collect();
+    assert_eq!(rest.len(), 4);
+    assert!(!rest.contains(&alcohol) && !rest.contains(&dev_license));
+    let rows = clip_events_of(t, cam).await;
+    assert_eq!(rows, vec![(alcohol, false, 0), (dev_license, true, 0)]);
+    let kinds: Vec<(String, Option<String>)> = su
+        .query("SELECT kind, device_id FROM alc_api.cam_clip_events WHERE tenant_id = $1 ORDER BY occurred_at", &[&t])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(kinds, vec![("alcohol".into(), Some("prod-1".into())), ("license".into(), Some("dev-1".into()))]);
+
+    // 別のカメラでは同じイベントをまた拾う (1 イベントが複数カメラに映るのは可)
+    let cam2 = recording_camera(&mut pg, t, &["prod-1"]).await;
+    let on2 = pg::auto_events(&mut pg, t, cam2, from, to).await.unwrap();
+    assert!(on2.iter().any(|e| e.source_id == alcohol));
+
+    // 走査済み時刻・テナントとカメラの列挙
+    pg::set_scanned_until(&mut pg, t, cam, T + 1234).await.unwrap();
+    assert_eq!(scanned_until(t, cam).await, Some(T + 1234));
+    assert!(pg::recording_tenants(&mut pg).await.unwrap().contains(&t));
+    let (_, plain) = call(&mut pg, &caller(t, false), "POST", "/cameras", "", json!({"name": "ONVIF だけ"})).await;
+    let plain = Uuid::parse_str(plain["id"].as_str().unwrap()).unwrap();
+    let cams: Vec<Uuid> = pg::recording_cameras(&mut pg, t).await.unwrap().iter().map(|c| c.id).collect();
+    assert!(cams.contains(&cam) && cams.contains(&cam2) && !cams.contains(&plain));
+    let me = pg::recording_cameras(&mut pg, t).await.unwrap().into_iter().find(|c| c.id == cam).unwrap();
+    assert_eq!(me.scanned_until_ms, Some(T + 1234));
+}
+
+#[tokio::test]
+async fn cron_cuts_closed_windows_and_defers_the_rest() {
+    let t = tenant().await;
+    let su = admin().await;
+    let mut pg = rt().await;
+    let cam = recording_camera(&mut pg, t, &["prod-1", "dev-1"]).await;
+    // 12:00:00 / 12:04:00 は閉じた、12:08:00 は書き込み途中 → 閉じた終わりは 12:08:00 (480 秒)
+    let mut fake = Fake { files: vec![sd(0, true), sd(240, true), sd(480, false)], ..Default::default() };
+    let e1 = hub_event(&su, t, "prod-1", "alcohol", Some(T + 100 * S), T + 100 * S, false).await;
+    let e2 = hub_event(&su, t, "prod-1", "blood_pressure", Some(T + 115 * S), T + 115 * S, false).await; // e1 と重なる → 1 本
+    let e3 = vein_event(&su, t, "prod-1", T + 200 * S, false).await; // 同じファイルの別のまとまり (取り寄せは使い回す)
+    let e4 = hub_event(&su, t, "dev-1", "timecard", Some(T + 235 * S), T + 235 * S, true).await; // 2 ファイルにまたがる
+    let e5 = hub_event(&su, t, "prod-1", "license", Some(T + 470 * S), T + 470 * S, false).await; // e6 と窓が重なる → [460, 485]
+    let e6 = hub_event(&su, t, "prod-1", "alcohol", Some(T + 475 * S), T + 475 * S, false).await; // まとまりの終わり 485 が閉じた終わり 480 を越える → 次の回
+    let e7 = hub_event(&su, t, "dev-1", "alcohol", Some(T + 600 * S), T + 600 * S, true).await;
+
+    let c = AutoCamera { id: cam, scanned_until_ms: Some(T) };
+    let o = run_camera(&mut pg, t, &c, &mut fake, T + 700 * S, 40).await.unwrap();
+    assert_eq!((o.events, o.groups, o.ready, o.failed, o.deferred, o.fetched), (7, 5, 3, 0, 2, 2), "{}", o.line());
+    // e5 と e6 は窓が重なるので 1 本 ([460, 485]) で、その終わりが 480 を越える → まとめて次の回
+    assert_eq!(fake.lists, 1);
+    assert_eq!(fake.fetches, [sd(0, true).name, sd(240, true).name]);
+    let cuts: Vec<(Vec<String>, i64, i64)> = fake.cuts.iter().map(|(_, f, a, b)| (f.clone(), (a - T) / S, (b - T) / S)).collect();
+    assert_eq!(
+        cuts,
+        vec![
+            (vec![sd(0, true).name], 90, 125),
+            (vec![sd(0, true).name], 190, 210),
+            (vec![sd(0, true).name, sd(240, true).name], 225, 245),
+        ]
+    );
+    assert_eq!(fake.cuts[0].0, cam_ingest_api::clip_r2_key(t, cam, T + 90 * S, T + 125 * S));
+    assert_eq!(clips_of(t, cam).await, vec![(90, 125, "ready".into(), None), (190, 210, "ready".into(), None), (225, 245, "ready".into(), None)]);
+    assert_eq!(clip_events_of(t, cam).await, vec![(e1, false, 90), (e2, false, 90), (e3, false, 190), (e4, true, 225)]);
+    // 走査済みは次の回へ回したまとまりの頭 (最初のイベント 470 - 10 秒)
+    assert_eq!(scanned_until(t, cam).await, Some(T + 460 * S));
+
+    // GET /events: その日のイベントと、切り出し済みならその clip (次の回待ちは null)
+    let (s, body) = call(&mut pg, &caller(t, false), "GET", "/events", &format!("camera_id={cam}&date=2026-10-23"), Value::Null).await;
+    assert_eq!(s, 200, "{body}");
+    let rows = body.as_array().unwrap();
+    let ids: Vec<String> = rows.iter().map(|r| r["source_id"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(ids, [e1, e2, e3, e4, e5, e6, e7].map(|u| u.to_string()));
+    assert_eq!(rows[0]["kind"], "alcohol");
+    assert_eq!(rows[0]["occurred_at"], "2026-10-23T12:01:40.000+09:00");
+    assert_eq!(rows[0]["device_id"], "prod-1");
+    assert_eq!(rows[0]["is_dev"], false);
+    assert_eq!(rows[0]["clip"]["status"], "ready");
+    assert_eq!(rows[0]["clip"]["key"], fake.cuts[0].0.as_str());
+    assert_eq!(rows[0]["clip"]["clip_id"], rows[1]["clip"]["clip_id"]);
+    assert_eq!(rows[2]["source_table"], "vein_enroll_events");
+    assert_eq!(rows[2]["kind"], "vein_enroll");
+    assert_eq!((rows[3]["is_dev"].as_bool(), rows[3]["clip"]["status"].as_str()), (Some(true), Some("ready")));
+    assert!(rows[4]["clip"].is_null() && rows[5]["clip"].is_null() && rows[6]["clip"].is_null());
+    // 前日・他テナント・無いカメラ
+    let (_, prev) = call(&mut pg, &caller(t, false), "GET", "/events", &format!("camera_id={cam}&date=2026-10-22"), Value::Null).await;
+    assert_eq!(prev, json!([]));
+    let other = tenant().await;
+    let (s, _) = call(&mut pg, &caller(other, false), "GET", "/events", &format!("camera_id={cam}&date=2026-10-23"), Value::Null).await;
+    assert_eq!(s, 404);
+
+    // 次の回: 12:08:00 が閉じ、12:12:00 が書き込み途中に。残りを切って upper まで進む
+    fake.files = vec![sd(0, true), sd(240, true), sd(480, true), sd(720, false)];
+    fake.fetches.clear();
+    fake.cuts.clear();
+    let c = AutoCamera { id: cam, scanned_until_ms: scanned_until(t, cam).await };
+    let o = run_camera(&mut pg, t, &c, &mut fake, T + 800 * S, 40).await.unwrap();
+    assert_eq!((o.events, o.ready, o.deferred), (3, 2, 0), "{}", o.line());
+    assert_eq!(fake.fetches, [sd(240, true).name, sd(480, true).name]);
+    assert_eq!(scanned_until(t, cam).await, Some(T + 800 * S));
+    let all = clip_events_of(t, cam).await;
+    assert_eq!(&all[4..], &[(e5, false, 460), (e6, false, 460), (e7, true, 590)]);
+
+    // その次の回: 新しいイベントが無い → 一覧を取りに行かずに upper まで
+    let lists = fake.lists;
+    let c = AutoCamera { id: cam, scanned_until_ms: scanned_until(t, cam).await };
+    let o = run_camera(&mut pg, t, &c, &mut fake, T + 900 * S, 40).await.unwrap();
+    assert_eq!((o.events, fake.lists), (0, lists));
+    assert_eq!(scanned_until(t, cam).await, Some(T + 900 * S));
+}
+
+#[tokio::test]
+async fn cron_failures_are_recorded_and_not_retried() {
+    let t = tenant().await;
+    let su = admin().await;
+    let mut pg = rt().await;
+    let cam = recording_camera(&mut pg, t, &["prod-1"]).await;
+    let files = vec![sd(0, true), sd(240, true), sd(480, false)];
+    let e0 = hub_event(&su, t, "prod-1", "alcohol", Some(T - 600 * S), T - 600 * S, false).await; // 録画の前
+    let e1 = hub_event(&su, t, "prod-1", "alcohol", Some(T + 50 * S), T + 50 * S, false).await;
+    let e2 = hub_event(&su, t, "prod-1", "alcohol", Some(T + 150 * S), T + 150 * S, false).await;
+    let e3 = hub_event(&su, t, "prod-1", "alcohol", Some(T + 300 * S), T + 300 * S, false).await;
+
+    // 12:00:00 の取り寄せが失敗 → そのファイルにかかる 2 本とも failed (取り寄せは 1 回だけ)、12:04:00 の 1 本は切れる
+    let mut fake = Fake { files: files.clone(), fail_fetch: vec![sd(0, true).name], ..Default::default() };
+    let c = AutoCamera { id: cam, scanned_until_ms: Some(T - 3600 * S) };
+    let o = run_camera(&mut pg, t, &c, &mut fake, T + 700 * S, 40).await.unwrap();
+    assert_eq!((o.ready, o.failed, o.fetched), (1, 3, 2), "{}", o.line());
+    assert_eq!(fake.fetches, [sd(0, true).name, sd(240, true).name]);
+    let clips = clips_of(t, cam).await;
+    assert_eq!(clips[0], (-610, -590, "failed".into(), Some("その時間帯の録画が SD にありません".into())));
+    assert_eq!(clips[1].2, "failed");
+    assert!(clips[1].3.as_deref().unwrap().contains("取り出しが 500"));
+    assert_eq!(clips[2].2, "failed");
+    assert_eq!(clips[3], (290, 310, "ready".into(), None));
+    // failed でもイベントとの対応は残る → 次の回に拾い直さない
+    let ev: Vec<Uuid> = clip_events_of(t, cam).await.iter().map(|e| e.0).collect();
+    assert_eq!(ev, [e0, e1, e2, e3]);
+    let o = run_camera(&mut pg, t, &AutoCamera { id: cam, scanned_until_ms: Some(T - 3600 * S) }, &mut fake, T + 700 * S, 40).await.unwrap();
+    assert_eq!((o.events, o.ready, o.failed), (0, 0, 0));
+
+    // 切り出しの失敗も failed
+    let cam2 = recording_camera(&mut pg, t, &["prod-1"]).await;
+    let mut fake = Fake { files: files.clone(), fail_cut: true, ..Default::default() };
+    let o = run_camera(&mut pg, t, &AutoCamera { id: cam2, scanned_until_ms: Some(T) }, &mut fake, T + 700 * S, 40).await.unwrap();
+    assert_eq!((o.ready, o.failed), (0, 3));
+    assert!(clips_of(t, cam2).await.iter().all(|c| c.2 == "failed" && c.3.as_deref() == Some("moov が見つかりません")));
+
+    // 一覧が取れない → 何も残さず、走査済みも進めない
+    let cam3 = recording_camera(&mut pg, t, &["prod-1"]).await;
+    let mut fake = Fake { list_fails: true, ..Default::default() };
+    let o = run_camera(&mut pg, t, &AutoCamera { id: cam3, scanned_until_ms: None }, &mut fake, T + 700 * S, 40).await.unwrap();
+    assert!(o.listing_failed);
+    // 初回は 2 時間前から → 4 本とも次の回
+    assert_eq!(o.deferred, 4);
+    assert!(clips_of(t, cam3).await.is_empty());
+    assert_eq!(scanned_until(t, cam3).await, None);
+
+    // 上限: 1 本だけ切って、残りの頭から次の回
+    let cam4 = recording_camera(&mut pg, t, &["prod-1"]).await;
+    let mut fake = Fake { files, ..Default::default() };
+    let o = run_camera(&mut pg, t, &AutoCamera { id: cam4, scanned_until_ms: Some(T) }, &mut fake, T + 700 * S, 1).await.unwrap();
+    assert_eq!((o.ready, o.deferred), (1, 2));
+    assert_eq!(scanned_until(t, cam4).await, Some(T + 140 * S));
+}
