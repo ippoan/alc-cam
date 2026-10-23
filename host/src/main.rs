@@ -1,23 +1,30 @@
 //! alc-cam-host: 拠点の Chrome 拡張 (extension/) が native messaging で起動する。
 //! 拡張が開いている間だけ動き、stdin が閉じたら (= 拡張が閉じたら) 終わる。
 //!
-//!   拡張 ──stdin──▶ config / start / stop / sdp_answer / ice_candidate
+//!   拡張 ──stdin──▶ config / start / stop / sdp_answer / ice_candidate   (config 以外は viewer_id 付き)
 //!   拡張 ◀─stdout── ready / sdp_offer / camera / peer / log
 //!
-//! 見る人が来たら (start) カメラの RTSP を受け始め、WebRTC の offer を返す。映像は見る側と P2P。
+//! 見る人が来るたび (start) その人への WebRTC の offer を返す。カメラの RTSP は最初の 1 人で開き、
+//! 最後の 1 人が離れたら TEARDOWN する (カメラにつき 1 本)。映像は `hub` が見る人ごとに複製して P2P で送る。
 
 mod camera;
+mod hub;
 mod native;
 mod peer;
 mod stun;
 
 use std::io;
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
+use camera::{Cam, Camera};
+use hub::{Frame, Hub, MAX_VIEWERS};
 use native::{In, Out};
 use peer::Viewer;
+
+/// 1 巡で UDP を待つ時間の合計 (見る人で割る)。stdin とカメラのフレームにもすぐ応じるため短く
+const MAX_WAIT: Duration = Duration::from_millis(5);
 
 fn main() {
     str0m::crypto::from_feature_flags().install_process_default();
@@ -50,11 +57,12 @@ fn main() {
     out(Out::Ready { version: env!("CARGO_PKG_VERSION") });
 
     let mut config: Option<(String, String)> = None;
-    let mut viewer: Option<Viewer> = None;
+    let mut hub: Hub<Viewer> = Hub::default();
+    let mut camera: Option<Camera> = None;
 
     loop {
         // 見る人が居ないあいだは stdin を待つだけ
-        let wait = if viewer.is_some() { Duration::ZERO } else { Duration::from_millis(500) };
+        let wait = if hub.is_empty() { Duration::from_millis(500) } else { Duration::ZERO };
         let msg = match rx.recv_timeout(wait) {
             Ok(Some(m)) => Some(m),
             Ok(None) | Err(RecvTimeoutError::Disconnected) => return,
@@ -65,53 +73,88 @@ fn main() {
             None => {}
             Some(Err(e)) => out(Out::Log { message: format!("読めないメッセージ: {e}") }),
             Some(Ok(In::Config { rtsp_url, stun })) => config = Some((rtsp_url, stun)),
-            Some(Ok(In::Start)) => {
-                viewer = None; // 前の見る人の分は畳む
-                match &config {
-                    None => out(Out::Log { message: "config より先に start が来ました".into() }),
-                    Some((rtsp_url, stun)) => match Viewer::new(rtsp_url, stun) {
-                        Ok((v, sdp)) => {
-                            viewer = Some(v);
-                            out(Out::SdpOffer { sdp });
-                            out(Out::Peer { ok: false, message: "offer を送信、answer 待ち".into() });
-                        }
-                        Err(e) => out(Out::Peer { ok: false, message: e }),
-                    },
+            Some(Ok(In::Start { viewer_id })) => match &config {
+                None => out(Out::Log { message: "config より先に start が来ました".into() }),
+                Some(_) if !hub.contains(&viewer_id) && hub.len() >= MAX_VIEWERS => {
+                    out(Out::Log { message: format!("見る人が上限 ({MAX_VIEWERS}) なので {viewer_id} は断ります") })
+                }
+                Some((rtsp_url, stun)) => match Viewer::new(&viewer_id, rtsp_url, stun) {
+                    Ok((v, sdp)) => {
+                        // 同じ viewer_id の入り直しなら前の分は畳まれる
+                        let _ = hub.insert(&viewer_id, v);
+                        out(Out::SdpOffer { viewer_id: viewer_id.clone(), sdp });
+                        out(Out::Peer { viewer_id, ok: false, message: "offer を送信、answer 待ち".into() });
+                    }
+                    Err(message) => out(Out::Peer { viewer_id, ok: false, message }),
+                },
+            },
+            Some(Ok(In::Stop { viewer_id })) => {
+                if hub.remove(&viewer_id).is_some() {
+                    out(Out::Peer { viewer_id, ok: false, message: "見る人が離れました".into() });
                 }
             }
-            Some(Ok(In::Stop)) => {
-                if viewer.take().is_some() {
-                    out(Out::Peer { ok: false, message: "見る人が離れました".into() });
-                    out(Out::Camera { ok: false, message: "停止".into() });
-                }
-            }
-            Some(Ok(In::SdpAnswer { sdp })) => {
-                if let Some(v) = viewer.as_mut() {
-                    if let Err(e) = v.accept_answer(&sdp) {
-                        out(Out::Peer { ok: false, message: e });
-                        viewer = None;
+            Some(Ok(In::SdpAnswer { viewer_id, sdp })) => match hub.get_mut(&viewer_id) {
+                None => out(Out::Log { message: format!("知らない viewer_id の answer: {viewer_id}") }),
+                Some(v) => {
+                    if let Err(message) = v.accept_answer(&sdp) {
+                        hub.remove(&viewer_id);
+                        out(Out::Peer { viewer_id, ok: false, message });
                     }
                 }
-            }
-            Some(Ok(In::IceCandidate { candidate })) => {
-                if let Some(v) = viewer.as_mut() {
-                    v.add_candidate(&candidate);
+            },
+            Some(Ok(In::IceCandidate { viewer_id, candidate })) => match hub.get_mut(&viewer_id) {
+                None => out(Out::Log { message: format!("知らない viewer_id の候補: {viewer_id}") }),
+                Some(v) => v.add_candidate(&candidate),
+            },
+        }
+
+        // カメラ → 全員へ複製
+        if let Some(cam) = &camera {
+            loop {
+                match cam.rx.try_recv() {
+                    Ok(Cam::Status { ok, message }) => out(Out::Camera { ok, message }),
+                    Ok(Cam::Frame { key, timestamp_us, data }) => {
+                        let f = Frame { key, ts: (timestamp_us * 0.09) as u64, data: data.into() };
+                        for (viewer_id, _, message) in hub.on_frame(f) {
+                            out(Out::Peer { viewer_id, ok: false, message });
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    // 受信スレッドが居なくなった。下で開き直す
+                    Err(TryRecvError::Disconnected) => {
+                        camera = None;
+                        break;
+                    }
                 }
             }
         }
 
-        if let Some(v) = viewer.as_mut() {
-            match v.step(&mut out) {
-                Ok(true) => {}
-                Ok(false) => {
-                    viewer = None;
-                    out(Out::Peer { ok: false, message: "切断されました".into() });
-                }
-                Err(e) => {
-                    viewer = None;
-                    out(Out::Peer { ok: false, message: e });
-                }
+        // 見る人ごとの WebRTC。1 人の失敗はその人だけ外す
+        if !hub.is_empty() {
+            let per = MAX_WAIT / hub.len() as u32;
+            for viewer_id in hub.ids() {
+                let Some(v) = hub.get_mut(&viewer_id) else { continue };
+                let message = match v.step(per, &mut out) {
+                    Ok(true) => continue,
+                    Ok(false) => "切断されました".to_string(),
+                    Err(e) => e,
+                };
+                hub.remove(&viewer_id);
+                out(Out::Peer { viewer_id, ok: false, message });
             }
+            for (viewer_id, _, message) in hub.flush_connected() {
+                out(Out::Peer { viewer_id, ok: false, message });
+            }
+        }
+
+        // RTSP は見る人が 1 人でも居る間だけ 1 本
+        match (&config, hub.is_empty(), camera.is_some()) {
+            (_, true, true) => {
+                camera = None; // TEARDOWN
+                out(Out::Camera { ok: false, message: "停止".into() });
+            }
+            (Some((rtsp_url, _)), false, false) => camera = Some(Camera::open(rtsp_url)),
+            _ => {}
         }
     }
 }

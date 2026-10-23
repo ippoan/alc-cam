@@ -1,10 +1,7 @@
-//! 見る人 1 人ぶんの WebRTC (str0m) と、その間だけ動くカメラ受信。
+//! 見る人 1 人ぶんの WebRTC (str0m)。UDP は 1 人に 1 本。カメラの受信は持たない (`hub` が束ねて配る)。
 //! カメラ中継規約どおり、映像のみ・H.264 パススルー・non-trickle の offer (候補は offer に全部入れる)。
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -14,18 +11,16 @@ use str0m::media::{Direction, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
-use crate::camera::{self, Cam};
+use crate::hub::{Frame, Sink};
 use crate::native::Out;
 use crate::stun;
 
 /// answer が来てから繋がるまでの猶予
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// 1 回の UDP 待ちの上限 (stdin とカメラのフレームにもすぐ応じるため短く)
-const MAX_WAIT: Duration = Duration::from_millis(5);
-/// 繋がる前に溜めておく直近の GOP の上限 (フレーム数)
-const MAX_GOP: usize = 300;
 
 pub struct Viewer {
+    /// cam-room の DO が付けた viewer_id (host → 拡張のメッセージに付けて返す)
+    id: String,
     rtc: Rtc,
     socket: UdpSocket,
     local: SocketAddr,
@@ -34,16 +29,12 @@ pub struct Viewer {
     pending: Option<SdpPendingOffer>,
     answered_at: Option<Instant>,
     connected: bool,
-    sent_key: bool,
-    gop: Vec<(bool, u64, Arc<[u8]>)>,
-    cam_rx: Receiver<Cam>,
-    stop: Arc<AtomicBool>,
     buf: Vec<u8>,
 }
 
 impl Viewer {
-    /// offer (SDP 文字列) を作り、カメラの受信を始める
-    pub fn new(rtsp_url: &str, stun_server: &str) -> Result<(Self, String), String> {
+    /// offer (SDP 文字列) を作る。`rtsp_url` は LAN 側の IP を決めるためだけに使う
+    pub fn new(id: &str, rtsp_url: &str, stun_server: &str) -> Result<(Self, String), String> {
         let stun_addr = resolve(stun_server.trim_start_matches("stun:"));
         let lan_ip = route_ip(rtsp_url, stun_addr).ok_or("LAN のアドレスが分かりません")?;
         let socket = UdpSocket::bind((lan_ip, 0)).map_err(|e| format!("UDP を開けません ({})", e.kind()))?;
@@ -64,11 +55,8 @@ impl Viewer {
         let mid = api.add_media(MediaKind::Video, Direction::SendOnly, Some("alc-cam".into()), Some("camera".into()), None);
         let (offer, pending) = api.apply().ok_or("offer を作れません")?;
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let (tx, cam_rx) = mpsc::channel();
-        camera::spawn(rtsp_url.to_string(), stop.clone(), tx);
-
         let viewer = Self {
+            id: id.to_string(),
             rtc,
             socket,
             local,
@@ -77,10 +65,6 @@ impl Viewer {
             pending: Some(pending),
             answered_at: None,
             connected: false,
-            sent_key: false,
-            gop: Vec::new(),
-            cam_rx,
-            stop,
             buf: vec![0u8; 2000],
         };
         Ok((viewer, offer.to_sdp_string()))
@@ -103,16 +87,8 @@ impl Viewer {
         }
     }
 
-    /// 1 巡ぶん進める。`Ok(false)` は相手が切れた (畳んでよい)
-    pub fn step(&mut self, out: &mut dyn FnMut(Out)) -> Result<bool, String> {
-        loop {
-            match self.cam_rx.try_recv() {
-                Ok(Cam::Status { ok, message }) => out(Out::Camera { ok, message }),
-                Ok(Cam::Frame { key, timestamp_us, data }) => self.on_frame(key, timestamp_us, data)?,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Err("カメラ受信が止まりました".into()),
-            }
-        }
+    /// 1 巡ぶん進める (UDP は最大 `max_wait` 待つ)。`Ok(false)` は相手が切れた (畳んでよい)
+    pub fn step(&mut self, max_wait: Duration, out: &mut dyn FnMut(Out)) -> Result<bool, String> {
 
         let timeout = loop {
             match self.rtc.poll_output().map_err(|e| e.to_string())? {
@@ -122,8 +98,7 @@ impl Viewer {
                 }
                 Output::Event(Event::Connected) => {
                     self.connected = true;
-                    out(Out::Peer { ok: true, message: "接続 (P2P)".into() });
-                    self.flush_gop()?;
+                    out(Out::Peer { viewer_id: self.id.clone(), ok: true, message: "接続 (P2P)".into() });
                 }
                 Output::Event(Event::IceConnectionStateChange(IceConnectionState::Disconnected)) => return Ok(false),
                 Output::Event(_) => {}
@@ -134,7 +109,7 @@ impl Viewer {
         }
 
         let now = Instant::now();
-        let wait = timeout.saturating_duration_since(now).min(MAX_WAIT);
+        let wait = timeout.saturating_duration_since(now).min(max_wait);
         if wait.is_zero() {
             self.rtc.handle_input(Input::Timeout(now)).map_err(|e| e.to_string())?;
             return Ok(true);
@@ -155,37 +130,14 @@ impl Viewer {
         Ok(true)
     }
 
-    fn on_frame(&mut self, key: bool, timestamp_us: f64, data: Vec<u8>) -> Result<(), String> {
-        let ts = (timestamp_us * 0.09) as u64;
-        let data: Arc<[u8]> = data.into();
-        if !self.connected {
-            // 繋がった瞬間に直近のキーフレームから出せるように、GOP を 1 つだけ持つ
-            if key {
-                self.gop.clear();
-            }
-            if !self.gop.is_empty() || key {
-                if self.gop.len() >= MAX_GOP {
-                    self.gop.clear();
-                } else {
-                    self.gop.push((key, ts, data));
-                }
-            }
-            return Ok(());
-        }
-        self.write(key, ts, data)
+}
+
+impl Sink for Viewer {
+    fn is_connected(&self) -> bool {
+        self.connected
     }
 
-    fn flush_gop(&mut self) -> Result<(), String> {
-        for (key, ts, data) in std::mem::take(&mut self.gop) {
-            self.write(key, ts, data)?;
-        }
-        Ok(())
-    }
-
-    fn write(&mut self, key: bool, ts: u64, data: Arc<[u8]>) -> Result<(), String> {
-        if !self.sent_key && !key {
-            return Ok(());
-        }
+    fn write(&mut self, f: &Frame) -> Result<(), String> {
         let Some(writer) = self.rtc.writer(self.mid) else { return Ok(()) };
         let pt = match self.pt {
             Some(pt) => pt,
@@ -197,15 +149,12 @@ impl Viewer {
                 pt
             }
         };
-        writer.write(pt, Instant::now(), MediaTime::from_90khz(ts), data).map_err(|e| e.to_string())?;
-        self.sent_key = true;
-        Ok(())
+        writer.write(pt, Instant::now(), MediaTime::from_90khz(f.ts), f.data.clone()).map_err(|e| e.to_string())
     }
 }
 
 impl Drop for Viewer {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
         self.rtc.disconnect();
     }
 }

@@ -1,6 +1,6 @@
 // native messaging の alc-cam-host (Rust)。このページが開いている間だけ Chrome が起動し、
 // ページが閉じる (= port が切れる) と host の stdin が閉じて終了する。
-// メッセージは host/README.md の表のとおり。
+// メッセージは docs/host-protocol.md の表のとおり。
 
 export const HOST_NAME = 'org.ippoan.alc_cam_host';
 const RETRY_MAX_MS = 30_000;

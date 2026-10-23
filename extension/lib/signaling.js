@@ -1,6 +1,6 @@
-// cf-alc-signaling の /cam-room/<拠点ID>?role=device への WebSocket (alc-gw の
-// docs/camera-relay-convention.md が一次の規約)。切れたら規約どおり 1s→60s の指数バックオフで繋ぎ直す。
-// 映像は通らない: SDP の offer/answer と peer_joined / peer_left だけが行き来する。
+// cf-alc-signaling の /cam-room/<拠点ID>?role=device&proto=2 への WebSocket (alc-gw の
+// docs/camera-relay-convention.md が一次の規約、複数人視聴は v2)。切れたら規約どおり 1s→60s の指数バックオフで繋ぎ直す。
+// 映像は通らない: SDP の offer/answer と peer_joined / peer_left だけが行き来する (v2 では viewer_id 付き)。
 
 const PING_INTERVAL_MS = 25_000;
 const BACKOFF_MIN_MS = 1_000;
@@ -55,8 +55,8 @@ export class CamRoom {
       if (this.ws !== ws) return;
       this.ws = null;
       clearInterval(this.pingTimer);
-      // 相手 (admin) もいなくなったものとして扱う
-      this.opts.onMessage({ type: 'peer_left', role: 'admin' });
+      // 見る人 (admin) も全員いなくなったものとして扱う
+      this.opts.onMessage({ type: 'room_closed' });
       // 409 = 同じ拠点の device が既に居る (alc-gw 等)。間隔を空けて繋ぎ直すだけ
       this.scheduleRetry(`close ${ev.code}${ev.reason ? ' ' + ev.reason : ''}`);
     };

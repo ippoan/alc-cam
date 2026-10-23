@@ -6,6 +6,8 @@
 //
 // 拠点側 (device) の振る舞いは alc-gw の docs/camera-relay-convention.md のとおり:
 // 見る側が入ってきたら (peer_joined) host が offer を作り (non-trickle)、出ていったら (peer_left) 畳む。
+// cam-room には proto=2 で入り、見る人を複数 (DO が付ける viewer_id で区別) 同時に持つ。
+// v1 の部屋 (viewer_id が来ない) では viewer_id = '' の 1 人として同じ道を通る。
 
 import { Host } from './lib/host.js';
 import { CamRoom } from './lib/signaling.js';
@@ -54,6 +56,7 @@ function readForm() {
 export function roomUrl(s) {
   const url = new URL(`${s.signalingUrl}/cam-room/${encodeURIComponent(s.siteId)}`);
   url.searchParams.set('role', 'device');
+  url.searchParams.set('proto', '2');
   return url.toString();
 }
 
@@ -61,14 +64,16 @@ export function roomUrl(s) {
 
 class Relay {
   constructor(s) {
-    this.viewerPresent = false;
+    /** viewer_id → 映像の状態 {ok, message} */
+    this.viewers = new Map();
 
     this.host = new Host({
       config: { rtsp_url: s.rtspUrl, stun: s.stun },
       onMessage: (msg) => this.onHost(msg),
       onDown: (reason) => {
         setStatus('st-host', `停止: ${reason}`, 'warn');
-        setStatus('st-peer', '-');
+        for (const v of this.viewers.values()) Object.assign(v, { ok: false, message: 'host 停止' });
+        this.renderViewers();
       },
     });
 
@@ -88,24 +93,30 @@ class Relay {
   }
 
   onRoom(msg) {
+    const viewerId = msg.viewer_id ?? '';
     switch (msg.type) {
       case 'peer_joined':
         if (msg.role !== 'admin') return;
-        this.viewerPresent = true;
-        setStatus('st-viewer', 'あり', 'ok');
-        this.host.send({ type: 'start' });
+        this.viewers.set(viewerId, { ok: false, message: '接続待ち' });
+        this.renderViewers();
+        this.host.send({ type: 'start', viewer_id: viewerId });
         break;
       case 'peer_left':
-        if (msg.role !== 'admin' || !this.viewerPresent) return;
-        this.viewerPresent = false;
-        setStatus('st-viewer', 'なし');
-        this.host.send({ type: 'stop' });
+        if (msg.role !== 'admin' || !this.viewers.delete(viewerId)) return;
+        this.renderViewers();
+        this.host.send({ type: 'stop', viewer_id: viewerId });
+        break;
+      case 'room_closed':
+        // cam-room の WebSocket が切れた = 見る人は全員居なくなったものとして畳む
+        for (const id of this.viewers.keys()) this.host.send({ type: 'stop', viewer_id: id });
+        this.viewers.clear();
+        this.renderViewers();
         break;
       case 'sdp_answer':
-        this.host.send({ type: 'sdp_answer', sdp: msg.sdp });
+        this.host.send({ type: 'sdp_answer', viewer_id: viewerId, sdp: msg.sdp });
         break;
       case 'ice_candidate':
-        this.host.send({ type: 'ice_candidate', candidate: msg.candidate });
+        this.host.send({ type: 'ice_candidate', viewer_id: viewerId, candidate: msg.candidate });
         break;
       case 'error':
         console.warn('cam-room:', msg.message);
@@ -118,21 +129,36 @@ class Relay {
       case 'ready':
         setStatus('st-host', `起動 (v${msg.version})`, 'ok');
         // host が落ちて起動し直したとき、見る人がまだ居れば offer を作り直させる
-        if (this.viewerPresent) this.host.send({ type: 'start' });
+        for (const id of this.viewers.keys()) this.host.send({ type: 'start', viewer_id: id });
         break;
       case 'sdp_offer':
-        this.room.send({ type: 'sdp_offer', sdp: msg.sdp });
+        // viewer_id '' は v1 の部屋 (DO が宛先を 1 人と決めている)
+        this.room.send(msg.viewer_id ? { type: 'sdp_offer', viewer_id: msg.viewer_id, sdp: msg.sdp } : { type: 'sdp_offer', sdp: msg.sdp });
         break;
       case 'camera':
         setStatus('st-camera', msg.message, msg.ok ? 'ok' : 'warn');
         break;
-      case 'peer':
-        setStatus('st-peer', msg.message, msg.ok ? 'ok' : '');
+      case 'peer': {
+        const v = this.viewers.get(msg.viewer_id ?? '');
+        if (!v) return;
+        Object.assign(v, { ok: msg.ok, message: msg.message });
+        this.renderViewers();
         break;
+      }
       case 'log':
         console.log('[host]', msg.message);
         break;
     }
+  }
+
+  renderViewers() {
+    const vs = [...this.viewers.values()];
+    setStatus('st-viewer', vs.length ? `${vs.length} 人` : 'なし', vs.length ? 'ok' : '');
+    if (!vs.length) return setStatus('st-peer', '-');
+    const ok = vs.filter((v) => v.ok).length;
+    const other = vs.filter((v) => !v.ok).map((v) => v.message);
+    const text = [ok ? `接続 (P2P) ${ok} 人` : '', ...new Set(other)].filter(Boolean).join(' / ');
+    setStatus('st-peer', text, ok === vs.length ? 'ok' : '');
   }
 
   stop() {
