@@ -10,6 +10,7 @@
     <h1>alc-cam 拠点中継</h1>
     <button id="toggle" type="button">開始</button>
   </header>
+  <p class="note">配信はパネルを閉じても続きます (Chrome が動いている間ずっと)。「停止」で止めます。</p>
 
   <dl class="status">
     <dt>host</dt><dd id="st-host">停止</dd>
@@ -34,7 +35,6 @@
       <label>STUN
         <input name="stun" required placeholder="stun.l.google.com:19302">
       </label>
-      <label class="check"><input name="autoStart" type="checkbox"> パネルを開いたら自動で開始</label>
       <button type="submit">保存</button>
       <span id="saved" hidden>保存しました</span>
     </form>
