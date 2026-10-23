@@ -83,3 +83,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create ${{ github.ref_name }} dist/alc-cam-windows.zip --generate-notes
+
+  # green の PR を merge する (ippoan/ci-workflows の reusable。merge は GitHub App の token で行う)。
+  # デプロイはしない (ingest は手で wrangler deploy)。windows も PR で走るので needs に入れる
+  auto-merge:
+    name: Auto Merge
+    needs: [test, ingest, windows]
+    if: github.event_name == 'pull_request' && needs.test.result == 'success' && needs.ingest.result == 'success' && needs.windows.result == 'success'
+    uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+      # 無いと startup_failure になる
+      checks: read
+    secrets:
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
+      CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
