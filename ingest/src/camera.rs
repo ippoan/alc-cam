@@ -5,7 +5,7 @@
 //! `redirect: "error"` は workerd が受け付けない)。
 
 use cam_ingest_api::dest::Dest;
-use cam_sd::{digest, list_path, parse_listing, safe_segment};
+use cam_sd::{digest, list_path};
 use wasm_bindgen::prelude::*;
 use worker::{Env, Fetcher, Headers, Method, Request, RequestInit, RequestRedirect, Response, Result};
 
@@ -66,13 +66,10 @@ impl Camera {
         Ok(Self { fetcher: Fetcher::unchecked_from_js(vpc.0), base: dest.base_url(), user, pass, nc: 0 })
     }
 
-    /// SD のいちばん上のフォルダ (カメラ名。`<カメラ名>/<種類>/<日付>/<時>/` の頭)。1 つだけでなければ失敗
+    /// SD のいちばん上のフォルダ (カメラ名。`<カメラ名>/<種類>/<日付>/<時>/` の頭)。決め方は `cam_ingest_api::sd_root`。
+    /// 決まらなければ失敗 (切り出しの口が 502 にする)
     pub async fn sd_root(&mut self) -> Result<String> {
-        let dirs: Vec<String> = parse_listing(&self.get_text(&list_path("")).await?).dirs.into_iter().filter(|d| safe_segment(d)).collect();
-        match <[String; 1]>::try_from(dirs) {
-            Ok([root]) => Ok(root),
-            Err(dirs) => Err(format!("SD のいちばん上のフォルダが 1 つではありません ({} 個)", dirs.len()).into()),
-        }
+        cam_ingest_api::sd_root(&self.get_text(&list_path("")).await?).ok_or_else(|| "SD のフォルダ (カメラ名) が特定できません".into())
     }
 
     pub async fn get_text(&mut self, path: &str) -> Result<String> {

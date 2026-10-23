@@ -14,7 +14,7 @@ pub mod dest;
 pub mod pg;
 
 use alc_worker_db::PgClient;
-use cam_sd::{jst_compact, jst_iso, parse_time, safe_segment};
+use cam_sd::{jst_compact, jst_iso, parse_listing, parse_time, safe_segment};
 use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -360,6 +360,17 @@ pub fn clip_r2_key(tenant: Uuid, camera_id: Uuid, from_ms: i64, to_ms: i64) -> S
 /// 元ファイルの R2 のキーの頭 (この後に SD と同じ並びが続く)
 pub fn raw_r2_prefix(tenant: Uuid, camera_id: Uuid) -> String {
     format!("{tenant}/{camera_id}")
+}
+
+/// SD のルートの一覧 (`sdcard.cgi?action=generate&dir=` の XML) から、いちばん上のフォルダ (カメラ名) を決める。
+/// `safe_segment` を満たすフォルダが 1 つだけならそれ、0 か 2 以上なら `None` (呼び手が 502 にする)
+pub fn sd_root(listing_xml: &str) -> Option<String> {
+    let mut dirs = parse_listing(listing_xml)
+        .dirs
+        .into_iter()
+        .filter(|d| safe_segment(d));
+    let root = dirs.next()?;
+    dirs.next().is_none().then_some(root)
 }
 
 /// 失敗の文から宛先を消す (カメラへの fetch の失敗の文に URL が混ざっても出さない)
@@ -859,6 +870,30 @@ mod tests {
             )),
             404
         );
+    }
+
+    #[test]
+    fn sd_root_needs_exactly_one_folder() {
+        let dir = |n: &str| format!(r#"<Dir name="{n}" path="/"></Dir>"#);
+        let xml = |dirs: &[&str]| {
+            format!(
+                "<Root>{}</Root>",
+                dirs.iter().map(|d| dir(d)).collect::<String>()
+            )
+        };
+        assert_eq!(
+            sd_root(&xml(&["TS-NS320W-55"])),
+            Some("TS-NS320W-55".to_owned())
+        );
+        // 使えない名前は数えない (1 つ残ればそれ)
+        assert_eq!(
+            sd_root(&xml(&["..", "TS-NS320W-55"])),
+            Some("TS-NS320W-55".to_owned())
+        );
+        assert_eq!(sd_root(&xml(&[])), None);
+        assert_eq!(sd_root(&xml(&["a b"])), None);
+        assert_eq!(sd_root(&xml(&["CAM-A", "CAM-B"])), None);
+        assert_eq!(sd_root(""), None);
     }
 
     #[test]
