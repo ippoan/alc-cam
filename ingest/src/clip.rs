@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use cam_ingest_api::auto::{listed_files, ListedFile};
+use cam_ingest_api::auto::{listed_files, ListedFile, LIST_LEAD_MS};
 use cam_mp4::{parse_moov, plan_clip, BoxHeader, Moov, Source};
 use cam_sd::{hours_to_scan, list_path, overlapping, parse_listing, Recording};
 use futures_util::StreamExt;
@@ -17,8 +17,6 @@ const KINDS: [&str; 1] = ["Schedule"];
 
 /// R2 のマルチパートの 1 パートの大きさ。最後以外は同じ大きさ・5MiB 以上でないといけない
 const PART: usize = 16 * 1024 * 1024;
-/// 頭のファイルは時間帯より前に始まる。1 本 (約 4 分) より長めに前から探す
-const LEAD_MS: i64 = 10 * 60_000;
 /// 最後のファイルの長さの見込み (次のファイルが無いとき)
 const LAST_LEN_MS: i64 = 5 * 60_000;
 
@@ -90,7 +88,7 @@ pub async fn make(target: &Target, cam: &mut Camera, bucket: &Bucket, from_ms: i
     }
 
     // 1. 重なる録画を探す
-    let found: Vec<ListedFile> = list(cam, &target.sd_root, from_ms, to_ms, LEAD_MS).await?.into_iter().filter(|f| f.closed).collect();
+    let found: Vec<ListedFile> = list(cam, &target.sd_root, from_ms, to_ms, LIST_LEAD_MS).await?.into_iter().filter(|f| f.closed).collect();
     let starts: Vec<i64> = found.iter().map(|f| f.start_ms).collect();
     let picked: Vec<&ListedFile> = overlapping(&starts, from_ms, to_ms, LAST_LEN_MS).into_iter().map(|i| &found[i]).collect();
     if picked.is_empty() {
