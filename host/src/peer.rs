@@ -1,11 +1,13 @@
 //! 見る人 1 人ぶんの WebRTC (str0m)。UDP は 1 人に 1 本。カメラの受信は持たない (`hub` が束ねて配る)。
 //! カメラ中継規約どおり、映像のみ・H.264 パススルー・non-trickle の offer (候補は offer に全部入れる)。
+//! 首振り用にデータチャネル `ptz` を 1 本だけ offer に足す (中身は JSON 文字列。`ptz.rs`)。
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use str0m::change::{SdpAnswer, SdpPendingOffer};
+use str0m::channel::ChannelId;
 use str0m::format::Codec;
 use str0m::media::{Direction, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
@@ -13,7 +15,7 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig}
 
 use crate::hub::{Frame, Sink};
 use crate::native::Out;
-use crate::stun;
+use crate::{ptz, stun};
 
 /// answer が来てから繋がるまでの猶予
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -29,6 +31,10 @@ pub struct Viewer {
     pending: Option<SdpPendingOffer>,
     answered_at: Option<Instant>,
     connected: bool,
+    /// データチャネル `ptz` (開いてから)
+    ptz: Option<ChannelId>,
+    /// 見る側から届いた `ptz` の文字列 (main が `take_ptz` で引き取る)
+    inbox: Vec<String>,
     buf: Vec<u8>,
 }
 
@@ -53,6 +59,7 @@ impl Viewer {
 
         let mut api = rtc.sdp_api();
         let mid = api.add_media(MediaKind::Video, Direction::SendOnly, Some("alc-cam".into()), Some("camera".into()), None);
+        api.add_channel("ptz".into());
         let (offer, pending) = api.apply().ok_or("offer を作れません")?;
 
         let viewer = Self {
@@ -65,6 +72,8 @@ impl Viewer {
             pending: Some(pending),
             answered_at: None,
             connected: false,
+            ptz: None,
+            inbox: Vec::new(),
             buf: vec![0u8; 2000],
         };
         Ok((viewer, offer.to_sdp_string()))
@@ -101,6 +110,14 @@ impl Viewer {
                     out(Out::Peer { viewer_id: self.id.clone(), ok: true, message: "接続 (P2P)".into() });
                 }
                 Output::Event(Event::IceConnectionStateChange(IceConnectionState::Disconnected)) => return Ok(false),
+                Output::Event(Event::ChannelOpen(id, label)) if label == "ptz" => {
+                    self.ptz = Some(id);
+                    self.send_ptz(&ptz::caps());
+                }
+                Output::Event(Event::ChannelData(d)) if Some(d.id) == self.ptz && !d.binary => {
+                    self.inbox.push(String::from_utf8_lossy(&d.data).into_owned());
+                }
+                Output::Event(Event::ChannelClose(id)) if Some(id) == self.ptz => self.ptz = None,
                 Output::Event(_) => {}
             }
         };
@@ -130,6 +147,16 @@ impl Viewer {
         Ok(true)
     }
 
+    pub fn take_ptz(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.inbox)
+    }
+
+    /// データチャネル `ptz` へ 1 通 (開いていなければ捨てる)
+    pub fn send_ptz(&mut self, text: &str) {
+        if let Some(mut ch) = self.ptz.and_then(|id| self.rtc.channel(id)) {
+            let _ = ch.write(false, text.as_bytes());
+        }
+    }
 }
 
 impl Sink for Viewer {

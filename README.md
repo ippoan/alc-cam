@@ -29,6 +29,7 @@
 | `test/` | 偽カメラ・cam-room のローカル版・見る側のページと、それらを通す `e2e.mjs` |
 | `crates/cam-sd/` | カメラの SD 録画の一覧・取り出し・時刻の扱い (I/O を持たない) |
 | `crates/cam-mp4/` | MP4 を再エンコードせずに切ってつなぐ (moov を読み、出力の頭と写す区間を返す。I/O を持たない) |
+| `crates/cam-ptz/` | 首振り (パン・チルト・プリセット) の命令の交通整理と CGI (HTTP Digest) の組み立て (I/O を持たない)。見る側とはデータチャネル `ptz` |
 | `ingest/` | SD 録画の時間指定の切り出しを R2 に置く Worker `alc-cam-sd-ingest` (wasm32、別 workspace) |
 
 ## 拠点 PC への入れ方 (Windows)
