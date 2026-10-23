@@ -43,7 +43,7 @@ const hostRunning = () => {
 };
 
 const camera = startFakeRtsp({ host: lanIp, port: 8554 });
-const signaling = startSignaling({ port: SIG_PORT });
+const signaling = startSignaling({ port: SIG_PORT, v1Sites: ['v1-site'] });
 
 // native messaging host の登録 (Linux の Chromium は <user-data-dir>/NativeMessagingHosts も見る)
 const userDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'alc-cam-e2e-'));
@@ -70,12 +70,8 @@ try {
   const panel = await ctx.newPage();
   panel.on('console', (m) => console.log('[panel]', m.text()));
   await panel.goto(`chrome-extension://${EXT_ID}/panel.html`);
-  await panel.evaluate((s) => chrome.storage.local.set(s), {
-    signalingUrl: `ws://127.0.0.1:${SIG_PORT}`,
-    siteId: 'test-site',
-    rtspUrl: camera.url,
-    stun: 'stun.l.google.com:19302',
-  });
+  const settings = (siteId) => ({ signalingUrl: `ws://127.0.0.1:${SIG_PORT}`, siteId, rtspUrl: camera.url, stun: 'stun.l.google.com:19302' });
+  await panel.evaluate((s) => chrome.storage.local.set(s), settings('test-site'));
   await panel.reload();
   await panel.click('#toggle');
   const status = () => panel.evaluate(() =>
@@ -84,31 +80,55 @@ try {
   await waitFor(async () => (await status())['シグナリング'] === '接続済み', 10_000, 'cam-room 接続');
   results.beforeViewer = { ...camera.stats };
 
-  // 1 人目
-  const viewer = await viewerBrowser.newPage();
-  await viewer.goto(`http://localhost:${SIG_PORT}/viewer.html?site=test-site`);
-  const first = await waitFor(async () => {
-    const s = await viewer.evaluate(() => window.camState);
-    return s.framesDecoded > 30 ? s : null;
-  }, 30_000, '1 人目のデコード');
-  results.first = first;
-  results.panelWhileViewing = await status();
-  await viewer.screenshot({ path: path.join(here, 'e2e-viewer.png') });
+  const openViewer = async (site = 'test-site') => {
+    const page = await viewerBrowser.newPage();
+    await page.goto(`http://localhost:${SIG_PORT}/viewer.html?site=${site}`);
+    return page;
+  };
+  const decoded = (page) => page.evaluate(() => window.camState.framesDecoded ?? 0);
+  const decodes = (page, n, label) => waitFor(async () => ((await decoded(page)) > n ? page.evaluate(() => window.camState) : null), 30_000, label);
+  // 2 秒の間に増えたか (= まだ映像が流れているか)
+  const stillFlowing = async (page) => {
+    const before = await decoded(page);
+    await sleep(2000);
+    return (await decoded(page)) - before;
+  };
 
-  // 離れたらカメラを畳む
-  await viewer.close();
+  // A が見ている途中で B が入る (同時に 2 人)
+  const a = await openViewer();
+  results.a = await decodes(a, 30, 'A のデコード');
+  const b = await openViewer();
+  results.b = await decodes(b, 15, 'B (途中参加) のデコード');
+  results.bothWatching = { aDelta: await stillFlowing(a), camera: { ...camera.stats }, panel: await status() };
+  await a.screenshot({ path: path.join(here, 'e2e-viewer.png') });
+
+  // A が離れても B は流れ続け、カメラは畳まない
+  await a.close();
+  await sleep(1000);
+  results.afterALeft = { bDelta: await stillFlowing(b), camera: { ...camera.stats }, panel: await status() };
+
+  // 最後の 1 人 (B) が離れたらカメラを畳む
+  await b.close();
   await waitFor(() => camera.stats.closed >= 1, 10_000, 'カメラの切断');
   await sleep(300);
-  results.afterLeave = { ...camera.stats, panel: await status() };
+  results.afterAllLeft = { ...camera.stats, panel: await status() };
 
-  // 2 人目 (入り直し)
-  const viewer2 = await viewerBrowser.newPage();
-  await viewer2.goto(`http://localhost:${SIG_PORT}/viewer.html?site=test-site`);
-  results.second = await waitFor(async () => {
-    const s = await viewer2.evaluate(() => window.camState);
-    return s.framesDecoded > 15 ? s : null;
-  }, 30_000, '2 人目のデコード');
-  await viewer2.close();
+  // 入り直しで再び映る
+  const c = await openViewer();
+  results.c = await decodes(c, 15, 'C (入り直し) のデコード');
+  await c.close();
+  await waitFor(() => camera.stats.closed >= 2, 10_000, 'カメラの切断 (2 回目)');
+
+  // v1 の部屋 (proto を知らない古い DO) でも 1 人なら映る
+  await panel.click('#toggle');
+  await panel.evaluate((s) => chrome.storage.local.set(s), settings('v1-site'));
+  await panel.reload();
+  await panel.click('#toggle');
+  await waitFor(async () => (await status())['シグナリング'] === '接続済み', 10_000, 'cam-room (v1) 接続');
+  const d = await openViewer('v1-site');
+  results.v1 = await decodes(d, 15, 'v1 の部屋のデコード');
+  await d.close();
+  await waitFor(() => camera.stats.closed >= 3, 10_000, 'カメラの切断 (v1)');
 
   // パネルを閉じたら host も終わる
   await panel.close();
@@ -125,6 +145,18 @@ try {
 }
 
 console.log(JSON.stringify(results, null, 1));
-const ok = !results.error && results.beforeViewer.sessions === 0 && results.afterLeave.teardowns >= 1 && results.hostExitedOnPanelClose;
+const checks = results.error ? {} : {
+  // 見る人が来るまでカメラに触らない
+  noCameraBeforeViewer: results.beforeViewer.sessions === 0,
+  // 2 人同時でも RTSP は 1 本、A も流れ続けている
+  oneRtspForTwo: results.bothWatching.camera.sessions === 1 && results.bothWatching.aDelta > 0,
+  // 片方が離れてももう片方は流れ、カメラは畳まない
+  otherKeepsFlowing: results.afterALeft.bDelta > 0 && results.afterALeft.camera.teardowns === 0,
+  // 最後の 1 人で TEARDOWN
+  teardownOnLastLeave: results.afterAllLeft.teardowns >= 1 && results.afterAllLeft.sessions === 1,
+  hostExitedOnPanelClose: !!results.hostExitedOnPanelClose,
+};
+console.log(JSON.stringify(checks, null, 1));
+const ok = !results.error && Object.values(checks).every(Boolean);
 console.log(ok ? 'E2E OK' : 'E2E NG');
 process.exit(ok ? 0 : 1);

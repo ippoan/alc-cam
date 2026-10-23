@@ -1,9 +1,10 @@
-//! カメラの RTSP を受け続けるスレッド。見る人が居る間だけ動く (止める旗が立つまで、切れたら繋ぎ直す)。
+//! カメラの RTSP を受け続けるスレッド。見る人が 1 人でも居る間だけ、カメラにつき 1 本動く
+//! (止める旗が立つまで、切れたら繋ぎ直す)。複数の見る人への複製は `hub` の仕事。
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,11 +16,32 @@ pub enum Cam {
     Status { ok: bool, message: String },
 }
 
+/// 受信スレッド 1 本の持ち手。落とすと旗が立ち、スレッドはカメラへ TEARDOWN を送って終わる
+pub struct Camera {
+    stop: Arc<AtomicBool>,
+    pub rx: Receiver<Cam>,
+}
+
+impl Camera {
+    pub fn open(rtsp_url: &str) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        spawn(rtsp_url.to_string(), stop.clone(), tx);
+        Self { stop, rx }
+    }
+}
+
+impl Drop for Camera {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 const RETRY_MAX: Duration = Duration::from_secs(30);
 /// これだけ何も読めなければ切れたものとみなす
 const READ_STALL: Duration = Duration::from_secs(10);
 
-pub fn spawn(rtsp_url: String, stop: Arc<AtomicBool>, tx: Sender<Cam>) {
+fn spawn(rtsp_url: String, stop: Arc<AtomicBool>, tx: Sender<Cam>) {
     thread::spawn(move || {
         let mut wait = Duration::from_secs(1);
         while !stop.load(Ordering::Relaxed) {

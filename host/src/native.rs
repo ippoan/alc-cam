@@ -9,17 +9,32 @@ use serde_json::Value;
 /// Chrome が host へ送れる 1 通の上限は 4GB だが、ここで受けるのは設定と SDP だけ
 const MAX_IN: usize = 1024 * 1024;
 
-/// 拡張 → host
+/// 拡張 → host。`viewer_id` は cam-room の DO が見る人ごとに付ける。
+/// 無い (古い拡張・v1 の部屋) ときは "" = 見る人 1 人として扱う
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum In {
     Config { rtsp_url: String, stun: String },
-    /// 見る人が入ってきた: offer を作る
-    Start,
-    /// 見る人が出ていった: 畳む
-    Stop,
-    SdpAnswer { sdp: String },
-    IceCandidate { candidate: Value },
+    /// 見る人が入ってきた: その人への offer を作る
+    Start {
+        #[serde(default)]
+        viewer_id: String,
+    },
+    /// 見る人が出ていった: その人の分を畳む (最後の 1 人ならカメラも)
+    Stop {
+        #[serde(default)]
+        viewer_id: String,
+    },
+    SdpAnswer {
+        #[serde(default)]
+        viewer_id: String,
+        sdp: String,
+    },
+    IceCandidate {
+        #[serde(default)]
+        viewer_id: String,
+        candidate: Value,
+    },
 }
 
 /// host → 拡張
@@ -27,9 +42,11 @@ pub enum In {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Out {
     Ready { version: &'static str },
-    SdpOffer { sdp: String },
+    SdpOffer { viewer_id: String, sdp: String },
+    /// カメラ (RTSP は 1 本) の状態
     Camera { ok: bool, message: String },
-    Peer { ok: bool, message: String },
+    /// 見る人ごとの接続の状態
+    Peer { viewer_id: String, ok: bool, message: String },
     Log { message: String },
 }
 
@@ -71,10 +88,15 @@ mod tests {
     fn reads_messages_until_eof() {
         let mut data = frame(r#"{"type":"config","rtsp_url":"rtsp://c/s","stun":"s:1"}"#);
         data.extend(frame(r#"{"type":"start"}"#));
+        data.extend(frame(r#"{"type":"start","viewer_id":"v1"}"#));
+        data.extend(frame(r#"{"type":"sdp_answer","viewer_id":"v2","sdp":"v=0"}"#));
         data.extend(frame(r#"{"type":"nope"}"#));
         let mut r = data.as_slice();
         assert_eq!(read(&mut r).unwrap(), Some(Ok(In::Config { rtsp_url: "rtsp://c/s".into(), stun: "s:1".into() })));
-        assert_eq!(read(&mut r).unwrap(), Some(Ok(In::Start)));
+        // viewer_id の無い古い拡張は "" (1 人) として読む
+        assert_eq!(read(&mut r).unwrap(), Some(Ok(In::Start { viewer_id: String::new() })));
+        assert_eq!(read(&mut r).unwrap(), Some(Ok(In::Start { viewer_id: "v1".into() })));
+        assert_eq!(read(&mut r).unwrap(), Some(Ok(In::SdpAnswer { viewer_id: "v2".into(), sdp: "v=0".into() })));
         assert!(matches!(read(&mut r).unwrap(), Some(Err(_))));
         assert_eq!(read(&mut r).unwrap(), None);
     }
@@ -82,9 +104,9 @@ mod tests {
     #[test]
     fn writes_framed_json() {
         let mut out = Vec::new();
-        write(&mut out, &Out::SdpOffer { sdp: "v=0".into() }).unwrap();
+        write(&mut out, &Out::SdpOffer { viewer_id: "v1".into(), sdp: "v=0".into() }).unwrap();
         let len = u32::from_ne_bytes(out[..4].try_into().unwrap()) as usize;
-        assert_eq!(&out[4..], br#"{"type":"sdp_offer","sdp":"v=0"}"#);
+        assert_eq!(&out[4..], br#"{"type":"sdp_offer","viewer_id":"v1","sdp":"v=0"}"#);
         assert_eq!(len, out.len() - 4);
     }
 }

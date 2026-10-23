@@ -7,12 +7,15 @@
 カメラ ─RTSP─▶ alc-cam-host (Rust, native messaging) ══WebRTC P2P (H.264 そのまま)══▶ 見る側
                      ▲ stdin/stdout                                                    (alc-app の TenkoCameraView)
                      │                                                                  ▲
-               Chrome 拡張 (サイドパネル) ──WebSocket── cf-alc-signaling /cam-room/<拠点ID> ──┘
-                                              (SDP だけ。role=device)
+               Chrome 拡張 (サイドパネル) ──WebSocket── cf-alc-signaling /cam-room/<カメラID> ──┘
+                                              (SDP だけ。role=device&proto=2)
 ```
 
 - 拡張は TCP を張れないので、RTSP と WebRTC は Rust の host が持つ。host は拡張が起動し、パネルを閉じると終わる (サービス常駐しない)
-- シグナリングは既存の `cf-alc-signaling` の `/cam-room` をそのまま使う。**クラウド側の変更は無い**。見る側も既存の alc-app のまま
+- シグナリングは `cf-alc-signaling` の `/cam-room` を使う。部屋の名前は `alc_api.cameras.id` (拡張の「拠点 ID」に入れる)。見る側は既存の alc-app のまま
+- **1 台のカメラを最大 4 人が同時に見られる** (cam-room v2。DO が見る人ごとに `viewer_id` を付ける)。
+  RTSP はカメラにつき 1 本で、最初の 1 人で開き最後の 1 人が離れたら TEARDOWN、映像は見る人ごとの PeerConnection へ複製する。
+  上り帯域は 人数 × stream2。v2 に対応していない cam-room (古い DO) でも 1 人なら今までどおり映る
 - 映像は Cloudflare を通らない (DO が中継するのは SDP の数通だけで、hibernation が効く)
 - 規約: ippoan/alc-gw の `docs/camera-relay-convention.md`。拡張と host の間は [docs/host-protocol.md](docs/host-protocol.md)
 
@@ -20,7 +23,7 @@
 
 | パス | 中身 |
 |---|---|
-| `host/` | `alc-cam-host` (str0m で WebRTC、暗号は pure Rust)。`install.ps1` は Windows への登録 |
+| `host/` | `alc-cam-host` (str0m で WebRTC、暗号は pure Rust)。`hub.rs` が見る人への複製。`install.ps1` は Windows への登録 |
 | `crates/cam-rtsp/` | RTSP (Digest・TCP interleaved) → H.264 Annex B。I/O を持たない |
 | `extension/` | 拠点側の Chrome 拡張 (MV3・サイドパネル)。ID は `key` で `icmmpdjddlphkbokdalofdjpkcgfiggd` に固定 |
 | `test/` | 偽カメラ・cam-room のローカル版・見る側のページと、それらを通す `e2e.mjs` |
@@ -33,9 +36,13 @@
 1. Actions の成果物 (またはタグの Release) の `alc-cam-windows.zip` を展開
 2. `powershell -ExecutionPolicy Bypass -File install.ps1` (管理者不要。`%LOCALAPPDATA%\alc-cam` と HKCU に登録)
 3. `chrome://extensions` → デベロッパーモード → 「パッケージ化されていない拡張機能を読み込む」→ `extension/`
-4. ツールバーのアイコン → サイドパネル → 設定に拠点 ID・カメラの RTSP URL (stream2) を入れて保存 → 開始
+4. ツールバーのアイコン → サイドパネル → 設定に拠点 ID (= `alc_api.cameras.id`)・カメラの RTSP URL (stream2) を入れて保存 → 開始
 
-見る側は alc-app の拠点カメラ画面で同じ拠点 ID を開く。
+見る側は alc-app の拠点カメラ画面で同じカメラを開く。
+
+版を上げるとき: `host/Cargo.toml` と `extension/manifest.json` の `version` を揃えて上げ、merge 後に `v<版>` のタグを打つと
+CI が `alc-cam-windows.zip` を Release に付ける。拠点 PC では zip を展開し直して `install.ps1` を再実行し、
+`chrome://extensions` で拡張を再読み込みする (host と拡張は対で入れ替える)。
 
 ## SD 録画の時間指定の切り出し (ingest/)
 
@@ -90,7 +97,9 @@ node e2e.mjs            # 偽カメラ → host → 拡張 → cam-room → 見�
 ```
 
 `e2e.mjs` が確かめること: 見る人が来るまでカメラに触らない / Digest 認証 / 見る側で H.264 がデコードされる /
-見る人が離れたらカメラへ TEARDOWN / 入り直しで再び映る / パネルを閉じたら host が終わる。
+2 人目が途中から入っても映り、そのあいだ RTSP は 1 本 / 片方が離れてももう片方は流れ続ける /
+最後の 1 人が離れたらカメラへ TEARDOWN / 入り直しで再び映る / v1 の部屋 (古い DO) でも 1 人なら映る /
+パネルを閉じたら host が終わる。`signaling.mjs` は cam-room の v2 (と `v1Sites` に入れた部屋の v1) を写している。
 
 ## 未確認・未対応
 
