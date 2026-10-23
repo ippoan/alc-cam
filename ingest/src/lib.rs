@@ -1,47 +1,31 @@
-//! カメラの SD 録画を定期的に R2 へ取り込む (cron)。
+//! カメラの SD 録画から、指定した時間帯を 1 本の MP4 にして R2 に置く Worker。
 //!
-//!   cron ─▶ この Worker ─VPC (HTTP Service, ohishi-data の Tunnel)─▶ カメラ (sdcard.cgi で一覧 / recdownload で本体)
-//!                 └─▶ R2 `<カメラ名>/<種類>/<YYYYMMDD>/<HH>/<ファイル名>`
+//!   auth-worker ─Service Binding─▶ この Worker ─VPC (HTTP Service, ohishi-data の Tunnel)─▶ カメラ
+//!                                       │ 重なる録画 (約 4 分ごと) を R2 にそろえ、moov を読み、
+//!                                       │ 範囲を切ってつなぐ (再エンコードなし。crates/cam-mp4)
+//!                                       └▶ R2 `clips/<カメラ名>/<開始>_<終了>.mp4`
 //!
-//! 昨日と今日 (JST) のフォルダを古い順に見て、R2 に同じ大きさで在るものは飛ばす (= 何度回しても同じ結果)。
-//! 1 回の実行は本数と時間で打ち切り、残りは次の cron に回す。本体は wasm を通さず JS の
-//! FixedLengthStream に直接流す (100MB を Rust で受けると CPU 時間を食う)。
+//! - `POST <prefix>/clips` に `{"from": "...", "to": "..."}` (ISO 8601。時差が無ければ JST)
+//! - `GET <prefix>/clips/<カメラ名>/<開始>_<終了>.mp4` で取り出す (Range 対応 = シークできる)
+//!
+//! 外から直接届く口は持たない (workers_dev / route なし)。呼び手の認証は auth-worker が済ませる
+//! (alc 系の分割 Worker と同じ: JWT を検証するのは auth-worker だけ)。
 
 mod camera;
+mod clip;
+mod raw;
 
-use cam_sd::{list_path, parse_listing, safe_segment, scan_dates, wanted, Recording, DOWNLOAD_PATH};
+use cam_sd::{jst_iso, parse_time, safe_segment};
 use camera::Camera;
-use wasm_bindgen::prelude::*;
-use worker::{
-    console_error, console_log, event, Bucket, Context, Data, Date, Env, HttpMetadata, Request, Response, ResponseBody,
-    Result, ScheduleContext, ScheduledEvent,
-};
+use serde::Deserialize;
+use worker::{event, Context, Env, Headers, Method, Range, Request, Response, Result};
 
-#[wasm_bindgen]
-extern "C" {
-    /// Workers の組み込み。長さが分かっている stream でないと R2 の put が受け付けない
-    #[wasm_bindgen(js_name = FixedLengthStream)]
-    type JsFixedLengthStream;
-
-    #[wasm_bindgen(constructor, js_class = "FixedLengthStream")]
-    fn new(length: f64) -> JsFixedLengthStream;
-
-    #[wasm_bindgen(method, getter)]
-    fn readable(this: &JsFixedLengthStream) -> web_sys::ReadableStream;
-
-    #[wasm_bindgen(method, getter)]
-    fn writable(this: &JsFixedLengthStream) -> JsValue;
-}
-
-struct Config {
-    camera: String,
-    kinds: Vec<String>,
+pub(crate) struct Config {
+    pub camera: String,
+    pub kinds: Vec<String>,
     binding: String,
-    max_files: u32,
-    budget_ms: f64,
-    days: u32,
-    /// 切り分け用: R2 に書かず読み捨てて、届いたバイト数と時間だけログに出す
-    drain_only: bool,
+    max_clip_ms: i64,
+    prefix: String,
 }
 
 impl Config {
@@ -51,168 +35,115 @@ impl Config {
             camera: var("CAM_NAME", ""),
             kinds: var("CAM_KINDS", "Schedule").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             binding: var("CAM_VPC_BINDING", "CAM_HTTP"),
-            max_files: var("MAX_FILES_PER_RUN", "12").parse().unwrap_or(12),
-            budget_ms: var("RUN_BUDGET_SECS", "600").parse::<f64>().unwrap_or(600.0) * 1000.0,
-            days: var("SCAN_DAYS", "2").parse().unwrap_or(2),
-            drain_only: var("DRAIN_ONLY", "0") == "1",
+            max_clip_ms: var("MAX_CLIP_SECS", "7200").parse::<i64>().unwrap_or(7200) * 1000,
+            prefix: var("PUBLIC_PATH_PREFIX", ""),
         }
     }
 }
 
-#[derive(Default)]
-struct Summary {
-    uploaded: u32,
-    bytes: u64,
-    skipped: u32,
-    stopped: Option<&'static str>,
+#[derive(Deserialize)]
+struct ClipRequest {
+    from: String,
+    to: String,
 }
 
-#[event(scheduled)]
-async fn scheduled(_ev: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    match run(&env).await {
-        Ok(s) => console_log!(
-            "sd-ingest: uploaded={} bytes={} skipped={} stopped={}",
-            s.uploaded,
-            s.bytes,
-            s.skipped,
-            s.stopped.unwrap_or("-")
-        ),
-        Err(e) => console_error!("sd-ingest: failed: {e}"),
-    }
+fn json(status: u16, body: serde_json::Value) -> Result<Response> {
+    Ok(Response::from_json(&body)?.with_status(status))
 }
 
-/// 外から届く口は持たない (workers_dev / route なし)。/health だけ答える
+fn fail(status: u16, message: &str) -> Result<Response> {
+    json(status, serde_json::json!({ "error": message }))
+}
+
 #[event(fetch)]
-async fn fetch(req: Request, _env: Env, _ctx: Context) -> Result<Response> {
-    if req.path() == "/health" {
-        return Response::ok("ok");
+async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    let cfg = Config::from_env(&env);
+    let full = req.path();
+    // auth-worker から来るときは公開側の接頭辞 (/alc-cam-clips) が付いたまま
+    let path = if cfg.prefix.is_empty() { full.as_str() } else { full.strip_prefix(cfg.prefix.as_str()).unwrap_or(&full) }.to_string();
+    match (req.method(), path.as_str()) {
+        (Method::Get, "/health") => Response::ok("ok"),
+        (Method::Post, "/clips") => {
+            let Ok(body) = req.json::<ClipRequest>().await else {
+                return fail(400, "本文は {\"from\": \"...\", \"to\": \"...\"} の JSON にしてください");
+            };
+            create_clip(&env, &cfg, &body).await
+        }
+        (Method::Get, p) if p.starts_with("/clips/") => get_clip(&env, &req, &p["/clips/".len()..]).await,
+        _ => fail(404, "Not Found"),
     }
-    Response::error("Not Found", 404)
 }
 
-async fn run(env: &Env) -> Result<Summary> {
-    let cfg = Config::from_env(env);
+async fn create_clip(env: &Env, cfg: &Config, body: &ClipRequest) -> Result<Response> {
     if !safe_segment(&cfg.camera) || cfg.kinds.iter().any(|k| !safe_segment(k)) {
-        return Err("CAM_NAME / CAM_KINDS が無いか、使えない文字を含みます".into());
+        return fail(500, "CAM_NAME / CAM_KINDS の設定が正しくありません");
+    }
+    let (Some(from), Some(to)) = (parse_time(&body.from), parse_time(&body.to)) else {
+        return fail(400, "時刻は 2026-10-23T12:58:00+09:00 の形にしてください (時差が無ければ JST)");
+    };
+    if from >= to {
+        return fail(400, "to は from より後にしてください");
+    }
+    if to - from > cfg.max_clip_ms {
+        return fail(400, &format!("一度に切り出せるのは {} 分までです", cfg.max_clip_ms / 60_000));
     }
     let auth = env.secret("CAM_AUTH")?.to_string();
     let mut cam = Camera::new(env, &cfg.binding, &auth)?;
     let bucket = env.bucket("RECORDINGS")?;
-    let started = Date::now().as_millis() as f64;
-    let mut s = Summary::default();
-
-    for date in scan_dates(started, cfg.days) {
-        for kind in &cfg.kinds {
-            let day_dir = format!("{}/{kind}/{date}", cfg.camera);
-            let mut hours = parse_listing(&cam.get_text(&list_path(&day_dir)).await?).dirs;
-            hours.retain(|h| safe_segment(h));
-            hours.sort();
-            console_log!("sd-ingest: {day_dir} hours={:?}", hours);
-            for hour in hours {
-                let rec_dir = format!("{day_dir}/{hour}");
-                let mut files = parse_listing(&cam.get_text(&list_path(&rec_dir)).await?).files;
-                files.sort_by(|a, b| a.name.cmp(&b.name));
-                console_log!("sd-ingest: {rec_dir} files={}", files.len());
-                for f in files.iter().filter(|f| wanted(&f.name) && safe_segment(&f.name)) {
-                    let rec = Recording { camera: &cfg.camera, kind, date: &date, hour: &hour, name: &f.name };
-                    let key = rec.r2_key();
-                    if bucket.head(key.clone()).await?.is_some_and(|o| o.size() == f.size) {
-                        s.skipped += 1;
-                        continue;
-                    }
-                    if s.uploaded >= cfg.max_files {
-                        s.stopped = Some("max_files");
-                        return Ok(s);
-                    }
-                    if Date::now().as_millis() as f64 - started > cfg.budget_ms {
-                        s.stopped = Some("time_budget");
-                        return Ok(s);
-                    }
-                    copy_one(&mut cam, &bucket, &rec, f.size, cfg.drain_only).await?;
-                    s.uploaded += 1;
-                    s.bytes += f.size;
-                }
-            }
-        }
+    match clip::make(cfg, &mut cam, &bucket, from, to).await {
+        Ok(m) => json(
+            if m.reused { 200 } else { 201 },
+            serde_json::json!({
+                "key": m.key,
+                "size": m.size,
+                "from": jst_iso(from),
+                "to": jst_iso(to),
+                "actual_from": jst_iso(m.actual_from_ms),
+                "actual_to": jst_iso(m.actual_to_ms),
+                "sources": m.sources,
+                "reused": m.reused,
+            }),
+        ),
+        Err(clip::Fail(status, message)) => fail(status, &message),
     }
-    Ok(s)
 }
 
-async fn copy_one(cam: &mut Camera, bucket: &Bucket, rec: &Recording<'_>, listed_size: u64, drain_only: bool) -> Result<()> {
-    console_log!("sd-ingest: download {} ({listed_size} bytes listed)", rec.name);
-    let mut res = cam.post_stream(DOWNLOAD_PATH, cam_sd::download_body(&rec.sd_path())).await?;
-    let ctype = res.headers().get("Content-Type")?.unwrap_or_default();
-    if res.status_code() != 200 || !ctype.starts_with("application/octet-stream") {
-        return Err(format!("{} の取り出しが {} ({ctype}) で失敗", rec.name, res.status_code()).into());
+/// `GET /clips/<カメラ名>/<開始>_<終了>.mp4`。Range (`bytes=a-b` / `bytes=a-`) に答える
+async fn get_clip(env: &Env, req: &Request, rest: &str) -> Result<Response> {
+    if rest.split('/').count() != 2 || !rest.split('/').all(safe_segment) {
+        return fail(400, "取り出す名前が正しくありません");
     }
-    // 長さは応答のものを優先 (一覧の値と違えば、R2 の put がそこで止まる)
-    let length = res.headers().get("Content-Length")?.and_then(|v| v.parse::<u64>().ok()).unwrap_or(listed_size);
-    if drain_only {
-        return drain(&mut res, rec.name).await;
+    let key = format!("clips/{rest}");
+    let bucket = env.bucket("RECORDINGS")?;
+    let Some(head) = bucket.head(key.clone()).await? else { return fail(404, "その切り出しはありません") };
+    let size = head.size();
+    let range = req.headers().get("Range")?.and_then(|r| parse_range(&r, size));
+    let mut get = bucket.get(key);
+    if let Some((start, end)) = range {
+        get = get.range(Range::OffsetWithLength { offset: start, length: end - start + 1 });
     }
-    let ResponseBody::Stream(body) = res.body() else {
-        return Err(format!("{} の応答に本文がありません", rec.name).into());
+    let obj = get.execute().await?.ok_or("その切り出しはありません")?;
+    let headers = Headers::new();
+    headers.set("Content-Type", "video/mp4")?;
+    headers.set("Accept-Ranges", "bytes")?;
+    let (status, len) = match range {
+        Some((start, end)) => {
+            headers.set("Content-Range", &format!("bytes {start}-{end}/{size}"))?;
+            (206, end - start + 1)
+        }
+        None => (200, size),
     };
-    console_log!("sd-ingest: {} status={} type={ctype} length={length}", rec.name, res.status_code());
-    let fixed = JsFixedLengthStream::new(length as f64);
-    let pipe_to: js_sys::Function = js_sys::Reflect::get(body, &"pipeTo".into())?.into();
-    let piping: js_sys::Promise = pipe_to.call1(body, &fixed.writable())?.into();
-    let content_type = if rec.name.ends_with(".jpg") { "image/jpeg" } else { "video/mp4" };
-    let put = bucket
-        .put(rec.r2_key(), Data::ReadableStream(fixed.readable()))
-        .http_metadata(HttpMetadata { content_type: Some(content_type.into()), ..Default::default() })
-        .execute();
-    let (put, piped) = futures_join(put, wasm_bindgen_futures::JsFuture::from(piping)).await;
-    piped?;
-    put?;
-    Ok(())
+    headers.set("Content-Length", &len.to_string())?;
+    // R2 の本文を JS の stream のまま渡す (Rust を通すと CPU を使ううえ Content-Length が落ちて chunked になる)
+    let body = obj.body().ok_or("本文が読めません")?.response_body()?;
+    Ok(Response::from_body(body)?.with_status(status).with_headers(headers))
 }
 
-async fn futures_join<A: std::future::Future, B: std::future::Future>(a: A, b: B) -> (A::Output, B::Output) {
-    // 依存を増やさないための 2 本だけの join (put は pipe が流れないと進まないので逐次 await にはできない)
-    let mut a = std::pin::pin!(a);
-    let mut b = std::pin::pin!(b);
-    let mut ra = None;
-    let mut rb = None;
-    std::future::poll_fn(|cx| {
-        if ra.is_none() {
-            if let std::task::Poll::Ready(v) = a.as_mut().poll(cx) {
-                ra = Some(v);
-            }
-        }
-        if rb.is_none() {
-            if let std::task::Poll::Ready(v) = b.as_mut().poll(cx) {
-                rb = Some(v);
-            }
-        }
-        if ra.is_some() && rb.is_some() {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await;
-    (ra.unwrap(), rb.unwrap())
-}
-
-async fn drain(res: &mut Response, name: &str) -> Result<()> {
-    use futures_util::StreamExt;
-    let mut stream = res.stream()?;
-    let t0 = Date::now().as_millis();
-    let (mut n, mut last) = (0u64, t0);
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(c) => n += c.len() as u64,
-            Err(e) => {
-                console_error!("sd-ingest: drain {name} error after {n} bytes / {}ms: {e}", Date::now().as_millis() - t0);
-                return Err(e);
-            }
-        }
-        if Date::now().as_millis() - last > 5000 {
-            last = Date::now().as_millis();
-            console_log!("sd-ingest: drain {name} {n} bytes");
-        }
-    }
-    console_log!("sd-ingest: drain {name} done {n} bytes in {}ms", Date::now().as_millis() - t0);
-    Ok(())
+/// `bytes=a-b` / `bytes=a-` を (先頭, 末尾) に。外れたものは None (全体を返す)
+fn parse_range(h: &str, size: u64) -> Option<(u64, u64)> {
+    let (a, b) = h.strip_prefix("bytes=")?.split_once('-')?;
+    let start: u64 = a.parse().ok()?;
+    let last = size.checked_sub(1)?;
+    let end = if b.is_empty() { last } else { b.parse::<u64>().ok()?.min(last) };
+    (start <= end).then_some((start, end))
 }

@@ -19,7 +19,7 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # SD 取り込みの Worker (ingest/、wasm32 専用の別 workspace)。デプロイはしない (手で wrangler deploy)
+  # SD 録画の切り出しの Worker (ingest/、wasm32 専用の別 workspace)。デプロイはしない (手で wrangler deploy)
   ingest:
     runs-on: ubuntu-latest
     defaults:

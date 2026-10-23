@@ -1,5 +1,6 @@
-# カメラの SD 録画を定期的に R2 へ取り込む Worker (src/lib.rs)。
-# ★ 外から届く口は持たない: workers_dev / preview_urls を false、route を書かない。動くのは cron だけ。
+# カメラの SD 録画から、指定した時間帯を 1 本の MP4 にして R2 に置く Worker (src/lib.rs)。
+# ★ 外から直接届く口は持たない: workers_dev / preview_urls を false、route を書かない。
+#   呼び手は auth-worker の Service Binding だけ (公開側の接頭辞は PUBLIC_PATH_PREFIX)。
 name = "alc-cam-sd-ingest"
 main = "build/index.js"
 compatibility_date = "2026-09-01"
@@ -10,10 +11,9 @@ preview_urls = false
 [build]
 command = "cargo install -q worker-build@0.8.7 && worker-build --release"
 
-# 1 回で最大 MAX_FILES_PER_RUN 本 (約 100MB/本)・RUN_BUDGET_SECS 秒。メインストリームの 24 時間録画は
-# 約 15 本/時なので、15 分ごとに 12 本で追いつく
-[triggers]
-crons = ["*/15 * * * *"]
+# 切り出しは本体を wasm で 16MiB ずつ R2 のマルチパートへ写すので、長い時間帯では CPU を使う (1 時間 ≈ 1.5GB)
+[limits]
+cpu_ms = 300000
 
 [observability]
 enabled = true
@@ -23,9 +23,9 @@ enabled = true
 CAM_NAME = "TS-NS320W-55"
 CAM_KINDS = "Schedule"
 CAM_VPC_BINDING = "CAM_HTTP"
-MAX_FILES_PER_RUN = "12"
-RUN_BUDGET_SECS = "600"
-SCAN_DAYS = "2"
+# 一度に切り出せる長さの上限 (秒)
+MAX_CLIP_SECS = "7200"
+PUBLIC_PATH_PREFIX = "/alc-cam-clips"
 
 [[r2_buckets]]
 binding = "RECORDINGS"

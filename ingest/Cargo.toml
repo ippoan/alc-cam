@@ -1,6 +1,7 @@
-# カメラの SD 録画を定期的に R2 へ取り込む Worker `alc-cam-sd-ingest`。
+# カメラの SD 録画から、指定した時間帯を 1 本の MP4 にして R2 に置く Worker `alc-cam-sd-ingest`。
 # wasm32 専用なので root の workspace から外し、ここを自分の workspace にする (lock も ingest/Cargo.lock)。
-# 手順 (一覧・取り出し・Digest) は crates/cam-sd に在り、ここが持つのは VPC への fetch と R2 への流し込みだけ。
+# 手順 (一覧・取り出し・Digest・時刻) は crates/cam-sd、MP4 の切ってつなぐ部分は crates/cam-mp4 に在り、
+# ここが持つのは VPC への fetch と R2 の読み書き・HTTP の口だけ。
 [package]
 name = "alc-cam-sd-ingest"
 version = "0.1.0"
@@ -14,9 +15,12 @@ crate-type = ["cdylib"]
 
 # 使わない依存は入れない
 [dependencies]
+cam-mp4 = { path = "../crates/cam-mp4" }
 cam-sd = { path = "../crates/cam-sd" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["ReadableStream"] }

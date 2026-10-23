@@ -24,8 +24,9 @@
 | `crates/cam-rtsp/` | RTSP (Digest・TCP interleaved) → H.264 Annex B。I/O を持たない |
 | `extension/` | 拠点側の Chrome 拡張 (MV3・サイドパネル)。ID は `key` で `icmmpdjddlphkbokdalofdjpkcgfiggd` に固定 |
 | `test/` | 偽カメラ・cam-room のローカル版・見る側のページと、それらを通す `e2e.mjs` |
-| `crates/cam-sd/` | カメラの SD 録画の一覧と取り出しの手順 (I/O を持たない) |
-| `ingest/` | SD 録画を R2 へ取り込む Worker `alc-cam-sd-ingest` (wasm32、別 workspace) |
+| `crates/cam-sd/` | カメラの SD 録画の一覧・取り出し・時刻の扱い (I/O を持たない) |
+| `crates/cam-mp4/` | MP4 を再エンコードせずに切ってつなぐ (moov を読み、出力の頭と写す区間を返す。I/O を持たない) |
+| `ingest/` | SD 録画の時間指定の切り出しを R2 に置く Worker `alc-cam-sd-ingest` (wasm32、別 workspace) |
 
 ## 拠点 PC への入れ方 (Windows)
 
@@ -36,32 +37,45 @@
 
 見る側は alc-app の拠点カメラ画面で同じ拠点 ID を開く。
 
-## SD 録画の取り込み (ingest/)
+## SD 録画の時間指定の切り出し (ingest/)
 
-カメラの SD に録られた録画を、Worker `alc-cam-sd-ingest` が 15 分ごとに R2 (`alc-cam-recordings`) へ取り込む。
+カメラの SD の録画 (約 4 分・約 100MB ごとの MP4) から、指定した時間帯を 1 本の MP4 にして R2 に置く
+Worker `alc-cam-sd-ingest`。再エンコードはしない。
 
 ```
-cron ─▶ alc-cam-sd-ingest ─Workers VPC (HTTP Service, ohishi-data の Tunnel)─▶ カメラの管理画面 (Digest)
-              └─▶ R2 alc-cam-recordings/<カメラ名>/<種類>/<YYYYMMDD>/<HH>/<ファイル名>.mp4
+auth-worker ─Service Binding─▶ alc-cam-sd-ingest ─Workers VPC (HTTP, ohishi-data の Tunnel)─▶ カメラの管理画面 (Digest)
+                                     ├▶ R2 alc-cam-recordings/<カメラ名>/<種類>/<YYYYMMDD>/<HH>/<元ファイル>.mp4  (元ファイルの置き場)
+                                     └▶ R2 alc-cam-recordings/clips/<カメラ名>/<開始>_<終了>.mp4             (切り出した 1 本)
 ```
 
-- 一覧は `camera-cgi/admin/sdcard.cgi?action=generate`、本体は `POST /action/stream?subject=recdownload`
-  (パスの頭に `/mnt/mmc`)。手順の細部と実機での確認は `crates/cam-sd/src/lib.rs` の先頭
-- 昨日と今日 (JST) を古い順に見て、R2 に同じ大きさで在るものは飛ばす。1 回 12 本 (約 1.2GB)・600 秒で打ち切り、残りは次へ
-- 本体は wasm を通さず `FixedLengthStream` で R2 へ流す。VPC 越しで約 11MB/s (100MB を 9 秒)
+```
+POST /alc-cam-clips/clips   {"from": "2026-10-23T12:58:00+09:00", "to": "2026-10-23T12:59:30+09:00"}
+→ 201 {"key": "clips/TS-NS320W-55/20261023T125800_20261023T125930.mp4", "size": …,
+       "actual_from": "2026-10-23T12:57:58.257+09:00", "actual_to": "…", "sources": [元ファイル…], "reused": false}
+GET  /alc-cam-clips/clips/TS-NS320W-55/20261023T125800_20261023T125930.mp4   (Range 対応 = シークできる)
+```
+
+- 時刻は ISO 8601。時差が無ければ JST。1 回 120 分まで (`MAX_CLIP_SECS`)。同じ時間帯は作り直さず 200 で返す
+- 映像の頭は、時間帯の頭の直前のキーフレーム (約 2 秒おき) に寄る → `actual_from` が少し前になる
+- 元ファイルの映像は 240 秒の区切りに対して約 238 秒しか無く、つなぎ目の約 1.7 秒の抜けは詰まる
+- 手順: 重なる元ファイルを SD の一覧 (`camera-cgi/admin/sdcard.cgi`) で探し、R2 に無ければカメラから
+  (`/action/stream?subject=recdownload`、パスに `/mnt/mmc`) 丸ごと取って置く → R2 の範囲読み出しで末尾の
+  moov を読む → `crates/cam-mp4` で切ってつなぐ計画を立て → 16MiB ずつ R2 のマルチパートに写す
 - 資格情報は Worker の secret `CAM_AUTH` (`user:pass`)。repo には無い
+- 外から直接は届かない (workers_dev / route なし)。呼び手の認証は auth-worker が済ませる
 
 確認 (VPC は実物のカメラ、R2 は手元の模擬):
 
 ```bash
 cd ingest
 printf 'CAM_AUTH="user:pass"\n' > .dev.vars   # 終わったら消す
-npx wrangler@4.152.0 dev --test-scheduled --var MAX_FILES_PER_RUN:1 --var SCAN_DAYS:1
-curl 'http://localhost:8787/cdn-cgi/handler/scheduled?cron=*/15+*+*+*+*'
+npx wrangler@4.152.0 dev
+curl -X POST localhost:8787/alc-cam-clips/clips -d '{"from":"2026-10-23T12:58:00","to":"2026-10-23T12:59:30"}'
 ```
 
-`--var DRAIN_ONLY:1` を付けると R2 に書かず読み捨て、届いたバイト数と時間だけログに出す (経路の切り分け用)。
 wrangler 4.58 では手元の dev から VPC に繋がらない (preview セッションの作成が 400)。
+手元の dev から本物の R2 (`remote = true`) へ 100MB を流すと途中で切れるので、R2 は手元の模擬で確かめる。
+手元のファイルだけで切り出しを試すなら `cargo run -p cam-mp4 --example clip -- 出力 from_ms to_ms start_ms:入力…`。
 
 ## 開発
 

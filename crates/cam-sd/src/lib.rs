@@ -133,6 +133,109 @@ fn ymd_from_epoch_days(z: i64) -> String {
     format!("{y:04}{m:02}{d:02}")
 }
 
+const JST_OFFSET_MS: i64 = 9 * 3600 * 1000;
+
+/// `YYYY-MM-DD` → 1970-01-01 からの日数 (civil_from_days の逆)
+fn epoch_days(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn num(s: &str) -> Option<i64> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok()).flatten()
+}
+
+/// 壁時計 (JST) の年月日時分秒 → UNIX ms
+fn jst_ms(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> Option<i64> {
+    let ok = (1..=12).contains(&mo) && (1..=31).contains(&d) && (0..24).contains(&h) && (0..60).contains(&mi) && (0..60).contains(&s);
+    ok.then(|| (epoch_days(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s) * 1000 - JST_OFFSET_MS)
+}
+
+/// 録画ファイルの開始時刻 (UNIX ms)。名前は `<種類>YYYYMMDD_HHMMSS.mp4` (カメラの時計 = JST)
+pub fn file_start_ms(name: &str) -> Option<i64> {
+    let stem = name.strip_suffix(".mp4")?;
+    let (head, time) = stem.rsplit_once('_')?;
+    let date = head.get(head.len().checked_sub(8)?..)?;
+    if time.len() != 6 {
+        return None;
+    }
+    jst_ms(num(&date[..4])?, num(&date[4..6])?, num(&date[6..])?, num(&time[..2])?, num(&time[2..4])?, num(&time[4..])?)
+}
+
+/// 指定時刻を読む: `YYYY-MM-DDTHH:MM:SS` に `Z` / `+09:00` などの時差。時差が無ければ JST とみなす
+pub fn parse_time(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (dt, offset_ms) = if let Some(dt) = s.strip_suffix('Z') {
+        (dt, 0)
+    } else if s.len() > 19 && matches!(s.as_bytes()[19], b'+' | b'-') {
+        let (dt, off) = s.split_at(19);
+        let sign = if off.starts_with('-') { -1 } else { 1 };
+        let (h, m) = off[1..].split_once(':')?;
+        (dt, sign * (num(h)? * 3600 + num(m)? * 60) * 1000)
+    } else {
+        (s, JST_OFFSET_MS)
+    };
+    let b = dt.as_bytes();
+    if dt.len() != 19 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b' ') || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let wall = jst_ms(num(&dt[..4])?, num(&dt[5..7])?, num(&dt[8..10])?, num(&dt[11..13])?, num(&dt[14..16])?, num(&dt[17..19])?)?;
+    // jst_ms は JST として引いているので、実際の時差に置き直す
+    Some(wall + JST_OFFSET_MS - offset_ms)
+}
+
+/// UNIX ms → JST の (`YYYYMMDD`, `HH`) (SD のフォルダ名と同じ形)
+pub fn jst_date_hour(ms: i64) -> (String, String) {
+    let local = ms + JST_OFFSET_MS;
+    let day = local.div_euclid(86_400_000);
+    let hour = local.rem_euclid(86_400_000) / 3_600_000;
+    (ymd_from_epoch_days(day), format!("{hour:02}"))
+}
+
+/// UNIX ms → JST の `YYYYMMDDTHHMMSS` (切り出しの R2 キーに使う)
+pub fn jst_compact(ms: i64) -> String {
+    let local = ms + JST_OFFSET_MS;
+    let (day, rem) = (local.div_euclid(86_400_000), local.rem_euclid(86_400_000) / 1000);
+    format!("{}T{:02}{:02}{:02}", ymd_from_epoch_days(day), rem / 3600, rem / 60 % 60, rem % 60)
+}
+
+/// UNIX ms → `2026-10-23T12:57:58.257+09:00` (API の応答に使う)
+pub fn jst_iso(ms: i64) -> String {
+    let c = jst_compact(ms);
+    format!("{}-{}-{}T{}:{}:{}.{:03}+09:00", &c[..4], &c[4..6], &c[6..8], &c[9..11], &c[11..13], &c[13..15], ms.rem_euclid(1000))
+}
+
+/// `[from, to)` の前後を含めて見に行く (`YYYYMMDD`, `HH`) の一覧。頭のファイルは時間帯より前に始まるので、
+/// 1 本の長さ (約 4 分) より長めに `lead_ms` だけ前から見る
+pub fn hours_to_scan(from_ms: i64, to_ms: i64, lead_ms: i64) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut t = (from_ms - lead_ms).div_euclid(3_600_000) * 3_600_000;
+    while t < to_ms {
+        let dh = jst_date_hour(t);
+        if out.last() != Some(&dh) {
+            out.push(dh);
+        }
+        t += 3_600_000;
+    }
+    out
+}
+
+/// 開始時刻の昇順に並んだファイルのうち、`[from, to)` に重なるものの番号。各ファイルの終わりは次の
+/// ファイルの開始 (最後のファイルは `last_len_ms` だけ続くとみなす)
+pub fn overlapping(starts: &[i64], from_ms: i64, to_ms: i64, last_len_ms: i64) -> Vec<usize> {
+    (0..starts.len())
+        .filter(|&i| {
+            let end = starts.get(i + 1).copied().unwrap_or(starts[i] + last_len_ms);
+            starts[i] < to_ms && end > from_ms
+        })
+        .collect()
+}
+
 /// secret の `user:pass` を分ける (パスワード側に `:` があっても最初の `:` で切る)
 pub fn split_auth(s: &str) -> Option<(&str, &str)> {
     s.split_once(':').filter(|(u, _)| !u.is_empty())
@@ -192,6 +295,48 @@ mod tests {
         assert_eq!(ymd_from_epoch_days(0), "19700101");
         assert_eq!(ymd_from_epoch_days(20_454), "20260101");
         assert_eq!(ymd_from_epoch_days(20_453), "20251231");
+    }
+
+    #[test]
+    fn times() {
+        // 2026-10-23 12:54:48 JST = 03:54:48Z
+        let t = file_start_ms("Schedule20261023_125448.mp4").unwrap();
+        assert_eq!(t, parse_time("2026-10-23T03:54:48Z").unwrap());
+        assert_eq!(t, parse_time("2026-10-23T12:54:48+09:00").unwrap());
+        assert_eq!(t, parse_time("2026-10-23 12:54:48").unwrap()); // 時差なし = JST
+        assert_eq!(t % 1000, 0);
+        assert_eq!(jst_date_hour(t), ("20261023".into(), "12".into()));
+        assert_eq!(jst_compact(t), "20261023T125448");
+        assert_eq!(jst_iso(t + 257), "2026-10-23T12:54:48.257+09:00");
+        // 日付またぎ (JST 0 時台は UTC では前日)
+        let midnight = parse_time("2026-10-23T00:10:00+09:00").unwrap();
+        assert_eq!(jst_date_hour(midnight), ("20261023".into(), "00".into()));
+        assert_eq!(parse_time("2026-10-22T15:10:00Z"), Some(midnight));
+        assert_eq!(epoch_days(1970, 1, 1), 0);
+        assert_eq!(epoch_days(2026, 1, 1), 20_454);
+        // 壊れた入力
+        assert_eq!(file_start_ms("Schedule20261023_1254.mp4"), None);
+        assert_eq!(file_start_ms("Schedule20261323_125448.mp4"), None);
+        assert_eq!(parse_time("2026/10/23 12:00:00"), None);
+        assert_eq!(parse_time("2026-10-23T25:00:00"), None);
+    }
+
+    #[test]
+    fn scan_plan() {
+        let from = parse_time("2026-10-23T13:02:00").unwrap();
+        let to = parse_time("2026-10-23T14:10:00").unwrap();
+        let h = hours_to_scan(from, to, 10 * 60_000);
+        assert_eq!(h, vec![("20261023".into(), "12".into()), ("20261023".into(), "13".into()), ("20261023".into(), "14".into())]);
+        // 日付をまたぐ
+        let h = hours_to_scan(parse_time("2026-10-23T23:30:00").unwrap(), parse_time("2026-10-24T00:20:00").unwrap(), 0);
+        assert_eq!(h, vec![("20261023".into(), "23".into()), ("20261024".into(), "00".into())]);
+
+        let s = [0, 240, 480, 720];
+        assert_eq!(overlapping(&s, 250, 500, 240), vec![1, 2]);
+        assert_eq!(overlapping(&s, 240, 480, 240), vec![1]);
+        assert_eq!(overlapping(&s, 900, 1000, 240), vec![3]);
+        assert_eq!(overlapping(&s, 1000, 1100, 240), Vec::<usize>::new());
+        assert_eq!(overlapping(&[], 0, 1, 240), Vec::<usize>::new());
     }
 
     #[test]
