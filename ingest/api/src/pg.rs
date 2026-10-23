@@ -80,6 +80,8 @@ pub struct Candidate {
     pub license: i64,
     pub vein_enroll: i64,
     pub last_at_ms: i64,
+    /// 開発端末の行 (RLS の is_dev 軸が true 側) から出した候補
+    pub is_dev: bool,
 }
 impl TxOutput for Candidate {}
 
@@ -250,42 +252,67 @@ pub async fn update_camera(
     .await
 }
 
+const SELECT_CANDIDATES: &str = "\
+WITH ev AS (
+    SELECT device_id, kind, COALESCE(recorded_at, created_at) AS at
+      FROM alc_api.hub_measurements
+     WHERE tenant_id = $1 AND device_id IS NOT NULL
+       AND kind IN ('alcohol', 'blood_pressure', 'timecard', 'license')
+       AND COALESCE(recorded_at, created_at) >= now() - make_interval(days => $2)
+    UNION ALL
+    SELECT registered_device_id, 'vein_enroll', created_at
+      FROM alc_api.vein_enroll_events
+     WHERE tenant_id = $1 AND registered_device_id IS NOT NULL
+       AND created_at >= now() - make_interval(days => $2)
+)
+SELECT device_id,
+       count(*) FILTER (WHERE kind = 'alcohol'),
+       count(*) FILTER (WHERE kind = 'blood_pressure'),
+       count(*) FILTER (WHERE kind = 'timecard'),
+       count(*) FILTER (WHERE kind = 'license'),
+       count(*) FILTER (WHERE kind = 'vein_enroll'),
+       (extract(epoch FROM max(at)) * 1000)::int8
+  FROM ev
+ GROUP BY device_id
+ ORDER BY max(at) DESC, device_id";
+
 /// 直近 `days` 日にイベントを出した端末と、その種類ごとの件数 (新しい順)。
 /// hub_measurements (alcohol / blood_pressure / timecard / license、時刻は COALESCE(recorded_at, created_at)) と
-/// vein_enroll_events (registered_device_id) を合わせる。is_dev の行は RLS で見えない (app.device_dev を設定しない)
+/// vein_enroll_events (registered_device_id) を合わせる。
+/// 両表の RLS は is_dev 軸付きなので、同じ集計を軸ごとに 2 回流す: 本番の行 (`app.device_dev` 未設定) と、
+/// 別の transaction で `set_config('app.device_dev', '1', true)` (transaction 単位) を立てた開発端末の行 (`is_dev = true`)。
+/// device_id では結合しない (両方に出れば 2 行)。並びは last_at の新しい順
 pub async fn device_candidates(
     pg: &mut PgClient,
     tenant: Uuid,
     days: i32,
 ) -> Result<Vec<Candidate>, Error> {
+    let mut all = candidates_in_axis(pg, tenant, days, false).await?;
+    all.extend(candidates_in_axis(pg, tenant, days, true).await?);
+    all.sort_by(|a, b| {
+        b.last_at_ms
+            .cmp(&a.last_at_ms)
+            .then_with(|| a.device_id.cmp(&b.device_id))
+            .then_with(|| a.is_dev.cmp(&b.is_dev))
+    });
+    Ok(all)
+}
+
+async fn candidates_in_axis(
+    pg: &mut PgClient,
+    tenant: Uuid,
+    days: i32,
+    is_dev: bool,
+) -> Result<Vec<Candidate>, Error> {
     pg.tenant_tx(tenant, move |tx| {
         Box::pin(async move {
+            if is_dev {
+                // transaction 単位 (第 3 引数 true)。COMMIT で消えるので後の文に漏れない
+                tx.query_typed("SELECT set_config('app.device_dev', '1', true)", &[])
+                    .await?;
+            }
             let rows = tx
-                .query_typed(
-                    "WITH ev AS (
-                        SELECT device_id, kind, COALESCE(recorded_at, created_at) AS at
-                          FROM alc_api.hub_measurements
-                         WHERE tenant_id = $1 AND device_id IS NOT NULL
-                           AND kind IN ('alcohol', 'blood_pressure', 'timecard', 'license')
-                           AND COALESCE(recorded_at, created_at) >= now() - make_interval(days => $2)
-                        UNION ALL
-                        SELECT registered_device_id, 'vein_enroll', created_at
-                          FROM alc_api.vein_enroll_events
-                         WHERE tenant_id = $1 AND registered_device_id IS NOT NULL
-                           AND created_at >= now() - make_interval(days => $2)
-                    )
-                    SELECT device_id,
-                           count(*) FILTER (WHERE kind = 'alcohol'),
-                           count(*) FILTER (WHERE kind = 'blood_pressure'),
-                           count(*) FILTER (WHERE kind = 'timecard'),
-                           count(*) FILTER (WHERE kind = 'license'),
-                           count(*) FILTER (WHERE kind = 'vein_enroll'),
-                           (extract(epoch FROM max(at)) * 1000)::int8
-                      FROM ev
-                     GROUP BY device_id
-                     ORDER BY max(at) DESC, device_id",
-                    &[(&tenant, Type::UUID), (&days, Type::INT4)],
-                )
+                .query_typed(SELECT_CANDIDATES, &[(&tenant, Type::UUID), (&days, Type::INT4)])
                 .await?;
             Ok(rows
                 .iter()
@@ -297,6 +324,7 @@ pub async fn device_candidates(
                     license: r.get(4),
                     vein_enroll: r.get(5),
                     last_at_ms: r.get(6),
+                    is_dev,
                 })
                 .collect())
         })

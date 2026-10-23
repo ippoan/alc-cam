@@ -501,6 +501,7 @@ pub async fn execute(
                             "vein_enroll": r.vein_enroll,
                         },
                         "last_at": jst_iso(r.last_at_ms),
+                        "is_dev": r.is_dev,
                     })
                 })
                 .collect();
