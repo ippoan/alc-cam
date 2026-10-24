@@ -31,7 +31,7 @@ host は拡張の background service worker が、見る人が来た時に `conn
 | `camera` | `ok`, `message` | カメラ (RTSP は 1 本) の状態 (受信中 / 再接続待ち / 停止)。文言に資格情報・宛先は入れない |
 | `peer` | `viewer_id`, `ok`, `message` | その見る人との接続の状態 (answer 待ち / 接続 (P2P) / 失敗 / 離れた) |
 | `log` | `message` | 診断用 |
-| `update` | `state`, `current`, `latest`, `message` | 自己更新 (`host/src/update.rs`)。`state` は `checking` → `latest` (最新) / `installed` (`latest` の版を入れた。次の起動から) / `failed` (今の版のまま) / `unsupported` (Windows 以外) |
+| `update` | `state`, `current`, `latest`, `message` | 自己更新 (`host/src/update.rs`、host の exe と拡張のフォルダ)。`state` は `checking` → `latest` (最新) / `installed` (`latest` の版を入れた。host は次の起動から、拡張はディスクの manifest.json の版が変わるので拡張が読み込み直す) / `deferred` (見る人が居るので拡張は後で) / `failed` (今の版のまま) / `unsupported` (Windows 以外)。`message` は人が読む説明 |
 
 ## host の中の流れ
 

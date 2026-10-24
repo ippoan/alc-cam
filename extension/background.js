@@ -13,9 +13,10 @@
 // それでも止まったとき (Chrome の都合・更新) は、状態をメモリに頼らず設定から繋ぎ直す:
 // worker が起きるたびに top level で sync() し、起こす口は onStartup / onInstalled / 30 秒ごとの alarm / 設定の変更。
 //
-// host の自己更新: 6 時間ごと (最初は 10 分後) とパネルの「今すぐ確認」で host に update_check を送る。
-// host が動いていなければ (見る人なし) 確認のためだけに起動し、答えが来たら切る。新版は host の次の起動から。
-// 拡張そのものの更新は Chrome のポリシー (update_url) が Release の update.xml を見て勝手に行う。
+// 自己更新: 6 時間ごと (最初は 10 分後) とパネルの「今すぐ確認」で host に update_check を送る。
+// host が動いていなければ (見る人なし) 確認のためだけに起動し、答えが来たら切る。host は自分の exe (次の起動から) と、
+// この拡張のフォルダ (%LOCALAPPDATA%\alc-cam\extension、見る人が居ない時だけ) を Release の版に入れ替える。
+// 拡張はディスクの manifest.json の版が動いている版と違えば chrome.runtime.reload() で読み込み直す。
 
 import { HOST_NAME, Host } from './lib/host.js';
 import { CamRoom } from './lib/signaling.js';
@@ -208,15 +209,16 @@ class Relay {
 
 /** host の `update` を表示の [文言, class] にする */
 export function updateLabel(msg, now = new Date()) {
-  const v = `v${msg.current}`;
+  const v = `拡張 v${chrome.runtime.getManifest().version}・host v${msg.current}`;
   const at = now.toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   switch (msg.state) {
     case 'checking':
       return [`${v}: 確認中…`, ''];
     case 'latest':
-      return [`${v} (最新、${at} 確認)`, 'ok'];
+      return [`${v} (最新、${at} 確認)${msg.message ? `。${msg.message}` : ''}`, 'ok'];
     case 'installed':
-      return [`${v} → v${msg.latest} を入れました (host の次の起動から)`, 'ok'];
+      return [`${v}: ${msg.message}`, 'ok'];
+    case 'deferred':
     case 'unsupported':
       return [`${v}: ${msg.message}`, ''];
     default:
@@ -227,7 +229,22 @@ export function updateLabel(msg, now = new Date()) {
 /** @returns {boolean} 確認が終わった (checking 以外) */
 function reportUpdate(msg) {
   report({ update: updateLabel(msg) });
-  return msg.state !== 'checking';
+  if (msg.state === 'checking') return false;
+  reloadIfUpdatedOnDisk();
+  return true;
+}
+
+// host が拡張のフォルダを入れ替えていたら (ディスクの manifest.json の版が動いている版と違う) 読み込み直す。
+// 見る人が居る間は待つ (host も見る人が居る間は入れ替えない。次の確認か worker の起き直しで拾う)
+async function reloadIfUpdatedOnDisk() {
+  try {
+    const disk = await (await fetch(chrome.runtime.getURL('manifest.json'), { cache: 'no-store' })).json();
+    if (disk.version === chrome.runtime.getManifest().version || relay?.viewers.size) return;
+    console.log(`拡張を v${disk.version} に読み込み直します`);
+    chrome.runtime.reload();
+  } catch (e) {
+    console.warn('manifest.json', e);
+  }
 }
 
 function checkHostUpdate() {
@@ -288,6 +305,7 @@ chrome.runtime.onStartup.addListener(resync);
 chrome.runtime.onInstalled.addListener(resync);
 chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === ALARM) resync();
+reloadIfUpdatedOnDisk();
   if (a.name === UPDATE_ALARM) checkHostUpdate();
 });
 chrome.runtime.onMessage.addListener((msg) => {

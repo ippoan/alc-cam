@@ -54,12 +54,17 @@ const signaling = startSignaling({ port: SIG_PORT, v1Sites: ['v1-site'] });
 // native messaging host の登録 (Linux の Chromium は <user-data-dir>/NativeMessagingHosts も見る)
 const userDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'alc-cam-e2e-'));
 await fs.mkdir(path.join(userDataDir, 'NativeMessagingHosts'));
+// 拠点と同じくデベロッパー モードを ON に (OFF だと chrome.runtime.reload() で手で読み込んだ拡張が無効になる)
+await fs.mkdir(path.join(userDataDir, 'Default'));
+await fs.writeFile(path.join(userDataDir, 'Default', 'Preferences'), JSON.stringify({ extensions: { ui: { developer_mode: true } } }));
 await fs.writeFile(
   path.join(userDataDir, 'NativeMessagingHosts', `${HOST_NAME}.json`),
   JSON.stringify({ name: HOST_NAME, description: 'alc-cam host (e2e)', path: HOST_BIN, type: 'stdio', allowed_origins: [`chrome-extension://${EXT_ID}/`] }),
 );
 
-const extDir = path.join(here, '../extension');
+// 拡張は写しを読み込む (自己更新の確認で manifest.json の版を書き換えるため)
+const extDir = await fs.mkdtemp(path.join(os.tmpdir(), 'alc-cam-e2e-ext-'));
+await fs.cp(path.join(here, '../extension'), extDir, { recursive: true });
 const ctx = await chromium.launchPersistentContext(userDataDir, {
   channel: 'chromium',
   headless: false,
@@ -221,6 +226,30 @@ try {
   await waitFor(() => !hostRunning(), 10_000, '確認のためだけの host が終わる');
   results.afterUpdateCheck = { hostRunning: hostRunning() };
 
+  // host が拡張のフォルダを入れ替えた後の形: ディスクの manifest.json の版が上がっていれば、確認の答えで読み込み直す
+  const manifestPath = path.join(extDir, 'manifest.json');
+  const m = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  await fs.writeFile(manifestPath, JSON.stringify({ ...m, version: '99.0.0' }));
+  const upd2 = await ctx.newPage();
+  await upd2.goto(`chrome-extension://${EXT_ID}/panel.html`);
+  const joins = deviceJoins();
+  await upd2.click('#update-check');
+  // 読み込み直すと拡張のページは閉じる。開き直して動いている版を見る
+  results.reloadedVersion = await waitFor(async () => {
+    const p = await ctx.newPage();
+    try {
+      await p.goto(`chrome-extension://${EXT_ID}/panel.html`);
+      const v = await p.evaluate(() => chrome.runtime.getManifest().version);
+      return v === '99.0.0' ? v : null;
+    } catch {
+      return null;
+    } finally {
+      await p.close().catch(() => {});
+    }
+  }, 15_000, '拡張の読み込み直し');
+  // 読み込み直した後も設定から cam-room に繋ぎ直す
+  await waitFor(() => deviceJoins() > joins, 15_000, '読み込み直し後の再接続');
+
   // 「停止」(enabled=false) で cam-room から抜ける
   const leftBefore = signaling.log.filter((l) => l === 'device left').length;
   await setStorage({ enabled: false });
@@ -255,7 +284,9 @@ const checks = results.error ? {} : {
   reconnectsAfterSwStop: results.afterSwRestart.cDelta > 0,
   stoppedByToggle: !!results.stoppedByToggle,
   // 更新の確認は host の版を添えてパネルに出て、確認のためだけの host は残らない
-  updateCheck: results.update?.startsWith('v0.3.0') && results.afterUpdateCheck?.hostRunning === false,
+  updateCheck: results.update?.includes('host v0.3.0') && results.afterUpdateCheck?.hostRunning === false,
+  // ディスクの拡張が新しくなっていたら読み込み直し、配信に戻る
+  reloadsWhenUpdatedOnDisk: results.reloadedVersion === '99.0.0',
   // データチャネルで caps が届き、押している間ステップが続き (左も上も)、要求は常に 1 本・Digest が通る
   ptzCaps: results.ptzCaps?.dirs?.length === 4 && results.ptzCaps.zoom === false,
   ptzSteps: ['move=left', 'move=up'].every((m) => results.ptz.stats.calls.filter((c) => c.startsWith(m)).length >= 2),
