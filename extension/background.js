@@ -41,6 +41,9 @@ const ALARM = 'alc-cam-watchdog';
 // host が TEARDOWN を書く前に stdout が閉じて終わることがあるので少し待つ (入り直しの起動し直しも省ける)
 const HOST_IDLE_MS = 5_000;
 const UPDATE_ALARM = 'alc-cam-host-update';
+// 新しい拡張を見る人が居る間は待たせた (host の update の extension_deferred) とき、確認し直すまでの分
+const UPDATE_RETRY_ALARM = 'alc-cam-host-update-retry';
+const UPDATE_RETRY_MIN = 2;
 const UPDATE_FIRST_MIN = 10;
 const UPDATE_PERIOD_MIN = 6 * 60;
 // 確認のためだけに起動した host を諦めるまで (exe のダウンロード込み)
@@ -276,6 +279,8 @@ function reportUpdate(msg) {
   report({ update: updateLabel(msg), hostVersion: msg.current, updateState: msg.state, updateAt: Date.now() });
   if (msg.state === 'error') noteError(`更新: ${msg.message}`);
   if (msg.state === 'checking') return false;
+  // 見る人が居なくなったら入れられるよう、6 時間待たずに確認し直す (まだ居ればまた待ちになり、また予約する)
+  if (msg.extension_deferred) chrome.alarms.create(UPDATE_RETRY_ALARM, { delayInMinutes: UPDATE_RETRY_MIN });
   reloadIfUpdatedOnDisk();
   return true;
 }
@@ -466,7 +471,7 @@ chrome.runtime.onInstalled.addListener(resync);
 chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === ALARM) resync();
 reloadIfUpdatedOnDisk();
-  if (a.name === UPDATE_ALARM) checkHostUpdate();
+  if (a.name === UPDATE_ALARM || a.name === UPDATE_RETRY_ALARM) checkHostUpdate();
 });
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.type === 'update_check') checkHostUpdate();

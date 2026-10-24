@@ -140,6 +140,10 @@ fn download(fetch: &impl Fetch, rel: &Release, name: &str, sha: &str, limit: u64
 }
 
 fn update_host(fetch: &impl Fetch, rel: &Release, exe: &Path, rename: Rename) -> Result<(), String> {
+    // 前の確認で入れ替え済み (動いているのは古い版のまま、次の起動から): 落とし直さない
+    if fs::read(exe).is_ok_and(|b| sha256_hex(&b).eq_ignore_ascii_case(rel.host_sha256.trim())) {
+        return Ok(());
+    }
     let bin = download(fetch, rel, "alc-cam-host.exe", &rel.host_sha256, MAX_EXE)?;
     replace_with(exe, &bin, rename).map_err(|e| format!("host の入れ替えに失敗 (今の版のまま): {e}"))
 }
@@ -149,6 +153,11 @@ struct Manifest {
     version: String,
     #[serde(default)]
     key: String,
+}
+
+/// 入っている拡張 (exe の隣の `extension\`) の版。読めなければ None
+pub fn extension_version(exe: &Path) -> Option<String> {
+    read_manifest(&ext_dir(exe)).ok().map(|m| m.version)
 }
 
 fn read_manifest(dir: &Path) -> Result<Manifest, String> {
@@ -500,6 +509,12 @@ mod tests {
         assert_eq!(summarize(&o).0, "installed");
         assert!(!fake.asked.borrow().iter().any(|u| u.ends_with(".zip")));
         assert_eq!(fs::read_to_string(d.join("extension/background.js")).unwrap(), "old");
+
+        // 見る人が居るまま確認し直す: 入れ替え済みの exe は落とし直さない
+        fake.asked.borrow_mut().clear();
+        let o = check(&fake, "0.3.0", &exe, BUSY).unwrap();
+        assert_eq!((&o.host, &o.extension), (&Part::Installed, &Part::Deferred));
+        assert_eq!(*fake.asked.borrow(), vec![LATEST_URL.to_string()]);
 
         // host が既に新しく、拡張だけ待ち
         let o = check(&fake, "0.3.1", &exe, BUSY).unwrap();

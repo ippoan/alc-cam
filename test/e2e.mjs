@@ -259,6 +259,14 @@ try {
   await a.evaluate(() => window.talkRelease());
   cgi.talk.busy = false;
 
+  // 見る側から自己更新の確認を頼む: 版が caps で届き、結果 (Linux の host は unsupported) が A と B の両方へ返る
+  results.updateCaps = await waitFor(() => a.evaluate(() => window.camState.update.caps), 10_000, 'update の caps');
+  await a.evaluate(() => window.updateCheck());
+  results.updateStates = {
+    a: await waitFor(async () => { const s = await a.evaluate(() => window.camState.update.states); return s.length ? s : null; }, 10_000, 'A に更新の結果'),
+    b: await waitFor(async () => { const s = await b.evaluate(() => window.camState.update.states); return s.length ? s : null; }, 10_000, 'B に更新の結果'),
+  };
+
   // A が離れても B は流れ続け、カメラは畳まない
   await a.close();
   await sleep(1000);
@@ -410,7 +418,7 @@ const checks = results.error ? {} : {
   extStatus: (() => {
     const st = results.extStatus;
     const json = JSON.stringify(st);
-    return st?.version === '0.4.4' && st.enabled === true && st.tokenLive === true && st.tokenSub === TOKEN_SUB &&
+    return st?.version === '0.4.5' && st.enabled === true && st.tokenLive === true && st.tokenSub === TOKEN_SUB &&
       st.assigned?.id === 'test-site' && st.signal?.[0] === '接続済み' && !json.includes(CAM_PASS) && !json.includes('eyJ') && !json.includes('rtsp://');
   })(),
   // 取り直しは /cameras/mine を 1 回呼び、同じカメラなら繋ぎ直さない
@@ -418,7 +426,7 @@ const checks = results.error ? {} : {
   extStopStart: results.extStop?.ok === true && results.extStoppedStatus?.enabled === false && results.extStart?.ok === true &&
     results.extStart.status?.enabled === true,
   extUnknownRejected: results.extUnknown?.ok === false,
-  extUpdateCheck: results.extUpdate?.ok === true && results.extUpdateStatus?.updateState === 'unsupported' && results.extUpdateStatus.hostVersion === '0.4.4',
+  extUpdateCheck: results.extUpdate?.ok === true && results.extUpdateStatus?.updateState === 'unsupported' && results.extUpdateStatus.hostVersion === '0.4.5',
   // 鍵は alc.ippoan.org からだけ受ける (他の origin には chrome.runtime.sendMessage 自体が生えない = 状態も操作も届かない)
   pwaOnly: results.evilHasSendMessage === 'undefined' && results.token1Reply?.ok === true,
   zeroCamerasReason: !!results.zeroCameras,
@@ -450,7 +458,7 @@ const checks = results.error ? {} : {
   reconnectsAfterSwStop: results.afterSwRestart.cDelta > 0,
   stoppedByToggle: !!results.stoppedByToggle,
   // 更新の確認は host の版を添えてパネルに出て、確認のためだけの host は残らない
-  updateCheck: results.update?.includes('host v0.4.4') && results.afterUpdateCheck?.hostRunning === false,
+  updateCheck: results.update?.includes('host v0.4.5') && results.afterUpdateCheck?.hostRunning === false,
   // ディスクの拡張が新しくなっていたら読み込み直し、配信に戻る
   reloadsWhenUpdatedOnDisk: results.reloadedVersion === '99.0.0',
   // 読み込み直しの後はパスワード待ち (写しのカメラ id は残る)、鍵が届けば繋ぎ直す
@@ -470,6 +478,9 @@ const checks = results.error ? {} : {
   talkReleased: results.talkReleased.open === 0 && results.talkReleased.closed === 1 && results.talkReleased.challenges >= 1 &&
     results.talkReleased.rates.length === 1 && results.talkReleased.rates[0] === 8,
   talkBusy: results.talkBusy?.ok === false && results.talkBusy.busy === true,
+  // 見る側からの更新の確認: host の版が caps で届き、結果は頼んだ A にも見ているだけの B にも届く
+  updateFromViewer: results.updateCaps?.host === '0.4.5' && 'extension' in results.updateCaps &&
+    [results.updateStates.a, results.updateStates.b].every((s) => s.at(-1).state === 'unsupported' && s.at(-1).current === '0.4.5'),
   ptzSteps: ['move=left', 'move=up'].every((m) => results.ptz.stats.calls.filter((c) => c.startsWith(m)).length >= 2),
   ptzOneAtATime: results.ptz.stats.maxInFlight === 1 && results.ptz.stats.unauthorized === 0,
   // A の stop で B は止まらない・B の stop の後は送らない・stop が無くても 1 秒で止まる

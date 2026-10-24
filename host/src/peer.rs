@@ -2,7 +2,7 @@
 //! カメラ中継規約どおり、映像は H.264 パススルー・non-trickle の offer (候補は offer に全部入れる)。
 //! 音声は PCMU (8kHz) の sendrecv を 1 本: カメラのマイクを全員へ、話している人の声をカメラのスピーカーへ (`talk.rs`)。
 //! 映像と同じ stream id にするので、古い見る側 (`event.streams[0]` を video に付けるだけ) も映像はそのまま出る。
-//! 首振り・通話の合図用にデータチャネル `ptz` を 1 本だけ offer に足す (中身は JSON 文字列。`ptz.rs` / `talk.rs`)。
+//! 首振り・通話・自己更新の合図用にデータチャネル `ptz` を 1 本だけ offer に足す (中身は JSON 文字列。`ptz.rs` / `talk.rs` / `remote.rs`)。
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,6 +44,8 @@ pub struct Viewer {
     connected: bool,
     /// データチャネル `ptz` (開いてから)
     ptz: Option<ChannelId>,
+    /// チャネルが開いたら送る自己更新の `caps` (`remote::caps`)
+    update_caps: String,
     /// 見る側から届いた `ptz` の文字列 (main が `take_ptz` で引き取る)
     inbox: Vec<String>,
     buf: Vec<u8>,
@@ -51,7 +53,7 @@ pub struct Viewer {
 
 impl Viewer {
     /// offer (SDP 文字列) を作る。`rtsp_url` は LAN 側の IP を決めるためだけに使う
-    pub fn new(id: &str, rtsp_url: &str, stun_server: &str) -> Result<(Self, String), String> {
+    pub fn new(id: &str, rtsp_url: &str, stun_server: &str, update_caps: String) -> Result<(Self, String), String> {
         let stun_addr = resolve(stun_server.trim_start_matches("stun:"));
         let lan_ip = route_ip(rtsp_url, stun_addr).ok_or("LAN のアドレスが分かりません")?;
         let socket = UdpSocket::bind((lan_ip, 0)).map_err(|e| format!("UDP を開けません ({})", e.kind()))?;
@@ -89,6 +91,7 @@ impl Viewer {
             answered_at: None,
             connected: false,
             ptz: None,
+            update_caps,
             inbox: Vec::new(),
             buf: vec![0u8; 2000],
         };
@@ -130,6 +133,8 @@ impl Viewer {
                     self.ptz = Some(id);
                     self.send_ptz(&ptz::caps());
                     self.send_ptz(&talk::caps());
+                    let caps = self.update_caps.clone();
+                    self.send_ptz(&caps);
                 }
                 Output::Event(Event::MediaData(d)) if d.mid == self.audio_mid && d.params.spec().codec == Codec::PCMU => {
                     if self.mic.len() < MAX_MIC {

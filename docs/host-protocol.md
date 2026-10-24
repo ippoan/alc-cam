@@ -31,7 +31,7 @@ host は拡張の background service worker が、見る人が来た時に `conn
 | `camera` | `ok`, `message` | カメラ (RTSP は 1 本) の状態 (受信中 / 再接続待ち / 停止)。文言に資格情報・宛先は入れない |
 | `peer` | `viewer_id`, `ok`, `message` | その見る人との接続の状態 (answer 待ち / 接続 (P2P) / 失敗 / 離れた) |
 | `log` | `message` | 診断用 |
-| `update` | `state`, `current`, `latest`, `message` | 自己更新 (`host/src/update.rs`、host の exe と拡張のフォルダ)。`state` は `checking` → `latest` (最新) / `installed` (`latest` の版を入れた。host は次の起動から、拡張はディスクの manifest.json の版が変わるので拡張が読み込み直す) / `deferred` (見る人が居るので拡張は後で) / `failed` (今の版のまま) / `unsupported` (Windows 以外)。`message` は人が読む説明 |
+| `update` | `state`, `current`, `latest`, `message`, `extension_deferred` | 自己更新 (`host/src/update.rs`、host の exe と拡張のフォルダ)。`state` は `checking` → `latest` (最新) / `installed` (`latest` の版を入れた。host は次の起動から、拡張はディスクの manifest.json の版が変わるので拡張が読み込み直す) / `deferred` (見る人が居るので拡張は後で) / `failed` (今の版のまま) / `unsupported` (Windows 以外)。`message` は人が読む説明。`extension_deferred` (0.4.5〜): 新しい拡張を見る人が居る間は待たせた (拡張は 2 分後に確認し直す) |
 
 ## host の中の流れ
 
@@ -161,3 +161,19 @@ host → 見る側:
 e2e の偽カメラ (`test/fake-rtsp.mjs` / `test/fake-cgi.mjs`) は AAC 32kHz の音声トラック (`test/fixture.aacbin`、
 `cargo run -p cam-audio --example aac-fixture -- test/fixture.aacbin` で作り直せる) と `transmit.cgi` (Digest・`audio/aac`・
 2 本目は `Too many users`) を持つ。見る側 (`test/viewer.html`) は Chrome の偽マイクで話す。
+
+## 見る側からの自己更新の確認 (データチャネル `ptz` の `type: "update"`、0.4.5〜)
+
+管理者の画面 (カメラ一覧・遠隔点呼のカメラ欄) から、拠点 PC の自己更新を頼める。中身は拡張の「今すぐ確認」(`update_check`) と同じ
+`update::check` で、経過・結果は拡張 (`update`) と見る人全員へ返す。0.4.4 までの host は `caps` を出さないので、見る側はボタンを出さない。
+
+| 向き | メッセージ | いつ |
+|---|---|---|
+| host → 見る側 | `{"type":"update","event":"caps","host":"0.4.5","extension":"0.4.5"}` (`extension` は host の隣の `extension\manifest.json` の版。読めなければ null) | チャネルが開いた直後 (首振り・通話の `caps` の後) |
+| 見る側 → host | `{"type":"update","action":"check"}` | 「更新を確認」を押した。確認中に重ねて来たものは捨てる |
+| host → 見る側 | `{"type":"update","event":"state","state","current","latest","message"}` (`state` は拡張への `update` と同じ: checking / latest / installed / deferred / failed / unsupported) | 確認の経過・結果。見る人全員へ |
+
+- host の exe は入れ替えるだけで、新しい版で動くのは次の起動から (見る人が全員抜けて host が終わり、次に誰かが繋いだとき)
+- 拡張は見る人が居る間は入れ替えない (`Part::Deferred`)。そのとき host → 拡張の `update` に `extension_deferred: true` を付け、
+  拡張は 2 分後に確認し直す (まだ見る人が居ればまた待ち)。見る人が居なくなった後の確認で入れ替わり、拡張が読み込み直す
+- 入れ替え済みの exe と同じもの (SHA256 が同じ) は落とし直さない (待ちの間の確認し直しで 5MB を繰り返し落とさない)

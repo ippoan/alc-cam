@@ -11,7 +11,7 @@
   const params = new URLSearchParams(location.search);
   const ws = new WebSocket(`ws://${location.host}/cam-room/${params.get('site') ?? 'test-site'}?role=admin`);
   const video = document.getElementById('v');
-  window.camState = { ws: 'connecting', pc: 'new', offers: 0, ptz: { caps: null, results: [] }, talk: { caps: null, states: [], results: [] }, audio: {} };
+  window.camState = { ws: 'connecting', pc: 'new', offers: 0, ptz: { caps: null, results: [] }, talk: { caps: null, states: [], results: [] }, audio: {}, update: { caps: null, states: [] } };
   // 首振り (データチャネル ptz)。e2e が ptzSend({action, dir, preset}) で押す
   let ptzChannel = null;
   window.ptzSend = (m) => ptzChannel?.readyState === 'open' && (ptzChannel.send(JSON.stringify({ type: 'ptz', ...m })), true);
@@ -29,6 +29,8 @@
     talkTimer = setInterval(send, 500);
   };
   // stop を送らずに止める (閉じた・届かなかった) こともできるように
+  // 自己更新の確認を頼む (alc-app の更新ボタンと同じ)
+  window.updateCheck = () => ptzChannel?.readyState === 'open' && (ptzChannel.send(JSON.stringify({ type: 'update', action: 'check' })), true);
   window.talkRelease = async (sendStop = true) => {
     clearInterval(talkTimer);
     await audioSender()?.replaceTrack(null);
@@ -55,7 +57,10 @@
       ptzChannel = e.channel;
       e.channel.onmessage = (m) => {
         const msg = JSON.parse(m.data);
-        if (msg.type === 'talk') {
+        if (msg.type === 'update') {
+          if (msg.event === 'caps') camState.update.caps = msg;
+          else camState.update.states.push(msg);
+        } else if (msg.type === 'talk') {
           if (msg.event === 'caps') camState.talk.caps = msg;
           else if (msg.event === 'state') camState.talk.states.push(msg);
           else camState.talk.results.push(msg);
