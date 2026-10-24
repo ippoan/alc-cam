@@ -28,7 +28,8 @@ WebRTC (P2P) で見る側へ届ける。alc-gw (Go の常駐アプリ) を置か
 
 | パス | 中身 |
 |---|---|
-| `host/` | `alc-cam-host` (str0m で WebRTC、暗号は pure Rust)。`hub.rs` が見る人への複製。`install.ps1` は Windows への登録 |
+| `host/` | `alc-cam-host` (str0m で WebRTC、暗号は pure Rust)。`hub.rs` が見る人への複製、`update.rs` が host と拡張の自己更新。`install.ps1` は Windows への初回の登録 |
+| `scripts/` | Release に付ける物 (host・拡張の zip・`alc-cam.json`) を作る `pack-release.ps1` |
 | `crates/cam-rtsp/` | RTSP (Digest・TCP interleaved) → H.264 Annex B。I/O を持たない |
 | `extension/` | 拠点側の Chrome 拡張 (MV3)。配信は `background.js` (service worker)、`panel.*` は設定と状態表示。ID は `key` で `icmmpdjddlphkbokdalofdjpkcgfiggd` に固定 |
 | `test/` | 偽カメラ・cam-room のローカル版・見る側のページと、それらを通す `e2e.mjs` |
@@ -39,19 +40,46 @@ WebRTC (P2P) で見る側へ届ける。alc-gw (Go の常駐アプリ) を置か
 
 ## 拠点 PC への入れ方 (Windows)
 
-1. Actions の成果物 (またはタグの Release) の `alc-cam-windows.zip` を展開
-2. `powershell -ExecutionPolicy Bypass -File install.ps1` (管理者不要。`%LOCALAPPDATA%\alc-cam` と HKCU に登録)
-3. `chrome://extensions` → デベロッパーモード → 「パッケージ化されていない拡張機能を読み込む」→ `extension/`
+**初回の 1 回だけ手で入れる (管理者権限は要らない)。以後は GitHub の Release を出すだけで、host も拡張も拠点 PC で勝手に新しくなる。**
+
+### 初回
+
+拠点で Chrome を使う Windows のユーザーで行う。
+
+1. 最新 Release の `alc-cam-windows.zip` を展開し、`install.cmd` をダブルクリックする
+   (= `powershell -ExecutionPolicy Bypass -File install.ps1`)。host を `%LOCALAPPDATA%\alc-cam\alc-cam-host.exe` に置いて
+   `HKCU` に native messaging として登録し、拡張を `%LOCALAPPDATA%\alc-cam\extension` に置く
+2. 以前に別の場所 (zip を展開したフォルダ等) から拡張を読み込んでいた PC は、install.ps1 がその場所を出して促すので、
+   拠点 ID と RTSP URL を控えてから `chrome://extensions` で「alc-cam 拠点中継」を **削除** する (そこは自動で更新されない)
+3. `chrome://extensions` → 右上の「デベロッパー モード」を ON → 「パッケージ化されていない拡張機能を読み込む」→
+   `%LOCALAPPDATA%\alc-cam\extension` (パスは install.ps1 がクリップボードに入れる)。ID が `icmmpdjddlphkbokdalofdjpkcgfiggd` であること。
+   **デベロッパー モードは以後も OFF に戻さない** (OFF のまま拡張が読み込み直すと、Chrome が拡張を無効にする)
 4. ツールバーのアイコン → サイドパネル → 設定に拠点 ID (= `alc_api.cameras.id`)・カメラの RTSP URL (stream2) を入れて保存。
    保存した時点で配信が始まる (以後は Chrome を起動するだけで繋ぐ)。パネルは閉じてよい。止めるときはパネルの「停止」
 
-見る側は alc-app の拠点カメラ画面で同じカメラを開く。
+見る側は alc-app の拠点カメラ画面で同じカメラを開く。外すとき: `uninstall.cmd` (host の登録とフォルダを消す) のあと `chrome://extensions` で削除。
 
-版を上げるとき: `host/Cargo.toml` と `extension/manifest.json` の `version` を揃えて上げ、merge 後に `v<版>` のタグを打つと
-CI が `alc-cam-windows.zip` を Release に付ける。拠点 PC では zip を展開し直して `install.ps1` を再実行し、
-`chrome://extensions` で拡張を再読み込みする (host と拡張は対で入れ替える)。
-0.2.x → 0.3.0 では設定 (`chrome.storage.local`) はそのまま引き継がれ、再読み込みした時点で background が繋ぐ。
-旧版の「パネルを開いたら自動で開始」は無くなり、代わりに既定で常時配信 (止めるのはパネルの「停止」)。
+### 以後の更新 (Release を出すだけ)
+
+拡張が 6 時間ごと (Chrome の起動から 10 分後が最初) とパネルの「今すぐ確認」で host に `update_check` を送る
+(host が動いていなければ確認のためだけに起動して、答えが来たら止める)。host は最新 Release の `alc-cam.json`
+(`{"version","host_sha256","extension_sha256"}`) を見て、
+
+- **host**: 自分より新しければその版の `alc-cam-host.exe` を落とし、SHA256 が合えば実行中の exe を `.old` に退けて置き換える (新版は host の次の起動から)
+- **拡張**: `%LOCALAPPDATA%\alc-cam\extension\manifest.json` より新しければ `alc-cam-extension.zip` を落として SHA256 を確かめ、
+  隣の一時フォルダに展開して manifest の版と key (= 拡張 ID) を確かめてから、フォルダごと rename で入れ替える。
+  **見る人が居る間は入れ替えない** (次の確認に回す)。拡張はディスクの manifest.json の版が動いている版と違えば `chrome.runtime.reload()` で読み込み直す
+
+どこで失敗しても今の版のまま動く (2 つ目の rename が失敗したら 1 つ目を戻す)。出る先は github.com と `*.githubusercontent.com` の https だけ
+(redirect 先も確かめる)。パネルの「host 更新」に拡張と host の版と結果が出る。
+
+版を上げるとき: `host/Cargo.toml` と `extension/manifest.json` の `version` を揃えて上げ、merge 後に `v<版>` のタグを手で打つ
+(GITHUB_TOKEN で打ったタグは workflow を起動しない)。タグの CI (`windows` job) が `scripts/pack-release.ps1` で
+`alc-cam-host.exe`・`alc-cam-extension.zip`・`alc-cam.json` を作り、`alc-cam-windows.zip` (初回用) と一緒に Release に付ける。
+拡張と host は別々の時点で入れ替わることがあるので、メッセージは後方互換に保つ (知らない `type` は双方とも捨てる)。
+
+Chrome のポリシー (`ExtensionSettings` の force_installed + CRX) で配る方式は採らない: Windows の Chrome が Web Store 外の拡張を
+force_installed するのは AD / Entra 参加か Chrome Enterprise Core 登録の PC だけで、拠点の PC では `[BLOCKED]` になるため。
 
 ## SD 録画の時間指定の切り出し (ingest/)
 
@@ -104,12 +132,16 @@ Digest 認証 / 見る側で H.264 がデコードされる / 2 人目が途中�
 片方が離れてももう片方は流れ続ける / 最後の 1 人が離れたらカメラへ TEARDOWN し host も止める / 入り直しで再び映る /
 パネルの状態表示と、パネルを閉じても映り続けること / keepalive の ping が `{"type":"ping"}` ちょうど /
 service worker を CDP で止めても起き直して繋ぎ直し、見ている人に再び映る / 設定を変えたら繋ぎ直す (v1 の部屋でも 1 人なら映る) /
+見る人が居ないときの「今すぐ確認」で確認のためだけに host を起こし、答えがパネルに出て host が止まる (Linux の host は入れ替えないので unsupported) /
+ディスクの拡張の manifest.json の版が上がっていたら確認の答えで読み込み直し、cam-room に繋ぎ直す (拡張は写しを読み込み、デベロッパー モードは ON) /
 「停止」で cam-room から抜ける。`signaling.mjs` は cam-room の v2 (と `v1Sites` に入れた部屋の v1)、
 keepalive の自動応答 (完全一致の ping にだけ pong) を写している。
 
 ## 未確認・未対応
 
-- Windows の実機 (install.ps1 と host.exe)。ビルドは CI の windows-latest で行う (この repo の Linux 環境に MinGW が無い)
+- Windows の実機 (install.ps1 と host.exe、host の exe と拡張のフォルダの入れ替え。Chrome が読み込んでいるフォルダを rename できるか)。
+  入れ替えの手順は `host/src/update.rs` の単体テスト、拡張の読み込み直しは e2e、GitHub の redirect の辿り方は
+  `cargo test -p alc-cam-host -- --ignored real_github` で確かめたビルドは CI の windows-latest で行う (この repo の Linux 環境に MinGW が無い)
 - 本物の C212 と、拠点の外 (NAT 越し) からの視聴。TURN は無いので、対称型 NAT 同士では繋がらない (規約 v1 と同じ)
 - device の認証 (規約 v1 と同じく cam-room は device を検証しない)
 - 音声

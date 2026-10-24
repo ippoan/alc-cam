@@ -37,6 +37,7 @@ function renderStatus(st) {
   setStatus('st-host', st.host);
   setStatus('st-signal', st.signal);
   setStatus('st-camera', st.camera);
+  if (st.update) setStatus('st-update', st.update);
   const vs = st.viewers;
   setStatus('st-viewer', [vs.length ? `${vs.length} 人` : 'なし', vs.length ? 'ok' : '']);
   if (!vs.length) return setStatus('st-peer', ['-', '']);
@@ -55,6 +56,8 @@ toggle.addEventListener('click', async () => {
   const { enabled } = await loadSettings();
   await chrome.storage.local.set({ enabled: !enabled });
 });
+
+$('update-check').addEventListener('click', () => chrome.runtime.sendMessage({ type: 'update_check' }));
 
 form.addEventListener('submit', async (ev) => {
   ev.preventDefault();

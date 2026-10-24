@@ -67,23 +67,48 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      # 日本語を含む .ps1 は BOM が無いと Windows PowerShell 5.1 が Shift_JIS で読んで壊れる
+      - name: PowerShell の構文と BOM
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($f in git ls-files '*.ps1') {
+            $b = [IO.File]::ReadAllBytes($f)
+            if ($b.Length -lt 3 -or $b[0] -ne 0xEF -or $b[1] -ne 0xBB -or $b[2] -ne 0xBF) { Write-Host "::error file=$f::UTF-8 BOM がありません"; $bad++ }
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$errs)
+            foreach ($e in $errs) { Write-Host "::error file=$f,line=$($e.Extent.StartLineNumber)::$($e.Message)"; $bad++ }
+          }
+          if ($bad) { exit 1 }
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p alc-cam-host
-      - name: パッケージ (host + install.ps1 + 拡張)
+      # Release に付ける host・拡張の zip・alc-cam.json (scripts/pack-release.ps1)。PR / main でも作って手順を確かめる
+      - name: 自己更新用の host・拡張 zip・版情報
+        shell: pwsh
+        run: |
+          $ver = if ('${{ github.ref }}'.StartsWith('refs/tags/v')) { '${{ github.ref_name }}'.TrimStart('v') } else { (Get-Content -Raw extension/manifest.json | ConvertFrom-Json).version }
+          ./scripts/pack-release.ps1 -Version $ver
+      - name: パッケージ (初回の手入れ用。host・install スクリプト・拡張)
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist/alc-cam | Out-Null
-          Copy-Item target/release/alc-cam-host.exe, host/install.ps1 dist/alc-cam/
+          Copy-Item target/release/alc-cam-host.exe, host/install.ps1, host/install.cmd, host/uninstall.cmd dist/alc-cam/
           Copy-Item -Recurse extension dist/alc-cam/extension
           Compress-Archive -Path dist/alc-cam/* -DestinationPath dist/alc-cam-windows.zip
       - uses: actions/upload-artifact@v4
         with:
           name: alc-cam-windows
-          path: dist/alc-cam-windows.zip
+          path: |
+            dist/alc-cam-windows.zip
+            dist/alc-cam-extension.zip
+            dist/alc-cam-host.exe
+            dist/alc-cam.json
+      # 拠点 PC の host は releases/latest の alc-cam.json を見るので、Release を出すだけで host も拡張も更新が届く。
+      # 版はタグ・manifest・Cargo.toml を揃えておく (pack-release.ps1 が確かめる)
       - if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create ${{ github.ref_name }} dist/alc-cam-windows.zip --generate-notes
+        run: gh release create ${{ github.ref_name }} dist/alc-cam-windows.zip dist/alc-cam-extension.zip dist/alc-cam-host.exe dist/alc-cam.json --generate-notes
 
   # green の PR を merge する (ippoan/ci-workflows の reusable。merge は GitHub App の token で行う)。
   # デプロイはここではしない (ingest は merge 後に deploy.yml が出す)。windows も PR で走るので needs に入れる

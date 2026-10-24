@@ -2,7 +2,8 @@
 //! 拡張が開いている間だけ動き、stdin が閉じたら (= 拡張が閉じたら) 終わる。
 //!
 //!   拡張 ──stdin──▶ config / start / stop / sdp_answer / ice_candidate   (config 以外は viewer_id 付き)
-//!   拡張 ◀─stdout── ready / sdp_offer / camera / peer / log
+//!                   update_check   (自己更新。見る人が居ない時は拡張がこれだけのために起動する)
+//!   拡張 ◀─stdout── ready / sdp_offer / camera / peer / log / update
 //!
 //! 首振りは映像と同じ PeerConnection のデータチャネル `ptz` で見る側から直接届き、カメラの管理画面 (HTTP) へ送る
 //! (`ptz`。拡張は関わらない)。
@@ -16,9 +17,12 @@ mod native;
 mod peer;
 mod ptz;
 mod stun;
+mod update;
 
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,6 +31,8 @@ use hub::{Frame, Hub, MAX_VIEWERS};
 use native::{In, Out};
 use peer::Viewer;
 use ptz::Ptz;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 1 巡で UDP を待つ時間の合計 (見る人で割る)。stdin とカメラのフレームにもすぐ応じるため短く
 const MAX_WAIT: Duration = Duration::from_millis(5);
@@ -59,7 +65,16 @@ fn main() {
             std::process::exit(0); // 拡張が居ない
         }
     };
-    out(Out::Ready { version: env!("CARGO_PKG_VERSION") });
+    out(Out::Ready { version: VERSION });
+
+    // 前回の自己更新で脇へ退けた古い exe を消す
+    if let Ok(exe) = std::env::current_exe() {
+        update::cleanup(&exe);
+    }
+    let (upd_tx, upd_rx) = mpsc::channel::<Out>();
+    let mut updating = false;
+    // 拡張の入れ替えは見る人が居ない時だけ (再読み込みで配信が切れる)。更新のスレッドが見る
+    let watching = Arc::new(AtomicUsize::new(0));
 
     let mut config: Option<(String, String)> = None;
     let mut hub: Hub<Viewer> = Hub::default();
@@ -118,6 +133,19 @@ fn main() {
                 None => out(Out::Log { message: format!("知らない viewer_id の候補: {viewer_id}") }),
                 Some(v) => v.add_candidate(&candidate),
             },
+            // 確認中に重ねて来たものは捨てる
+            Some(Ok(In::UpdateCheck)) if updating => {}
+            Some(Ok(In::UpdateCheck)) => {
+                updating = true;
+                start_update(upd_tx.clone(), watching.clone());
+            }
+        }
+
+        while let Ok(m) = upd_rx.try_recv() {
+            if !matches!(m, Out::Update { state: "checking", .. }) {
+                updating = false;
+            }
+            out(m);
         }
 
         // カメラ → 全員へ複製
@@ -188,6 +216,8 @@ fn main() {
         }
 
         // RTSP は見る人が 1 人でも居る間だけ 1 本
+        watching.store(hub.len(), Ordering::Relaxed);
+
         match (&config, hub.is_empty(), camera.is_some()) {
             (_, true, true) => {
                 camera = None; // TEARDOWN
@@ -197,4 +227,30 @@ fn main() {
             _ => {}
         }
     }
+}
+
+fn update_msg(state: &'static str, latest: Option<String>, message: String) -> Out {
+    Out::Update { state, current: VERSION, latest, message }
+}
+
+/// 自己更新は別スレッドで (落とす間も映像を止めない)。結果は `tx` へ。入れ替えは Windows だけ
+fn start_update(tx: mpsc::Sender<Out>, watching: Arc<AtomicUsize>) {
+    if !cfg!(windows) {
+        let _ = tx.send(update_msg("unsupported", None, "自己更新は Windows だけです".into()));
+        return;
+    }
+    let _ = tx.send(update_msg("checking", None, String::new()));
+    thread::spawn(move || {
+        let busy = move || watching.load(Ordering::Relaxed) > 0;
+        let res = std::env::current_exe()
+            .map_err(|e| format!("自分の場所が分かりません: {e}"))
+            .and_then(|exe| update::check(&update::GitHub::default(), VERSION, &exe, &busy));
+        let _ = tx.send(match res {
+            Ok(o) => {
+                let (state, message) = update::summarize(&o);
+                update_msg(state, Some(o.latest), message)
+            }
+            Err(e) => update_msg("failed", None, e),
+        });
+    });
 }
