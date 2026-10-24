@@ -80,7 +80,7 @@ $elsewhere = @($loaded | Where-Object { $_.Path -ne $extDir })
 if ($elsewhere) {
     Write-Warning "別の場所から読み込んだ alc-cam の拡張が Chrome に入っています:"
     $elsewhere | ForEach-Object { Write-Warning ("  {0}: {1}" -f $_.Profile, $_.Path) }
-    Write-Warning "そこは自動で更新されません。拠点 ID と RTSP URL を控えてから chrome://extensions で「削除」し、下の手順で読み込み直してください。"
+    Write-Warning "そこは自動で更新されません。chrome://extensions で「削除」し、下の手順で読み込み直してください。"
 }
 if ($here -and -not $elsewhere) {
     Write-Host "拡張はもう $extDir から読み込まれています。chrome://extensions の alc-cam 拠点中継の ↻ を押すと新しい版になります。"
@@ -92,4 +92,4 @@ Write-Host "  1. アドレス欄に chrome://extensions を入れて開く"
 Write-Host "  2. 右上の「デベロッパー モード」を ON にする (以後も OFF に戻さない。OFF だと自動更新で拡張が止まる)"
 Write-Host "  3. 「パッケージ化されていない拡張機能を読み込む」で次のフォルダを選ぶ (パスはクリップボードに入っています)"
 Write-Host "     $extDir"
-Write-Host "  4. ID が $extId であることを確かめ、ツールバーのアイコンからパネルを開いて拠点 ID と RTSP URL を保存する"
+Write-Host "  4. ID が $extId であることを確かめ、この Chrome で点呼の画面 (alc.ippoan.org) を開き、ツールバーのアイコンのパネルに「担当カメラ」が出ることを確かめる (拠点とカメラは録画の画面の紐づけから決まる)"
