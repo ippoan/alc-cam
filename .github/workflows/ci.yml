@@ -4,7 +4,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, feat/msi]  # 一時: PR 前に MSI の CI を回す (revert する)
     tags: ['v*']
 
 permissions:
