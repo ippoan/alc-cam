@@ -57,7 +57,14 @@
       <RegistryValue Root="HKCU" Key="Software\ippoan\alc-cam\Installed" Name="host [ProductVersion]" Type="integer" Value="1" KeyPath="yes" />
     </Component>
 
-    <!-- 入れ終わりの画面: ようこそ → 入れる → 拡張の読み込み手順 -->
+    <!-- 入れ終わりの画面: ようこそ → 入れる → 拡張の読み込み手順 (自前の AlcCamExitDlg)。
+         WiX 標準の ExitDialog の追加の文 (WIXUI_EXITDIALOGOPTIONALTEXT) は「NOT Installed」のときしか出ず
+         (同じ版の入れ直し = 保守モードでは出ない)、欄も 6〜7 行ぶんでフォルダの行が切れるので使わない -->
+    <!-- 拡張のフォルダ (完了画面の欄に出す。選んでコピーできる) と、[完了] で開く先 (util の WixShellExec が読む) -->
+    <SetProperty Id="ALCCAM_EXTDIR" After="CostFinalize" Sequence="ui" Value="[INSTALLFOLDER]extension" />
+    <Property Id="WixShellExecTarget" Value="[INSTALLFOLDER]extension" />
+    <Property Id="ALCCAM_OPENFOLDER" Value="1" />
+    <CustomAction Id="OpenExtFolder" BinaryRef="Wix4UtilCA_X64" DllEntry="WixShellExec" Impersonate="yes" Return="ignore" />
     <UI Id="AlcCamUI">
       <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
       <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
@@ -73,10 +80,29 @@
       <DialogRef Id="UserExit" />
       <DialogRef Id="WelcomeDlg" />
       <Publish Dialog="WelcomeDlg" Control="Next" Event="EndDialog" Value="Return" Order="2" />
-      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+
+      <Dialog Id="AlcCamExitDlg" Width="370" Height="270" Title="[ProductName] セットアップ">
+        <Control Id="Banner" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}alc-cam を入れました" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="最後に Chrome で拡張を 1 回だけ読み込みます (以後の更新は自動)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="Steps" Type="Text" X="20" Y="51" Width="330" Height="104" NoPrefix="yes"
+                 Text="1. Chrome で chrome://extensions を開き、右上の「デベロッパー モード」を ON にする (OFF に戻さない)&#13;&#10;2. 前に別の場所から読み込んだ「alc-cam 拠点中継」があれば「削除」&#13;&#10;3. 下の「フォルダを開く」を ON のまま [\[]完了[\]] を押すと拡張のフォルダが開くので、そのフォルダ (extension) を chrome://extensions の画面へドラッグ&amp;ドロップする&#13;&#10;　または「パッケージ化されていない拡張機能を読み込む」で下のフォルダを選ぶ (欄の文字は選んでコピーできる)" />
+        <Control Id="ExtDirLabel" Type="Text" X="20" Y="156" Width="330" Height="12" NoPrefix="yes" Text="拡張のフォルダ:" />
+        <Control Id="ExtDir" Type="Edit" X="20" Y="169" Width="330" Height="18" Property="ALCCAM_EXTDIR" Sunken="yes" />
+        <Control Id="OpenFolder" Type="CheckBox" X="20" Y="196" Width="330" Height="17" Property="ALCCAM_OPENFOLDER" CheckBoxValue="1" Text="[\[]完了[\]] でこのフォルダを開く" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="!(loc.WixUIBack)" />
+        <Control Id="Finish" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="!(loc.WixUIFinish)">
+          <Publish Event="DoAction" Value="OpenExtFolder" Condition="ALCCAM_OPENFOLDER = 1" Order="1" />
+          <Publish Event="EndDialog" Value="Return" Order="2" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Disabled="yes" Text="!(loc.WixUICancel)" />
+      </Dialog>
+      <InstallUISequence>
+        <Show Dialog="AlcCamExitDlg" OnExit="success" />
+      </InstallUISequence>
     </UI>
     <UIRef Id="WixUI_Common" />
-    <SetProperty Id="WIXUI_EXITDIALOGOPTIONALTEXT" After="CostFinalize" Sequence="ui"
-                 Value="Chrome で 1 回だけ (以後の更新は自動):&#13;&#10;1. chrome://extensions を開き、右上の「デベロッパー モード」を ON (OFF に戻さない)&#13;&#10;2. 前に別の場所から読み込んだ alc-cam 拠点中継があれば「削除」&#13;&#10;3. 「パッケージ化されていない拡張機能を読み込む」で次のフォルダを選ぶ:&#13;&#10;[INSTALLFOLDER]extension" />
   </Package>
 </Wix>
