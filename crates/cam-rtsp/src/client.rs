@@ -1,5 +1,7 @@
-//! RTSP の手順 (DESCRIBE → SETUP → PLAY) と、PLAY 後の interleaved RTP の受け取り。
+//! RTSP の手順 (DESCRIBE → SETUP (映像) → SETUP (音声、あれば) → PLAY) と、PLAY 後の interleaved RTP の受け取り。
+//! 音声の SETUP をカメラが断ったら音声なしで続ける。
 
+use crate::audio::{self, AudioDepacketizer, AudioTrack};
 use crate::digest::{self, Challenge};
 use crate::h264::{codec_string, Depacketizer};
 use crate::response::{self, Item, Response};
@@ -16,12 +18,17 @@ pub enum Event {
     Codec(String),
     /// アクセスユニット 1 つ。最初の 1 つは必ずキーフレーム
     Frame { key: bool, timestamp_us: f64, data: Vec<u8> },
+    /// 音声のトラックを SETUP できた (PLAY より前に 1 度)
+    AudioTrack(AudioTrack),
+    /// 音声のまとまり 1 つ (AAC は AU 1 つ、G.711 はペイロード)
+    Audio { data: Vec<u8> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
     Describe,
     Setup,
+    SetupAudio,
     Play,
     Playing,
 }
@@ -43,6 +50,9 @@ pub struct Client {
     cnonce: String,
     track: Option<VideoTrack>,
     rtp_channel: u8,
+    audio: Option<AudioTrack>,
+    audio_channel: Option<u8>,
+    audio_depack: AudioDepacketizer,
     session: Option<String>,
     timeout_secs: u32,
     inbuf: Vec<u8>,
@@ -67,6 +77,9 @@ impl Client {
             cnonce: cnonce.to_string(),
             track: None,
             rtp_channel: 0,
+            audio: None,
+            audio_channel: None,
+            audio_depack: AudioDepacketizer::default(),
             session: None,
             timeout_secs: 60,
             inbuf: Vec::new(),
@@ -122,11 +135,18 @@ impl Client {
         let mut events = Vec::new();
         while let Some(item) = response::next(&mut self.inbuf)? {
             match item {
-                Item::Response(r) => self.on_response(r)?,
+                Item::Response(r) => self.on_response(r, &mut events)?,
                 Item::Other => {}
                 Item::Interleaved { channel, data } => {
-                    if self.step == Step::Playing && channel == self.rtp_channel {
+                    if self.step != Step::Playing {
+                        continue;
+                    }
+                    if channel == self.rtp_channel {
                         self.on_rtp(&data, &mut events);
+                    } else if Some(channel) == self.audio_channel {
+                        if let Some(track) = &self.audio {
+                            events.extend(self.audio_depack.push(&data, track).into_iter().map(|u| Event::Audio { data: u.data }));
+                        }
                     }
                 }
             }
@@ -149,7 +169,7 @@ impl Client {
         }
     }
 
-    fn on_response(&mut self, r: Response) -> Result<(), Error> {
+    fn on_response(&mut self, r: Response, events: &mut Vec<Event>) -> Result<(), Error> {
         let cseq = r.header("CSeq").and_then(|v| v.trim().parse::<u32>().ok());
         let Some((sent, req)) = self.in_flight.clone() else {
             // PLAY 後の keepalive の応答。セッションが消えていたら続けられない
@@ -186,6 +206,12 @@ impl Client {
             return Ok(());
         }
         if !(200..300).contains(&r.status) {
+            if self.step == Step::SetupAudio {
+                // 音声を断るカメラ: 映像だけで続ける
+                self.audio = None;
+                self.play();
+                return Ok(());
+            }
             return err(format!("{} が {} で失敗しました", req.method, r.status));
         }
 
@@ -196,10 +222,15 @@ impl Client {
                     .or_else(|| r.header("Content-Location"))
                     .map(str::to_string)
                     .unwrap_or_else(|| self.url.uri.clone());
-                let track = sdp::parse(&String::from_utf8_lossy(&r.body))?;
+                let body = String::from_utf8_lossy(&r.body);
+                let track = sdp::parse(&body)?;
                 self.depack = Depacketizer::new(track.sps.clone(), track.pps.clone());
                 let uri = url::resolve_control(&base, &track.control);
                 self.track = Some(track);
+                self.audio = audio::parse(&body).map(|mut a| {
+                    a.control = url::resolve_control(&base, &a.control);
+                    a
+                });
                 self.step = Step::Setup;
                 self.send(Request {
                     method: "SETUP",
@@ -221,14 +252,35 @@ impl Client {
                 if let Some(ch) = r.header("Transport").and_then(interleaved_channel) {
                     self.rtp_channel = ch;
                 }
-                self.step = Step::Play;
-                let uri = self.url.uri.clone();
-                self.send(Request { method: "PLAY", uri, headers: vec![("Range", "npt=0.000-".into())] });
+                match &self.audio {
+                    Some(a) => {
+                        self.step = Step::SetupAudio;
+                        let uri = a.control.clone();
+                        self.send(Request { method: "SETUP", uri, headers: vec![("Transport", "RTP/AVP/TCP;unicast;interleaved=2-3".into())] });
+                    }
+                    None => self.play(),
+                }
+            }
+            Step::SetupAudio => {
+                let ch = r.header("Transport").and_then(interleaved_channel).unwrap_or(2);
+                if ch == self.rtp_channel {
+                    self.audio = None; // 映像と同じ番号を返すカメラ: 混ざるので音声は使わない
+                } else {
+                    self.audio_channel = Some(ch);
+                    events.extend(self.audio.clone().map(Event::AudioTrack));
+                }
+                self.play();
             }
             Step::Play => self.step = Step::Playing,
             Step::Playing => {}
         }
         Ok(())
+    }
+
+    fn play(&mut self) {
+        self.step = Step::Play;
+        let uri = self.url.uri.clone();
+        self.send(Request { method: "PLAY", uri, headers: vec![("Range", "npt=0.000-".into())] });
     }
 
     fn send(&mut self, req: Request) {
@@ -339,6 +391,53 @@ a=fmtp:96 packetization-mode=1;sprop-parameter-sets=Z0LAHg==,aM4=\r\na=control:t
         c.keepalive();
         let r = requests(&c.take_output());
         assert!(r[0].starts_with("OPTIONS") && r[0].contains("Session: 12345"));
+    }
+
+    const SDP_AAC: &str = "v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n\
+a=fmtp:96 packetization-mode=1;sprop-parameter-sets=Z0LAHg==,aM4=\r\na=control:track1\r\n\
+m=audio 0 RTP/AVP 97\r\na=rtpmap:97 MPEG4-GENERIC/32000/1\r\n\
+a=fmtp:97 mode=AAC-hbr;config=1288;sizelength=13;indexlength=3;indexdeltalength=3\r\na=control:track2\r\n";
+
+    /// DESCRIBE → 映像の SETUP まで進めて、音声の SETUP の要求を返す
+    fn up_to_audio_setup(c: &mut Client) -> String {
+        c.take_output();
+        reply(c, "200 OK", 1, "Content-Base: rtsp://cam/s/\r\n", SDP_AAC);
+        c.take_output();
+        reply(c, "200 OK", 2, "Session: 9\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n", "");
+        requests(&c.take_output()).remove(0)
+    }
+
+    #[test]
+    fn sets_up_audio_and_returns_aac_units() {
+        let mut c = Client::new("rtsp://cam/s", "cn").unwrap();
+        let r = up_to_audio_setup(&mut c);
+        assert!(r.starts_with("SETUP rtsp://cam/s/track2 RTSP/1.0") && r.contains("interleaved=2-3") && r.contains("Session: 9"), "{r}");
+        let ev = reply(&mut c, "200 OK", 3, "Session: 9\r\nTransport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n", "");
+        assert!(matches!(&ev[..], [Event::AudioTrack(t)] if t.clock_rate == 32000), "{ev:?}");
+        assert!(requests(&c.take_output())[0].starts_with("PLAY"));
+        reply(&mut c, "200 OK", 4, "", "");
+
+        let rtp = build_rtp(1, 0, true, 97, &crate::audio::packetize_aac(&[&[7, 7], &[8]]));
+        let mut wire = vec![b'$', 2];
+        wire.extend_from_slice(&(rtp.len() as u16).to_be_bytes());
+        wire.extend_from_slice(&rtp);
+        assert_eq!(c.feed(&wire).unwrap(), vec![Event::Audio { data: vec![7, 7] }, Event::Audio { data: vec![8] }]);
+    }
+
+    #[test]
+    fn camera_refusing_audio_still_plays_video() {
+        let mut c = Client::new("rtsp://cam/s", "cn").unwrap();
+        up_to_audio_setup(&mut c);
+        assert!(reply(&mut c, "461 Unsupported Transport", 3, "", "").is_empty());
+        assert!(requests(&c.take_output())[0].starts_with("PLAY"));
+        reply(&mut c, "200 OK", 4, "", "");
+        assert!(c.is_playing());
+
+        // 映像と同じ番号を返すカメラも音声なし
+        let mut c = Client::new("rtsp://cam/s", "cn").unwrap();
+        up_to_audio_setup(&mut c);
+        assert!(reply(&mut c, "200 OK", 3, "Session: 9\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n", "").is_empty());
+        assert!(requests(&c.take_output())[0].starts_with("PLAY"));
     }
 
     #[test]

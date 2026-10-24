@@ -43,12 +43,13 @@ WebRTC (P2P) で見る側へ届ける。alc-gw (Go の常駐アプリ) を置か
 |---|---|
 | `host/` | `alc-cam-host` (str0m で WebRTC、暗号は pure Rust)。`hub.rs` が見る人への複製、`update.rs` が host と拡張の自己更新 |
 | `scripts/` | Release に付ける物 (host・拡張の zip・`alc-cam.json`・`alc-cam.msi`) を作る `pack-release.ps1`。MSI は `alc-cam.wxs` + `build-msi.ps1`、検査は `check-msi.ps1` |
-| `crates/cam-rtsp/` | RTSP (Digest・TCP interleaved) → H.264 Annex B。I/O を持たない |
+| `crates/cam-rtsp/` | RTSP (Digest・TCP interleaved) → H.264 Annex B と音声 (AAC / G.711)。I/O を持たない |
 | `extension/` | 拠点側の Chrome 拡張 (MV3)。配信は `background.js` (service worker)、`lib/config.js` が鍵の受け取りと担当カメラの取得、`panel.*` は状態表示。ID は `key` で `icmmpdjddlphkbokdalofdjpkcgfiggd` に固定 |
 | `test/` | 偽カメラ・cam-room のローカル版・見る側のページと、それらを通す `e2e.mjs` |
 | `crates/cam-sd/` | カメラの SD 録画の一覧・取り出し・時刻の扱い (I/O を持たない) |
 | `crates/cam-mp4/` | MP4 を再エンコードせずに切ってつなぐ (moov を読み、出力の頭と写す区間を返す。I/O を持たない) |
 | `crates/cam-ptz/` | 首振り (パン・チルト・プリセット) の命令の交通整理と CGI (HTTP Digest) の組み立て (I/O を持たない)。見る側とはデータチャネル `ptz` |
+| `crates/cam-audio/` | 音声: カメラの AAC → PCMU (聞く)、見る側の PCMU → AAC (`audio/transmit.cgi` へ話す)、通話の順番 (1 人だけ・後から押した人が優先)。I/O を持たない。`docs/host-protocol.md` の「音声」 |
 | `ingest/` | SD 録画の時間指定の切り出しを R2 に置く Worker `alc-cam-sd-ingest` (wasm32、別 workspace) |
 
 ## 拠点 PC への入れ方 (Windows)

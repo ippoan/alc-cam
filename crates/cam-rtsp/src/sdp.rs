@@ -1,4 +1,4 @@
-//! DESCRIBE の SDP から映像 (H.264) のトラックを 1 本選ぶ。音声は使わない (カメラ中継規約 v1 と同じ)。
+//! DESCRIBE の SDP から映像 (H.264) のトラックを 1 本選ぶ。音声は `audio` が選ぶ。
 
 use base64::Engine;
 

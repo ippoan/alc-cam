@@ -3,13 +3,14 @@
 # シグナリング (cf-alc-signaling の /cam-room) は拡張が持ち、ここへは stdin/stdout の JSON で中継される。
 [package]
 name = "alc-cam-host"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 publish = false
 
 [dependencies]
 cam-rtsp = { path = "../crates/cam-rtsp" }
 cam-ptz = { path = "../crates/cam-ptz" }
+cam-audio = { path = "../crates/cam-audio" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 暗号は pure Rust (Windows へのクロスビルドで OpenSSL / aws-lc を持ち込まない)

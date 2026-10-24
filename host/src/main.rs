@@ -8,6 +8,10 @@
 //! 首振りは映像と同じ PeerConnection のデータチャネル `ptz` で見る側から直接届き、カメラの管理画面 (HTTP) へ送る
 //! (`ptz`。拡張は関わらない)。
 //!
+//! 音声も同じ PeerConnection (PCMU): カメラのマイク (RTSP の音声) は `cam_audio::Downlink` で PCMU にして全員へ。
+//! 見る側の「押して話す」は同じデータチャネルの `talk` で届き (`cam_audio::Floor` が 1 人に絞る)、
+//! その人の声を `talk::Talk` がカメラのスピーカー (`audio/transmit.cgi`) へ送る。
+//!
 //! 見る人が来るたび (start) その人への WebRTC の offer を返す。カメラの RTSP は最初の 1 人で開き、
 //! 最後の 1 人が離れたら TEARDOWN する (カメラにつき 1 本)。映像は `hub` が見る人ごとに複製して P2P で送る。
 
@@ -17,6 +21,7 @@ mod native;
 mod peer;
 mod ptz;
 mod stun;
+mod talk;
 mod update;
 
 use std::io;
@@ -31,6 +36,7 @@ use hub::{Frame, Hub, MAX_VIEWERS};
 use native::{In, Out};
 use peer::Viewer;
 use ptz::Ptz;
+use talk::{Talk, TalkEvent};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -81,8 +87,13 @@ fn main() {
     let mut camera: Option<Camera> = None;
     let mut ptz: Option<Ptz> = None;
     let mut ptz_ctl = cam_ptz::Controller::default();
+    let mut downlink: Option<cam_audio::Downlink> = None;
+    let mut floor = cam_audio::Floor::default();
+    let mut talk: Option<Talk> = None;
 
     loop {
+        // 話す人の入れ替わり (この巡で起きたもの)。最後に全員へ知らせ、カメラのスピーカーを開け閉めする
+        let mut changes: Vec<cam_audio::Change> = Vec::new();
         // 見る人が居ないあいだは stdin を待つだけ
         let wait = if hub.is_empty() { Duration::from_millis(500) } else { Duration::ZERO };
         let msg = match rx.recv_timeout(wait) {
@@ -116,6 +127,7 @@ fn main() {
             },
             Some(Ok(In::Stop { viewer_id })) => {
                 ptz_ctl.forget(&viewer_id);
+                changes.extend(floor.forget(&viewer_id));
                 if hub.remove(&viewer_id).is_some() {
                     out(Out::Peer { viewer_id, ok: false, message: "見る人が離れました".into() });
                 }
@@ -156,7 +168,21 @@ fn main() {
                     Ok(Cam::Frame { key, timestamp_us, data }) => {
                         let f = Frame { key, ts: (timestamp_us * 0.09) as u64, data: data.into() };
                         for (viewer_id, _, message) in hub.on_frame(f) {
+                            changes.extend(floor.forget(&viewer_id));
                             out(Out::Peer { viewer_id, ok: false, message });
+                        }
+                    }
+                    Ok(Cam::AudioTrack(track)) => {
+                        downlink = cam_audio::Downlink::new(&track)
+                            .map_err(|e| out(Out::Log { message: format!("カメラの音は流せません: {e}") }))
+                            .ok();
+                        if downlink.is_some() {
+                            out(Out::Log { message: format!("カメラの音: {}", track.describe()) });
+                        }
+                    }
+                    Ok(Cam::Audio(unit)) => {
+                        for pcmu in downlink.as_mut().map(|d| d.push(&unit)).unwrap_or_default() {
+                            hub.on_audio(&pcmu);
                         }
                     }
                     Err(TryRecvError::Empty) => break,
@@ -180,9 +206,11 @@ fn main() {
                     Err(e) => e,
                 };
                 hub.remove(&viewer_id);
+                changes.extend(floor.forget(&viewer_id));
                 out(Out::Peer { viewer_id, ok: false, message });
             }
             for (viewer_id, _, message) in hub.flush_connected() {
+                changes.extend(floor.forget(&viewer_id));
                 out(Out::Peer { viewer_id, ok: false, message });
             }
         }
@@ -192,7 +220,17 @@ fn main() {
         let mut replies = Vec::new();
         for viewer_id in hub.ids() {
             let Some(v) = hub.get_mut(&viewer_id) else { continue };
+            // 話している人の声だけをカメラへ。他の人の声は捨てる
+            let mic = v.take_mic();
+            if let (Some(t), Some(true)) = (&talk, floor.talker().map(|id| id == viewer_id)) {
+                mic.into_iter().for_each(|p| t.send(p));
+            }
             for text in v.take_ptz() {
+                match talk::parse(&text) {
+                    Some(talk::Action::Start) => changes.extend(floor.start(&viewer_id, now)),
+                    Some(talk::Action::Stop) => changes.extend(floor.stop(&viewer_id)),
+                    None => {}
+                }
                 match ptz::parse(&text) {
                     None => {}
                     Some((action, Err(message))) => v.send_ptz(&ptz::reply(&action, false, false, &message)),
@@ -215,12 +253,53 @@ fn main() {
             }
         }
 
+        // 通話: カメラ側の結果を話そうとした人へ。繋がらなければその人を外す
+        if let Some(t) = &talk {
+            if let Ok(ev) = t.rx.try_recv() {
+                let talker = floor.talker().map(str::to_string);
+                match ev {
+                    TalkEvent::Ready(format) => {
+                        if let Some(v) = talker.as_deref().and_then(|id| hub.get_mut(id)) {
+                            v.send_ptz(&talk::result(true, false, &format!("カメラのスピーカーに接続 ({format})")));
+                        }
+                    }
+                    TalkEvent::Failed { busy, message } => {
+                        out(Out::Log { message: format!("通話: {message}") });
+                        if let Some(id) = talker {
+                            if let Some(v) = hub.get_mut(&id) {
+                                v.send_ptz(&talk::result(false, busy, &message));
+                            }
+                            changes.extend(floor.refuse(&id, Instant::now()));
+                        }
+                        talk = None;
+                    }
+                }
+            }
+        }
+        changes.extend(floor.poll(now));
+        if !changes.is_empty() {
+            let talker = floor.talker().map(str::to_string);
+            for viewer_id in hub.ids() {
+                if let Some(v) = hub.get_mut(&viewer_id) {
+                    v.send_ptz(&talk::state(talker.is_some(), talker.as_deref() == Some(viewer_id.as_str())));
+                }
+            }
+            match (&config, &talker, talk.is_some()) {
+                (Some((rtsp_url, _)), Some(_), false) => {
+                    talk = Talk::open(rtsp_url).map_err(|e| out(Out::Log { message: format!("通話は使えません: {e}") })).ok();
+                }
+                (_, None, true) => talk = None, // 切断 = カメラ側の通話も終わる
+                _ => {}
+            }
+        }
+
         // RTSP は見る人が 1 人でも居る間だけ 1 本
         watching.store(hub.len(), Ordering::Relaxed);
 
         match (&config, hub.is_empty(), camera.is_some()) {
             (_, true, true) => {
                 camera = None; // TEARDOWN
+                downlink = None;
                 out(Out::Camera { ok: false, message: "停止".into() });
             }
             (Some((rtsp_url, _)), false, false) => camera = Some(Camera::open(rtsp_url)),

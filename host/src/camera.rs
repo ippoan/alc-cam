@@ -9,10 +9,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cam_rtsp::{Client, Event};
+use cam_rtsp::{AudioTrack, Client, Event};
 
 pub enum Cam {
     Frame { key: bool, timestamp_us: f64, data: Vec<u8> },
+    /// 音声のトラックがある (繋ぐたびに 1 度)
+    AudioTrack(AudioTrack),
+    /// 音声のまとまり 1 つ (AAC の AU / G.711)
+    Audio(Vec<u8>),
     Status { ok: bool, message: String },
 }
 
@@ -116,6 +120,8 @@ fn run(rtsp_url: &str, stop: &AtomicBool, tx: &Sender<Cam>) -> Result<(), String
                     Cam::Status { ok: true, message: format!("受信中 ({codec})") }
                 }
                 Event::Frame { key, timestamp_us, data } => Cam::Frame { key, timestamp_us, data },
+                Event::AudioTrack(t) => Cam::AudioTrack(t),
+                Event::Audio { data } => Cam::Audio(data),
             };
             if tx.send(msg).is_err() {
                 // 受け手が居ない = 畳まれた

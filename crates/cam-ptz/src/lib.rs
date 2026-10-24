@@ -283,14 +283,20 @@ impl Auth {
 
     /// 送るバイト列 (1 要求 1 接続、`Connection: close`)
     pub fn request(&mut self, path: &str) -> Vec<u8> {
-        let mut req = format!(
-            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n",
-            self.target.host_header()
-        );
+        self.build("POST", path, "Content-Length: 0\r\nConnection: close\r\n")
+    }
+
+    /// 接続を保ったまま本文を送り続ける要求 (通話の `audio/transmit.cgi`)。本文の長さは書かない
+    pub fn stream_request(&mut self, path: &str) -> Vec<u8> {
+        self.build("GET", path, "Content-Type: application/octet-stream\r\nConnection: Keep-Alive\r\nCache-Control: no-cache\r\n")
+    }
+
+    fn build(&mut self, method: &str, path: &str, headers: &str) -> Vec<u8> {
+        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {}\r\n{headers}", self.target.host_header());
         if let Some(ch) = &self.challenge {
             self.nc += 1;
             let t = &self.target;
-            req += &format!("Authorization: {}\r\n", digest::authorization(ch, "POST", path, &t.user, &t.pass, self.nc, &self.cnonce));
+            req += &format!("Authorization: {}\r\n", digest::authorization(ch, method, path, &t.user, &t.pass, self.nc, &self.cnonce));
         }
         req += "\r\n";
         req.into_bytes()
@@ -559,6 +565,20 @@ mod tests {
         let none = parse_response(b"HTTP/1.1 401 x\r\n\r\n").unwrap();
         assert!(!a.on_unauthorized(&none));
         assert!(!String::from_utf8(a.request("/p")).unwrap().contains("Authorization"));
+    }
+
+    #[test]
+    fn stream_request_is_keep_alive_get() {
+        let mut a = Auth::new(Target::from_rtsp("rtsp://admin:pw@cam/s", 8080).unwrap(), "c0ffee");
+        let first = String::from_utf8(a.stream_request("/camera-cgi/audio/transmit.cgi")).unwrap();
+        assert_eq!(
+            first,
+            "GET /camera-cgi/audio/transmit.cgi HTTP/1.1\r\nHost: cam:8080\r\nContent-Type: application/octet-stream\r\nConnection: Keep-Alive\r\nCache-Control: no-cache\r\n\r\n"
+        );
+        let r401 = parse_response(b"HTTP/1.1 401 x\r\nWWW-Authenticate: Digest realm=\"cam\", nonce=\"n1\", qop=\"auth\"\r\n\r\n").unwrap();
+        assert!(a.on_unauthorized(&r401));
+        let second = String::from_utf8(a.stream_request("/camera-cgi/audio/transmit.cgi")).unwrap();
+        assert!(second.starts_with("GET ") && second.contains("Authorization: Digest username=\"admin\""), "{second}");
     }
 
     #[test]
