@@ -33,11 +33,14 @@ function Tree([string]$d) {
     $kids = (Get-ChildItem -Directory -Path $d | ForEach-Object { Tree $_.FullName }) -join ''
     "<Directory Id=`"$($ids[$d])`" Name=`"$(& $esc (Split-Path -Leaf $d))`">$kids</Directory>"
 }
+# HKCU の KeyPath の部品は WiX が GUID を自動で決めないので、フォルダの相対パスから決まる GUID にする (版をまたいで同じ)
+$md5 = [Security.Cryptography.MD5]::Create()
 $comps = foreach ($d in $dirs) {
     $id = $ids[$d]
     $rel = [IO.Path]::GetRelativePath($root, $d).Replace('\', '/')
+    $guid = [guid]::new($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes("alc-cam/extension/$rel"))).ToString().ToUpper()
     $files = (Get-ChildItem -File -Path $d | ForEach-Object { "<File Source=`"$(& $esc $_.FullName)`" />" }) -join ''
-    "<Component Id=`"C_$id`" Directory=`"$id`" NeverOverwrite=`"yes`">" +
+    "<Component Id=`"C_$id`" Directory=`"$id`" Guid=`"$guid`" NeverOverwrite=`"yes`">" +
     "<RegistryValue Root=`"HKCU`" Key=`"Software\ippoan\alc-cam\Installed`" Name=`"extension:$(& $esc $rel) [ProductVersion]`" Type=`"integer`" Value=`"1`" KeyPath=`"yes`" />" +
     "<RemoveFolder Id=`"R_$id`" On=`"uninstall`" />$files</Component>"
 }

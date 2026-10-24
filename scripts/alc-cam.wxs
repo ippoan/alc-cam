@@ -39,7 +39,7 @@
     </Feature>
 
     <!-- 登録 (自己更新は触らないので修復してよい) -->
-    <Component Id="Registration" Directory="INSTALLFOLDER">
+    <Component Id="Registration" Directory="INSTALLFOLDER" Guid="B0CF3B7D-4978-44FE-931A-D18DC3DB92DA">
       <File Id="HostManifest" Source="$(var.HostManifest)" Name="org.ippoan.alc_cam_host.json" />
       <RegistryKey Root="HKCU" Key="Software\Google\Chrome\NativeMessagingHosts\org.ippoan.alc_cam_host" ForceDeleteOnUninstall="yes">
         <RegistryValue Type="string" Value="[#HostManifest]" KeyPath="yes" />
@@ -52,7 +52,7 @@
     </Component>
 
     <!-- host (自己更新が書き換える) -->
-    <Component Id="HostExe" Directory="INSTALLFOLDER" NeverOverwrite="yes">
+    <Component Id="HostExe" Directory="INSTALLFOLDER" Guid="E3FBA599-20C8-42CF-922E-7B937508080A" NeverOverwrite="yes">
       <File Id="HostExe" Source="$(var.HostExe)" Name="alc-cam-host.exe" />
       <RegistryValue Root="HKCU" Key="Software\ippoan\alc-cam\Installed" Name="host [ProductVersion]" Type="integer" Value="1" KeyPath="yes" />
     </Component>
