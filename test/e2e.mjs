@@ -55,7 +55,7 @@ const camera = startFakeRtsp({ host: lanIp, port: 8554, user: CAM_USER, pass: CA
 const cgi = startFakeCgi({ host: lanIp, port: CGI_PORT, user: CAM_USER, pass: CAM_PASS });
 process.env.ALC_CAM_HTTP_PORT = String(CGI_PORT);
 // 担当カメラ (DB の写し)。rtsp は ingest の /cameras/mine と同じ形
-const camEntry = (id) => ({ id, name: `カメラ ${id}`, rtsp: { host: lanIp, port: 8554, path: '/stream2', username: CAM_USER, password: CAM_PASS } });
+const camEntry = (id) => ({ id, name: `カメラ ${id}`, rtsp: { host: lanIp, port: 8554, path: 'stream2', username: CAM_USER, password: CAM_PASS } });
 const mine = { tokens: [], cameras: [] };
 const signaling = startSignaling({ port: SIG_PORT, v1Sites: ['v1-site'], mine });
 // 鍵の見た目だけ JWT (拡張は形を確かめる)
