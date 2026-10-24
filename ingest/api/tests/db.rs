@@ -1165,8 +1165,9 @@ async fn cron_failures_are_recorded_and_not_retried() {
     let cam2 = recording_camera(&mut pg, t, &["prod-1"]).await;
     let mut fake = Fake { files: files.clone(), fail_cut: true, ..Default::default() };
     let o = run_camera(&mut pg, t, &AutoCamera { id: cam2, scanned_until_ms: Some(T) }, &mut fake, T + 700 * S, 40).await.unwrap();
-    assert_eq!((o.ready, o.failed), (0, 3));
-    assert!(clips_of(t, cam2).await.iter().all(|c| c.2 == "failed" && c.3.as_deref() == Some("moov が見つかりません")));
+    // 24 時間前から見るので、録画の前の e0 (録画なしで failed) も入る
+    assert_eq!((o.ready, o.failed), (0, 4));
+    assert!(clips_of(t, cam2).await.iter().skip(1).all(|c| c.2 == "failed" && c.3.as_deref() == Some("moov が見つかりません")));
 
     // 一覧が取れない → 何も残さず、走査済みも進めない
     let cam3 = recording_camera(&mut pg, t, &["prod-1"]).await;
@@ -1181,7 +1182,27 @@ async fn cron_failures_are_recorded_and_not_retried() {
     // 上限: 1 本だけ切って、残りの頭から次の回
     let cam4 = recording_camera(&mut pg, t, &["prod-1"]).await;
     let mut fake = Fake { files, ..Default::default() };
-    let o = run_camera(&mut pg, t, &AutoCamera { id: cam4, scanned_until_ms: Some(T) }, &mut fake, T + 700 * S, 1).await.unwrap();
-    assert_eq!((o.ready, o.deferred), (1, 2));
+    let o = run_camera(&mut pg, t, &AutoCamera { id: cam4, scanned_until_ms: Some(T) }, &mut fake, T + 700 * S, 2).await.unwrap();
+    assert_eq!((o.ready, o.failed, o.deferred), (1, 1, 2));
     assert_eq!(scanned_until(t, cam4).await, Some(T + 140 * S));
+}
+
+#[tokio::test]
+async fn cron_picks_events_that_arrived_after_the_scanned_until() {
+    let t = tenant().await;
+    let su = admin().await;
+    let mut pg = rt().await;
+    let cam = recording_camera(&mut pg, t, &["prod-1"]).await;
+    // 走査済みが 12:10:00 まで進んだあとに、それより前の発生時刻 (12:01:40) のイベントが遅れて届いた
+    let late = hub_event(&su, t, "prod-1", "alcohol", Some(T + 100 * S), T + 100 * S, false).await;
+    pg::set_scanned_until(&mut pg, t, cam, T + 600 * S).await.unwrap();
+    let mut fake = Fake { files: vec![sd(0, true), sd(240, true), sd(480, false)], ..Default::default() };
+    let c = AutoCamera { id: cam, scanned_until_ms: scanned_until(t, cam).await };
+    let o = run_camera(&mut pg, t, &c, &mut fake, T + 700 * S, 40).await.unwrap();
+    assert_eq!((o.events, o.ready, o.failed, o.deferred), (1, 1, 0, 0), "{}", o.line());
+    assert_eq!(clips_of(t, cam).await, vec![(90, 110, "ready".into(), None)]);
+    assert_eq!(clip_events_of(t, cam).await, vec![(late, false, 90)]);
+    // 次の回は拾い直さない
+    let o = run_camera(&mut pg, t, &c, &mut fake, T + 800 * S, 40).await.unwrap();
+    assert_eq!((o.events, o.ready), (0, 0));
 }
