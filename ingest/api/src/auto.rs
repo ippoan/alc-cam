@@ -1,7 +1,9 @@
 //! cron (1 時間ごと) の自動切り出し: 結び付けた端末のイベントの前後 10 秒を、カメラの SD 録画から切って R2 に置く。
 //!
 //! 1 カメラ分の流れ ([`run_camera`]):
-//! 1. 走査の範囲 `[from, upper)` — `from = rec_scanned_until` (NULL なら `now - 2 時間`)、`upper = now`
+//! 1. 走査の範囲 `[from, upper)` — `from = now - 24 時間` ([`LATE_LOOKBACK_MS`])、`upper = now`。遅れて届いた記録 (端末の回線断で
+//!    キューに溜まった分。発生時刻は過去) も拾うため、`rec_scanned_until` は範囲に使わない。重複は `cam_clip_events` で防ぐ。
+//!    24 時間を超えて届かなかった記録、24 時間を超えて次の回へ回され続けたまとまりは拾わない (SD の上書きと 1 回の一覧の量の上限として受け入れる)
 //! 2. その範囲のイベント (本番の行と開発端末の行。`cam_clip_events` に在るものは除く。[`pg::auto_events`])
 //! 3. 各イベントの `[t - 10 秒, t + 10 秒]` を、重なる・接するものは 1 本にまとめる ([`group_events`])
 //! 4. SD の一覧を取り、閉じたファイルが覆う終わり ([`closed_until`]) までのまとまりだけを切る。越えるまとまりと
@@ -10,7 +12,7 @@
 //! 5. まとまりごとに、かかる SD ファイルを R2 へ (1 回の中で 1 ファイル 1 回だけ取り寄せる) → 切る → `cam_clips` に
 //!    1 行 (ready / failed) → `cam_clip_events` にイベントを 1 行ずつ。失敗しても再試行しない (failed の行とイベントが残る)
 //! 6. `rec_scanned_until` を、次の回へ回したまとまりがあればその頭 (最初のイベント - 10 秒)、無ければ `upper` にする。
-//!    SD の一覧が取れなかった回は進めない (次の回に同じ範囲から見直す)
+//!    画面の「走査済み」の表示用で、次の回の範囲は決めない。SD の一覧が取れなかった回は進めない
 //!
 //! カメラと R2 は [`Recorder`] の向こう (Worker が実装し、tests/ は差し替える)。
 
@@ -26,8 +28,8 @@ use crate::{clip_r2_key, pg};
 pub const PAD_MS: i64 = 10_000;
 /// 1 回で切るまとまりのカメラあたりの上限の既定 (vars `AUTO_CLIP_MAX_GROUPS`)
 pub const DEFAULT_MAX_GROUPS: usize = 40;
-/// `rec_scanned_until` が NULL (初回) のとき、どこから見るか
-pub const FIRST_LOOKBACK_MS: i64 = 2 * 3_600_000;
+/// 遅れて届いた記録 (端末の回線断でキューに溜まった分) も拾うため、発生時刻が過去 24 時間のものを毎回見る
+pub const LATE_LOOKBACK_MS: i64 = 24 * 3_600_000;
 /// SD の一覧を、最初のまとまりの頭よりどれだけ前から見るか (頭にかかるファイルはそれより前に始まる。
 /// サブストリームの 1 本は長いので 1 時間のフォルダを 1 つ余分に見る)。手動の切り出しも同じ値を使う
 pub const LIST_LEAD_MS: i64 = 3_600_000;
@@ -161,8 +163,8 @@ pub fn plan(groups: Vec<Group>, closed_until: Option<i64>, max_groups: usize, up
 }
 
 /// 走査の範囲 `[from, upper)`
-pub fn scan_range(scanned_until_ms: Option<i64>, now_ms: i64) -> (i64, i64) {
-    (scanned_until_ms.unwrap_or(now_ms - FIRST_LOOKBACK_MS), now_ms)
+pub fn scan_range(now_ms: i64) -> (i64, i64) {
+    (now_ms - LATE_LOOKBACK_MS, now_ms)
 }
 
 /// カメラと R2 (Worker が実装する。wasm では JS の値を持つので `Send` を求めない)
@@ -241,7 +243,7 @@ pub async fn run_camera<R: Recorder>(
     max_groups: usize,
 ) -> Result<Outcome, tokio_postgres::Error> {
     let mut out = Outcome::default();
-    let (from, upper) = scan_range(cam.scanned_until_ms, now_ms);
+    let (from, upper) = scan_range(now_ms);
     if from >= upper {
         return Ok(out);
     }
@@ -426,8 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_range_starts_two_hours_back_the_first_time() {
-        assert_eq!(scan_range(None, 10_000_000), (10_000_000 - FIRST_LOOKBACK_MS, 10_000_000));
-        assert_eq!(scan_range(Some(9_000_000), 10_000_000), (9_000_000, 10_000_000));
+    fn scan_range_always_looks_24_hours_back() {
+        assert_eq!(scan_range(100_000_000), (100_000_000 - LATE_LOOKBACK_MS, 100_000_000));
     }
 }

@@ -35,16 +35,17 @@ GET   /api/cam-clips/events?camera_id=<uuid>&date=2026-10-23   (JST の 1 日)
 と `ingest/src/auto.rs` (カメラと R2)。
 
 - テナント (`list_cam_recording_tenant_ids()`) → `rec_ip IS NOT NULL` のカメラの順に巡る
-- 範囲は `[rec_scanned_until (NULL なら 2 時間前), now)`。結び付けた端末 (`cam_camera_devices`) の `hub_measurements`
+- 範囲は `[now - 24 時間, now)` (`rec_scanned_until` は使わない。端末の回線断でキューに溜まって遅れて届いた記録も拾うため)。結び付けた端末 (`cam_camera_devices`) の `hub_measurements`
   (alcohol / blood_pressure / timecard / license、時刻は `COALESCE(recorded_at, created_at)`) と `vein_enroll_events` を、
-  本番の行と開発端末の行 (`app.device_dev='1'` の transaction) の両方から拾う。`cam_clip_events` に在るものは除く
+  本番の行と開発端末の行 (`app.device_dev='1'` の transaction) の両方から拾う。`cam_clip_events` に在るものは除く (重複はこれで防ぐ)。
+  24 時間を超えて届かなかった記録、24 時間を超えて次の回へ回され続けたまとまりは拾わない (SD の上書きと 1 回の一覧の量の上限として受け入れる)
 - 各イベントの前後 10 秒。重なる・接する窓は 1 本にまとめる
 - 切ってよいのは、まとまりの終わりが SD の一覧の「最後の閉じたファイルの終わり」(= 一覧で次のファイル、書き込み途中の
   `_!` を含む、の開始。後ろに何も無ければその開始) 以内のときだけ。越えたまとまりと以降、カメラあたり
-  `AUTO_CLIP_MAX_GROUPS` (40) を超えた分は次の回へ回し、`rec_scanned_until` をその頭 (最初のイベント - 10 秒) にする
+  `AUTO_CLIP_MAX_GROUPS` (40) を超えた分は次の回へ回し (次の回も同じ 24 時間から見直す)、画面の「走査済み」(`rec_scanned_until`) をその頭 (最初のイベント - 10 秒) にする
 - 同じ SD ファイルにかかるまとまりは R2 の元ファイルを使い回す (1 回の中で取り寄せは 1 ファイル 1 回)
 - R2 → `cam_clips` (ready / failed) → `cam_clip_events` の順に書く。失敗しても再試行しない
-- SD の一覧が取れなかった回は何も書かず、`rec_scanned_until` も進めない
+- SD の一覧が取れなかった回は何も書かず、`rec_scanned_until` (表示用) も進めない
 
 - 時刻は ISO 8601。時差が無ければ JST。1 回 120 分まで (`MAX_CLIP_SECS`)。同じ時間帯は作り直さず 200 で返す。
   結果 (ready / failed) は `cam_clips` に残す
