@@ -494,6 +494,66 @@ async fn candidates_in_axis(
     .await
 }
 
+/// 端末の鍵の状態の 1 行 (畳んだ端末 × 軸。直近 days 日の件数)。`device_id` が `None` の行は端末 ID の無い測定
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyStatus {
+    pub device_id: Option<String>,
+    /// 鍵の ID (`alarm:`) で入った hub_measurements の行数
+    pub hub_via_key: i64,
+    /// hub の ID で入った hub_measurements の行数 (鍵の行に畳まれた分と、結び付きの無い hub の分)
+    pub hub_hub_id: i64,
+    /// measurements (完了のアルコールと血圧のイベント) の行数
+    pub measurements: i64,
+    pub vein_enroll: i64,
+    /// hub_measurements のうち kind が timecard の行数 (`hub_via_key` + `hub_hub_id` の内数)
+    pub timecard: i64,
+    pub last_at_ms: i64,
+    pub is_dev: bool,
+}
+impl TxOutput for KeyStatus {}
+
+/// 直近 `days` 日の端末ごとの記録の件数 (鍵の ID で入ったか hub の ID で入ったかを分けて、新しい順)。
+/// 束ね方・結び付き・軸の流し方は [`device_candidates`] と同じ (本番の軸と開発端末の軸を別の transaction で)。
+/// 候補と違い `alarm:` 以外の ID も、端末 ID の無い測定 (`device_id = None`) も返す
+pub async fn device_key_status(pg: &mut PgClient, tenant: Uuid, days: i32) -> Result<Vec<KeyStatus>, Error> {
+    let mut all = key_status_in_axis(pg, tenant, days, false).await?;
+    all.extend(key_status_in_axis(pg, tenant, days, true).await?);
+    all.sort_by(|a, b| {
+        b.last_at_ms
+            .cmp(&a.last_at_ms)
+            .then_with(|| a.device_id.cmp(&b.device_id))
+            .then_with(|| a.is_dev.cmp(&b.is_dev))
+    });
+    Ok(all)
+}
+
+async fn key_status_in_axis(pg: &mut PgClient, tenant: Uuid, days: i32, is_dev: bool) -> Result<Vec<KeyStatus>, Error> {
+    pg.tenant_tx(tenant, move |tx| {
+        Box::pin(async move {
+            if is_dev {
+                tx.query_typed(SET_DEVICE_DEV, &[]).await?;
+            }
+            let rows = tx
+                .query_typed(SELECT_KEY_STATUS, &[(&tenant, Type::UUID), (&days, Type::INT4)])
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| KeyStatus {
+                    device_id: r.get(0),
+                    hub_via_key: r.get(1),
+                    hub_hub_id: r.get(2),
+                    measurements: r.get(3),
+                    vein_enroll: r.get(4),
+                    timecard: r.get(5),
+                    last_at_ms: r.get(6),
+                    is_dev,
+                })
+                .collect())
+        })
+    })
+    .await
+}
+
 /// 切り出しに要るカメラの値。無ければ `None`
 pub async fn clip_source(
     pg: &mut PgClient,
@@ -598,15 +658,30 @@ pub async fn recording_cameras(pg: &mut PgClient, tenant: Uuid) -> Result<Vec<Re
 /// measurements は `device_id IS NOT NULL` の行だけ (`measurements` = status completed のアルコール、時刻 measured_at /
 /// `measurements_bp` = systolic と medical_measured_at のある血圧)。同じ (畳んだ) 端末・同じ kind の hub_measurements が
 /// ±60 秒に在れば measurements 側は出さない (CoreS3 の PC で同じ測定が 2 回出るため)
+///
+/// 3 つ目の引数 `all` は端末の鍵の状態の口 ([`device_key_status`]) 用の形: measurements の重複落としをせず
+/// (行数をそのまま数える)、`device_id` が NULL の行 (管理者ログイン・無認証の経路) も NULL の端末として出す。
+/// `ev` には畳む前の ID (`raw_device_id`) も出す (鍵の ID で入った行と hub の ID で入った行を分けて数えるため)
 macro_rules! events_cte {
     ($lo:literal, $hi:literal) => {
+        events_cte!(
+            @ $lo, $hi,
+            "AND m.device_id IS NOT NULL",
+            dedupe!("alcohol", "m.measured_at"),
+            dedupe!("blood_pressure", "m.medical_measured_at")
+        )
+    };
+    ($lo:literal, $hi:literal, all) => {
+        events_cte!(@ $lo, $hi, "", "true", "true")
+    };
+    (@ $lo:literal, $hi:literal, $nn:literal, $dd_a:expr, $dd_b:expr) => {
         concat!(
             "WITH link AS (",
             link_select!(),
             "),
 ev AS (
     SELECT 'hub_measurements'::text AS source_table, h.id, h.kind, COALESCE(h.recorded_at, h.created_at) AS at,
-           COALESCE(l.key_id, h.device_id) AS device_id
+           COALESCE(l.key_id, h.device_id) AS device_id, h.device_id AS raw_device_id
       FROM alc_api.hub_measurements h
       LEFT JOIN link l ON l.hub_id = h.device_id
      WHERE h.tenant_id = $1
@@ -614,28 +689,28 @@ ev AS (
        AND COALESCE(h.recorded_at, h.created_at) >= ", $lo, "
        AND COALESCE(h.recorded_at, h.created_at) < ", $hi, "
     UNION ALL
-    SELECT 'vein_enroll_events', v.id, 'vein_enroll', v.created_at, COALESCE(l.key_id, v.registered_device_id)
+    SELECT 'vein_enroll_events', v.id, 'vein_enroll', v.created_at, COALESCE(l.key_id, v.registered_device_id), v.registered_device_id
       FROM alc_api.vein_enroll_events v
       LEFT JOIN link l ON l.hub_id = v.registered_device_id
      WHERE v.tenant_id = $1 AND v.registered_device_id IS NOT NULL
        AND v.created_at >= ", $lo, "
        AND v.created_at < ", $hi, "
     UNION ALL
-    SELECT 'measurements', m.id, 'alcohol', m.measured_at, COALESCE(l.key_id, m.device_id)
+    SELECT 'measurements', m.id, 'alcohol', m.measured_at, COALESCE(l.key_id, m.device_id), m.device_id
       FROM alc_api.measurements m
       LEFT JOIN link l ON l.hub_id = m.device_id
-     WHERE m.tenant_id = $1 AND m.status = 'completed' AND m.device_id IS NOT NULL
+     WHERE m.tenant_id = $1 AND m.status = 'completed' ", $nn, "
        AND m.measured_at >= ", $lo, "
        AND m.measured_at < ", $hi, "
-       AND ", dedupe!("alcohol", "m.measured_at"), "
+       AND ", $dd_a, "
     UNION ALL
-    SELECT 'measurements_bp', m.id, 'blood_pressure', m.medical_measured_at, COALESCE(l.key_id, m.device_id)
+    SELECT 'measurements_bp', m.id, 'blood_pressure', m.medical_measured_at, COALESCE(l.key_id, m.device_id), m.device_id
       FROM alc_api.measurements m
       LEFT JOIN link l ON l.hub_id = m.device_id
-     WHERE m.tenant_id = $1 AND m.systolic IS NOT NULL AND m.medical_measured_at IS NOT NULL AND m.device_id IS NOT NULL
+     WHERE m.tenant_id = $1 AND m.systolic IS NOT NULL AND m.medical_measured_at IS NOT NULL ", $nn, "
        AND m.medical_measured_at >= ", $lo, "
        AND m.medical_measured_at < ", $hi, "
-       AND ", dedupe!("blood_pressure", "m.medical_measured_at"), "
+       AND ", $dd_b, "
 )
 "
         )
@@ -677,6 +752,24 @@ const SELECT_CANDIDATES: &str = concat!(
        (extract(epoch FROM max(ev.at)) * 1000)::int8
   FROM ev
  WHERE ev.device_id LIKE 'alarm:%'
+ GROUP BY ev.device_id
+ ORDER BY max(ev.at) DESC, ev.device_id"
+);
+
+/// 端末の鍵の状態の集計 ([`device_key_status`])。イベントは [`events_cte!`] の `all` 形 (直近 `$2` 日)。
+/// 畳んだ端末ごとに、hub_measurements を鍵の ID で入った行 (畳む前の ID が `alarm:`) と hub の ID で入った行
+/// (畳まれた行と結び付きの無い行) に分け、measurements (アルコール + 血圧)・vein_enroll・timecard
+/// (hub_measurements の内数) を数える。`device_id` が NULL の組は端末 ID の無い測定
+const SELECT_KEY_STATUS: &str = concat!(
+    events_cte!("now() - make_interval(days => $2)", "'infinity'::timestamptz", all),
+    "SELECT ev.device_id,
+       count(*) FILTER (WHERE ev.source_table = 'hub_measurements' AND ev.raw_device_id LIKE 'alarm:%'),
+       count(*) FILTER (WHERE ev.source_table = 'hub_measurements' AND ev.raw_device_id NOT LIKE 'alarm:%'),
+       count(*) FILTER (WHERE ev.source_table IN ('measurements', 'measurements_bp')),
+       count(*) FILTER (WHERE ev.source_table = 'vein_enroll_events'),
+       count(*) FILTER (WHERE ev.source_table = 'hub_measurements' AND ev.kind = 'timecard'),
+       (extract(epoch FROM max(ev.at)) * 1000)::int8
+  FROM ev
  GROUP BY ev.device_id
  ORDER BY max(ev.at) DESC, ev.device_id"
 );

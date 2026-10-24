@@ -1794,3 +1794,154 @@ async fn camera_device_ids_are_folded_and_pending_ones_are_reported() {
     let (_, none) = call(&mut pg, &cam_host(t, "hub-1"), "GET", "/cameras/mine", "", Value::Null).await;
     assert_eq!(none["cameras"].as_array().unwrap().len(), 0);
 }
+
+// ---- 端末の鍵の状態 (GET /device-key-status) ----
+
+/// 応答の端末の行を (device_id, is_dev, kind, counts) の並びにする
+fn status_rows(body: &Value) -> Vec<(String, bool, String, Value)> {
+    body["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["device_id"].as_str().unwrap().to_owned(), r["is_dev"].as_bool().unwrap(), r["kind"].as_str().unwrap().to_owned(), r["counts"].clone()))
+        .collect()
+}
+
+fn status_counts(via_key: i64, hub_id: i64, measurements: i64, vein_enroll: i64, timecard: i64) -> Value {
+    json!({"hub_measurements_via_key": via_key, "hub_measurements_hub_id": hub_id, "measurements": measurements, "vein_enroll": vein_enroll, "timecard": timecard})
+}
+
+#[tokio::test]
+async fn key_status_classifies_folds_and_counts_within_the_period() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let su = admin().await;
+    let n = now_ms();
+    let h = 3_600 * S;
+    let d = 24 * h;
+    let (key, key2, hub) = ("alarm:aaaa0001", "alarm:bbbb0002", "cores3-a");
+
+    // 鍵の ID で入った行 (結び付きの元 = アルコール 1 件・打刻 1 件)
+    hub_event_via(&su, t, key, Some(hub), "alcohol", Some(n - h), n - h, false).await;
+    hub_event_via(&su, t, key, Some(hub), "timecard", Some(n - h / 3), n - h / 3, false).await;
+    // 結び付いた hub の ID で入った行 (鍵の行に畳まれ、hub_id 側に数える)。打刻はその内数
+    hub_event(&su, t, hub, "alcohol", Some(n - 2 * h), n - 2 * h, false).await;
+    hub_event(&su, t, hub, "timecard", Some(n - h / 2), n - h / 2, false).await;
+    vein_event(&su, t, hub, n - 5 * h, false).await;
+    // 期間 (7 日) の外
+    hub_event(&su, t, key, "alcohol", Some(n - 8 * d), n - 8 * d, false).await;
+    // measurements: 完了のアルコール・同じ行の血圧・hub の行と ±60 秒の重複 (候補では落とすがここでは数える)。started は数えない
+    measurement(&su, t, Some(key), "completed", n - 3 * h, None, false).await;
+    measurement(&su, t, Some(key), "started", n - 3 * h, None, false).await;
+    measurement(&su, t, Some(key), "completed", n - 4 * h, Some((n - 4 * h, Some(120))), false).await;
+    measurement(&su, t, Some(key), "completed", n - h + 20 * S, None, false).await;
+    // 測定だけの鍵
+    measurement(&su, t, Some(key2), "completed", n - 6 * h, None, false).await;
+    // 結び付きの無い hub (ファーム未更新)・ブラウザ・自己ペアの credential (測定にも出る)
+    hub_event(&su, t, "cores3-z", "alcohol", Some(n - h), n - h, false).await;
+    hub_event(&su, t, "browser", "timecard", Some(n - h), n - h, false).await;
+    hub_event(&su, t, "kiosk-3f9c2a", "license", Some(n - h), n - h, false).await;
+    vein_event(&su, t, "kiosk-3f9c2a", n - h, false).await;
+    // 端末 ID の無い測定 (アルコール + 血圧で 2 件)・期間の外の 1 件
+    measurement(&su, t, None, "completed", n - h, Some((n - h, Some(130))), false).await;
+    measurement(&su, t, None, "completed", n - 10 * d, None, false).await;
+    // 他テナント
+    hub_event_via(&su, other, "alarm:other0003", Some(hub), "alcohol", Some(n - h), n - h, false).await;
+    hub_event(&su, other, "cores3-other", "timecard", Some(n - h), n - h, false).await;
+    measurement(&su, other, None, "completed", n - h, None, false).await;
+
+    let mut pg = rt().await;
+    let (s, body) = call(&mut pg, &caller(t, false), "GET", "/device-key-status", "", Value::Null).await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["days"], 7);
+    assert_eq!(
+        status_rows(&body),
+        vec![
+            // 鍵 via 2 (アルコール・打刻) / hub の ID 2 (畳まれた旧行) / measurements 4 (重複も数える・血圧込み) / 指静脈 1 / 打刻 2 (via 1 + hub 1)
+            (key.to_owned(), false, "machine_key".to_owned(), status_counts(2, 2, 4, 1, 2)),
+            // last_at が同じ (n - h) の 3 行は device_id の昇順
+            ("browser".to_owned(), false, "browser".to_owned(), status_counts(0, 1, 0, 0, 1)),
+            ("cores3-z".to_owned(), false, "hub_unlinked".to_owned(), status_counts(0, 1, 0, 0, 0)),
+            ("kiosk-3f9c2a".to_owned(), false, "credential".to_owned(), status_counts(0, 1, 0, 1, 0)),
+            (key2.to_owned(), false, "machine_key".to_owned(), status_counts(0, 0, 1, 0, 0)),
+        ]
+    );
+    assert!(body["devices"][0]["last_at"].as_str().unwrap().ends_with("+09:00"));
+    assert_eq!(body["unattributed"]["measurements"], 2);
+    assert!(body["unattributed"]["last_at"].as_str().unwrap().ends_with("+09:00"));
+
+    // 期間を広げると外の行も入る (via_key の旧アルコール 1 件 = 8 日前・端末 ID の無い測定 1 件 = 10 日前)
+    let (s, wide) = call(&mut pg, &caller(t, false), "GET", "/device-key-status", "days=30", Value::Null).await;
+    assert_eq!(s, 200, "{wide}");
+    assert_eq!(wide["days"], 30);
+    assert_eq!(status_rows(&wide)[0].3, status_counts(3, 2, 4, 1, 2));
+    assert_eq!(wide["unattributed"]["measurements"], 3);
+
+    // 他テナントは自分の分だけ (結び付きも混ざらない: この hub の ID は鍵に畳まれない)
+    let (_, o) = call(&mut pg, &caller(other, false), "GET", "/device-key-status", "", Value::Null).await;
+    assert_eq!(
+        status_rows(&o),
+        vec![
+            ("alarm:other0003".to_owned(), false, "machine_key".to_owned(), status_counts(1, 0, 0, 0, 0)),
+            ("cores3-other".to_owned(), false, "hub_unlinked".to_owned(), status_counts(0, 1, 0, 0, 1)),
+        ]
+    );
+    assert_eq!(o["unattributed"]["measurements"], 1);
+}
+
+#[tokio::test]
+async fn key_status_with_no_rows_is_empty() {
+    let t = tenant().await;
+    let mut pg = rt().await;
+    let (s, body) = call(&mut pg, &caller(t, false), "GET", "/device-key-status", "", Value::Null).await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body, json!({"days": 7, "devices": [], "unattributed": {"measurements": 0, "last_at": null}}));
+}
+
+#[tokio::test]
+async fn key_status_does_not_cross_the_is_dev_axis() {
+    let t = tenant().await;
+    let su = admin().await;
+    let n = now_ms();
+    let h = 3_600 * S;
+    // 本番の軸の結び付き (hub-p → 鍵 p) と開発端末の軸の hub-p の旧行 (畳まれない)
+    hub_event_via(&su, t, "alarm:prod0001", Some("hub-p"), "alcohol", Some(n - h), n - h, false).await;
+    hub_event(&su, t, "hub-p", "timecard", Some(n - h), n - h, true).await;
+    // 開発端末の軸の結び付き (hub-d → 鍵 d) と本番の軸の hub-d の旧行
+    hub_event_via(&su, t, "alarm:dev00002", Some("hub-d"), "alcohol", Some(n - h), n - h, true).await;
+    hub_event(&su, t, "hub-d", "timecard", Some(n - h), n - h, false).await;
+    // 端末 ID の無い測定は軸をまたいで合算
+    measurement(&su, t, None, "completed", n - h, None, false).await;
+    measurement(&su, t, None, "completed", n - h, None, true).await;
+
+    let mut pg = rt().await;
+    let (s, body) = call(&mut pg, &caller(t, false), "GET", "/device-key-status", "", Value::Null).await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(
+        status_rows(&body),
+        vec![
+            ("alarm:dev00002".to_owned(), true, "machine_key".to_owned(), status_counts(1, 0, 0, 0, 0)),
+            ("alarm:prod0001".to_owned(), false, "machine_key".to_owned(), status_counts(1, 0, 0, 0, 0)),
+            ("hub-d".to_owned(), false, "hub_unlinked".to_owned(), status_counts(0, 1, 0, 0, 1)),
+            ("hub-p".to_owned(), true, "hub_unlinked".to_owned(), status_counts(0, 1, 0, 0, 1)),
+        ]
+    );
+    assert_eq!(body["unattributed"]["measurements"], 2);
+}
+
+#[tokio::test]
+async fn key_status_checks_days_and_is_admin_only() {
+    let t = tenant().await;
+    let mut pg = rt().await;
+    for q in ["days=0", "days=91", "days=abc"] {
+        let (s, _) = call(&mut pg, &caller(t, false), "GET", "/device-key-status", q, Value::Null).await;
+        assert_eq!(s, 400, "{q}");
+    }
+    let (s, _) = call(&mut pg, &caller(t, false), "GET", "/device-key-status", "days=90", Value::Null).await;
+    assert_eq!(s, 200);
+    // 運行管理者席の鍵・cam-host の鍵は 403
+    let (s, _) = call(&mut pg, &tenko_manager(t), "GET", "/device-key-status", "", Value::Null).await;
+    assert_eq!(s, 403);
+    let (s, _) = call(&mut pg, &cam_host(t, "alarm:host0001"), "GET", "/device-key-status", "", Value::Null).await;
+    assert_eq!(s, 403);
+}

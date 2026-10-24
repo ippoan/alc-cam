@@ -34,6 +34,8 @@ use crate::pg::{CameraRow, Change, MyCamera, NewCamera, PatchCamera, UpdateOutco
 
 /// 端末の候補を集計する日数の既定と上限
 pub const DEFAULT_DAYS: i32 = 30;
+/// 端末の鍵の状態 (`GET /device-key-status`) の既定の日数 (上限は同じ [`MAX_DAYS`])
+pub const DEFAULT_KEY_STATUS_DAYS: i32 = 7;
 pub const MAX_DAYS: i32 = 90;
 /// 結び付ける端末の数の上限・端末 id の長さの上限
 const MAX_DEVICES: usize = 50;
@@ -149,6 +151,10 @@ pub enum Op {
     CreateCamera(CameraInput),
     UpdateCamera(Uuid, CameraPatchInput),
     DeviceCandidates {
+        days: i32,
+    },
+    /// 拠点ごとに「どの鍵で記録が来ているか」(管理者だけ。[`key_status_json`])
+    DeviceKeyStatus {
         days: i32,
     },
     CreateClip {
@@ -462,10 +468,10 @@ fn camera_patch(body: &str) -> Result<CameraPatchInput, ApiError> {
     })
 }
 
-fn days_of(query: &str) -> Result<i32, ApiError> {
+fn days_of(query: &str, default: i32) -> Result<i32, ApiError> {
     let raw = query.split('&').find_map(|kv| kv.strip_prefix("days="));
     match raw {
-        None => Ok(DEFAULT_DAYS),
+        None => Ok(default),
         Some(v) => v
             .parse::<i32>()
             .ok()
@@ -562,7 +568,10 @@ pub fn parse(
             Ok(Op::UpdateCamera(id, camera_patch(body)?))
         }
         ("GET", "/device-candidates") => Ok(Op::DeviceCandidates {
-            days: days_of(query)?,
+            days: days_of(query, DEFAULT_DAYS)?,
+        }),
+        ("GET", "/device-key-status") => Ok(Op::DeviceKeyStatus {
+            days: days_of(query, DEFAULT_KEY_STATUS_DAYS)?,
         }),
         ("POST", "/clips") => clip_input(body, max_clip_ms),
         ("POST", "/auto-run") => auto_run_input(body),
@@ -614,6 +623,58 @@ fn camera_json(c: &CameraRow) -> Value {
         "pending_device_ids": c.pending_device_ids,
         "stream_device_ids": c.stream_device_ids,
         "rec_scanned_until": c.rec_scanned_until_ms.map(jst_iso),
+    })
+}
+
+/// 端末の鍵の種類 (`GET /device-key-status` の `kind`)。`device_id` は結び付きで畳んだ後の ID。
+/// - `machine_key`: `alarm:` で始まる (機体の鍵)
+/// - `browser`: `browser`
+/// - `hub_unlinked`: 上の 2 つでなく、hub_measurements にだけ出る ID (結び付きが無い = CoreS3 のファーム未更新)
+/// - `credential`: それ以外 (自己ペアのキオスクの credential の乱数 ID など)
+pub fn key_kind(r: &pg::KeyStatus, device_id: &str) -> &'static str {
+    if device_id.starts_with("alarm:") {
+        "machine_key"
+    } else if device_id == "browser" {
+        "browser"
+    } else if r.hub_via_key + r.hub_hub_id > 0 && r.measurements == 0 && r.vein_enroll == 0 {
+        "hub_unlinked"
+    } else {
+        "credential"
+    }
+}
+
+/// `GET /device-key-status` の応答。軸ごとの行 (`rows`、新しい順に整列済み) から端末の行と `unattributed` を組む。
+/// `device_id` が無い行 (端末 ID の無い測定) は軸をまたいで合算して `unattributed` に入れる (件数の合計・最終時刻の最大)
+pub fn key_status_json(days: i32, rows: &[pg::KeyStatus]) -> Value {
+    let devices: Vec<Value> = rows
+        .iter()
+        .filter_map(|r| {
+            let id = r.device_id.as_deref()?;
+            Some(json!({
+                "device_id": id,
+                "kind": key_kind(r, id),
+                "counts": {
+                    "hub_measurements_via_key": r.hub_via_key,
+                    "hub_measurements_hub_id": r.hub_hub_id,
+                    "measurements": r.measurements,
+                    "vein_enroll": r.vein_enroll,
+                    "timecard": r.timecard,
+                },
+                "last_at": jst_iso(r.last_at_ms),
+                "is_dev": r.is_dev,
+            }))
+        })
+        .collect();
+    let unattributed = rows.iter().filter(|r| r.device_id.is_none());
+    let count: i64 = unattributed.clone().map(|r| r.measurements).sum();
+    let last = unattributed.map(|r| r.last_at_ms).max();
+    json!({
+        "days": days,
+        "devices": devices,
+        "unattributed": {
+            "measurements": count,
+            "last_at": last.map(jst_iso),
+        },
     })
 }
 
@@ -790,6 +851,15 @@ pub async fn execute(
             Ok(Reply {
                 status: 200,
                 body: Value::Array(list),
+            })
+        }
+        Op::DeviceKeyStatus { days } => {
+            let rows = pg::device_key_status(pg, tenant, days)
+                .await
+                .map_err(|e| db_error(&e))?;
+            Ok(Reply {
+                status: 200,
+                body: key_status_json(days, &rows),
             })
         }
         Op::Events {
@@ -1053,6 +1123,7 @@ mod tests {
             ("POST", "/cameras", "", r#"{"name":"入口"}"#),
             ("PATCH", patch.as_str(), "", r#"{"name":"入口"}"#),
             ("GET", "/device-candidates", "", ""),
+            ("GET", "/device-key-status", "", ""),
             ("POST", "/clips", "", clip_body.as_str()),
             ("GET", clip.as_str(), "", ""),
             ("GET", "/events", events.as_str(), ""),
@@ -1132,6 +1203,7 @@ mod tests {
             ("POST", "/cameras", r#"{"name":"入口"}"#),
             ("PATCH", patch.as_str(), r#"{"name":"入口"}"#),
             ("GET", "/device-candidates", ""),
+            ("GET", "/device-key-status", ""),
             ("POST", "/clips", ""),
             ("POST", "/auto-run", ""),
             ("POST", "/cameras/mine", ""),
@@ -1557,6 +1629,89 @@ mod tests {
         assert_eq!(days("days=0"), -400);
         assert_eq!(days("days=91"), -400);
         assert_eq!(days("days=abc"), -400);
+    }
+
+    #[test]
+    fn key_status_days_default_7_and_bounded() {
+        let c = admin(false);
+        let days = |q: &str| match parse("GET", "/device-key-status", q, "", &c, 0) {
+            Ok(Op::DeviceKeyStatus { days }) => days,
+            Ok(_) => unreachable!(),
+            Err(e) => -(e.status as i32),
+        };
+        assert_eq!(days(""), 7);
+        assert_eq!(days("days=1"), 1);
+        assert_eq!(days("x=1&days=90"), 90);
+        assert_eq!(days("days=0"), -400);
+        assert_eq!(days("days=91"), -400);
+        assert_eq!(days("days=abc"), -400);
+        // 候補の口の既定は 30 のまま
+        assert!(matches!(
+            parse("GET", "/device-candidates", "", "", &c, 0),
+            Ok(Op::DeviceCandidates { days: 30 })
+        ));
+        // 管理者以外 (席の鍵・拠点 PC) は 403。POST は 404
+        assert_eq!(status(parse("GET", "/device-key-status", "", "", &tenko_manager(), 0)), 403);
+        assert_eq!(status(parse("GET", "/device-key-status", "", "", &cam_host(), 0)), 403);
+        assert_eq!(status(parse("POST", "/device-key-status", "", "", &c, 0)), 404);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ks(id: Option<&str>, via: i64, hub: i64, m: i64, v: i64, tc: i64, at: i64, dev: bool) -> pg::KeyStatus {
+        pg::KeyStatus {
+            device_id: id.map(str::to_owned),
+            hub_via_key: via,
+            hub_hub_id: hub,
+            measurements: m,
+            vein_enroll: v,
+            timecard: tc,
+            last_at_ms: at,
+            is_dev: dev,
+        }
+    }
+
+    #[test]
+    fn key_kind_is_decided_from_the_folded_id_and_where_it_appears() {
+        let k = |r: &pg::KeyStatus| key_kind(r, r.device_id.as_deref().unwrap());
+        assert_eq!(k(&ks(Some("alarm:aa"), 0, 0, 1, 0, 0, 0, false)), "machine_key");
+        assert_eq!(k(&ks(Some("browser"), 0, 0, 1, 0, 0, 0, false)), "browser");
+        // hub_measurements にだけ出る ID = 結び付きの無い hub
+        assert_eq!(k(&ks(Some("cores3-x"), 0, 5, 0, 0, 2, 0, false)), "hub_unlinked");
+        // 測定や指静脈にも出る ID = credential
+        assert_eq!(k(&ks(Some("rand-1"), 0, 0, 3, 0, 0, 0, false)), "credential");
+        assert_eq!(k(&ks(Some("rand-2"), 0, 0, 0, 1, 0, 0, false)), "credential");
+        assert_eq!(k(&ks(Some("rand-3"), 0, 1, 3, 0, 0, 0, false)), "credential");
+    }
+
+    #[test]
+    fn key_status_json_assembles_devices_and_unattributed() {
+        let rows = [
+            ks(Some("alarm:aa"), 2, 3, 4, 1, 1, 1_760_000_000_000, false),
+            ks(None, 0, 0, 2, 0, 0, 1_760_000_100_000, false),
+            ks(Some("cores3-x"), 0, 5, 0, 0, 2, 1_750_000_000_000, true),
+            ks(None, 0, 0, 1, 0, 0, 1_760_000_200_000, true),
+        ];
+        let v = key_status_json(7, &rows);
+        assert_eq!(v["days"], 7);
+        let d = v["devices"].as_array().unwrap();
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0]["device_id"], "alarm:aa");
+        assert_eq!(d[0]["kind"], "machine_key");
+        assert_eq!(
+            d[0]["counts"],
+            json!({"hub_measurements_via_key": 2, "hub_measurements_hub_id": 3, "measurements": 4, "vein_enroll": 1, "timecard": 1})
+        );
+        assert_eq!(d[0]["last_at"], jst_iso(1_760_000_000_000));
+        assert_eq!(d[0]["is_dev"], false);
+        assert_eq!(d[1]["kind"], "hub_unlinked");
+        assert_eq!(d[1]["is_dev"], true);
+        // 端末 ID の無い行は軸をまたいで合算 (件数の合計・最終時刻の最大)
+        assert_eq!(v["unattributed"]["measurements"], 3);
+        assert_eq!(v["unattributed"]["last_at"], jst_iso(1_760_000_200_000));
+        // 無ければ 0 と null
+        let none = key_status_json(30, &[]);
+        assert_eq!(none["devices"], json!([]));
+        assert_eq!(none["unattributed"], json!({"measurements": 0, "last_at": null}));
     }
 
     #[test]

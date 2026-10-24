@@ -24,6 +24,12 @@ PATCH /api/cam-clips/cameras/{id}            同じ項目 (省略 = 変えない
 GET   /api/cam-clips/cameras/mine            拠点 PC の配信の鍵だけ → {"cameras": [{id, name, rank, rtsp: {host, port, path, username, password} | null}]}
 GET   /api/cam-clips/device-candidates?days=30   直近 days 日 (1〜90) にイベントを出した端末と kind ごとの件数 (行ごとに is_dev: 開発端末の行も軸ごとに読んで返す)。
                                                hub の ID は結び付き (hub_measurements.via_device_id) で鍵の ID に畳み、alarm: の行だけ返す。measurements の測定も数える
+GET   /api/cam-clips/device-key-status?days=7   管理者だけ (運行管理者席の鍵・拠点 PC の鍵・キオスクは 403)。直近 days 日 (1〜90、既定 7) に記録が来た端末と、どの鍵で来ているか →
+                                               {days, devices: [{device_id, kind, counts: {hub_measurements_via_key, hub_measurements_hub_id, measurements, vein_enroll, timecard}, last_at, is_dev}], unattributed: {measurements, last_at}}。
+                                               device_id は結び付きで鍵の ID に畳んだ値。kind = machine_key (alarm:) / hub_unlinked (hub_measurements にだけ出る ID = ファーム未更新) / credential (それ以外の ID) / browser。
+                                               hub_measurements_via_key = 鍵の ID で入った行、hub_measurements_hub_id = hub の ID で入った行 (鍵の行に畳まれた分と結び付きの無い hub)。
+                                               timecard は hub_measurements の内数 (via_key + hub_id の中の打刻)。measurements は重複落としをせず数える (アルコール完了 + 血圧)。
+                                               unattributed = 端末 ID の無い測定 (管理者ログイン・無認証の経路)。軸ごとに読んで is_dev を返す (unattributed は合算)
 POST  /api/cam-clips/clips                   {"camera_id": "...", "from": "2026-10-23T12:58:00+09:00", "to": "2026-10-23T12:59:30+09:00"}
 POST  /api/cam-clips/auto-run                 {} か {"camera_id": "..."} → 200 {"cameras": [...]} (cron と同じ自動切り出しを呼び手のテナントだけで今すぐ回す。camera_id で 1 台に絞れる。dev token では 403)
 → 201 {"clip_id": …, "key": "clips/<tenant>/<camera_id>/20261023T125800_20261023T125930.mp4", "size": …,
