@@ -1945,3 +1945,23 @@ async fn key_status_checks_days_and_is_admin_only() {
     let (s, _) = call(&mut pg, &cam_host(t, "alarm:host0001"), "GET", "/device-key-status", "", Value::Null).await;
     assert_eq!(s, 403);
 }
+
+#[tokio::test]
+async fn test_records_are_cut_but_not_candidates() {
+    // 試験記録 (kind = test、MCP の create_test_record が機体に作らせる。いつも開発の軸) は
+    // 自動切り出しとその日の口には出るが、候補には数えない
+    let t = tenant().await;
+    let su = admin().await;
+    let mut pg = rt().await;
+    let cam = recording_camera(&mut pg, t, &["alarm:t1"]).await;
+    let now = now_ms();
+    let test = hub_event_via(&su, t, "alarm:t1", Some("hub-t1"), "test", Some(now - 60 * S), now - 60 * S, true).await;
+
+    let got = pg::auto_events(&mut pg, t, cam, now - 3600 * S, now).await.unwrap();
+    let seen: Vec<(Uuid, &str, &str, bool)> = got.iter().map(|e| (e.source_id, e.kind.as_str(), e.device_id.as_str(), e.is_dev)).collect();
+    assert_eq!(seen, vec![(test, "test", "alarm:t1", true)]);
+
+    let (s, body) = call(&mut pg, &caller(t, false), "GET", "/device-candidates", "", Value::Null).await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(candidate_rows(&body), vec![]);
+}

@@ -651,7 +651,7 @@ pub async fn recording_cameras(pg: &mut PgClient, tenant: Uuid) -> Result<Vec<Re
     .await
 }
 
-/// イベントの元 (hub_measurements の 4 種・指静脈の登録・measurements のアルコールと血圧)。`$1` テナント。
+/// イベントの元 (hub_measurements の 5 種 (試験記録 `test` を含む。MCP `create_test_record` が機体に作らせ、いつも開発の軸)・指静脈の登録・measurements のアルコールと血圧)。`$1` テナント。
 /// 引数は期間の `[lo, hi)` (timestamptz の式。切り出しは UNIX ms の `$3`/`$4`、候補は直近 `$2` 日)。
 /// 時刻の比較は ms を interval で足す (浮動小数の to_timestamp で境目がずれないように)。
 /// `device_id` は結び付き (`link`: hub の ID → 機体の鍵の ID) で畳んだ値 — hub の ID の行は鍵の ID で出る。
@@ -685,7 +685,7 @@ ev AS (
       FROM alc_api.hub_measurements h
       LEFT JOIN link l ON l.hub_id = h.device_id
      WHERE h.tenant_id = $1
-       AND h.kind IN ('alcohol', 'blood_pressure', 'timecard', 'license')
+       AND h.kind IN ('alcohol', 'blood_pressure', 'timecard', 'license', 'test')
        AND COALESCE(h.recorded_at, h.created_at) >= ", $lo, "
        AND COALESCE(h.recorded_at, h.created_at) < ", $hi, "
     UNION ALL
@@ -740,7 +740,8 @@ macro_rules! camera_devices {
     };
 }
 
-/// 候補の集計。イベントは [`events_cte!`] (直近 `days` 日)。畳んだ後で `alarm:` で始まる ID (機体の鍵) だけ
+/// 候補の集計。イベントは [`events_cte!`] (直近 `days` 日)。畳んだ後で `alarm:` で始まる ID (機体の鍵) だけ。
+/// 試験記録 (`test`) は数えない (候補に出す理由が無い。切り出し・その日の口・鍵の状態には出る)
 const SELECT_CANDIDATES: &str = concat!(
     events_cte!("now() - make_interval(days => $2)", "'infinity'::timestamptz"),
     "SELECT ev.device_id,
@@ -751,7 +752,7 @@ const SELECT_CANDIDATES: &str = concat!(
        count(*) FILTER (WHERE ev.kind = 'vein_enroll'),
        (extract(epoch FROM max(ev.at)) * 1000)::int8
   FROM ev
- WHERE ev.device_id LIKE 'alarm:%'
+ WHERE ev.device_id LIKE 'alarm:%' AND ev.kind <> 'test'
  GROUP BY ev.device_id
  ORDER BY max(ev.at) DESC, ev.device_id"
 );
