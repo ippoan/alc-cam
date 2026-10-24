@@ -13,6 +13,12 @@
 // それでも止まったとき (Chrome の都合・更新) は、状態をメモリに頼らず設定から繋ぎ直す:
 // worker が起きるたびに top level で sync() し、起こす口は onStartup / onInstalled / 30 秒ごとの alarm / 設定の変更。
 //
+// 何をどこへ配るか (拠点 ID = 担当カメラの id、RTSP URL) は手で入れない: 点呼の PWA (alc.ippoan.org) が
+// chrome.runtime.sendMessage で渡す鍵 (role=device-cam-host、TTL 900 秒) で担当カメラを引く (lib/config.js)。
+// 鍵はメモリにだけ持ち、cam-room に入るときに ?token= で付ける (鍵の更新では今の接続を切らず、次に繋ぐときに使う)。
+// 担当カメラの写し (パスワード以外) は storage.local、パスワードは storage.session (メモリ) に置くので、
+// 鍵が切れても・service worker が止まっても配信は続く。v0.3.0 の手入力の設定は DB から引けるまでの間だけ使い、引けたら消す。
+//
 // 自己更新: 6 時間ごと (最初は 10 分後) とパネルの「今すぐ確認」で host に update_check を送る。
 // host が動いていなければ (見る人なし) 確認のためだけに起動し、答えが来たら切る。host は自分の exe (次の起動から) と、
 // この拡張のフォルダ (%LOCALAPPDATA%\alc-cam\extension、見る人が居ない時だけ) を Release の版に入れ替える。
@@ -20,7 +26,8 @@
 
 import { HOST_NAME, Host } from './lib/host.js';
 import { CamRoom } from './lib/signaling.js';
-import { STATUS_KEY, isComplete, loadSettings } from './lib/settings.js';
+import { fetchMine, parseTokenMessage, rtspUrl } from './lib/config.js';
+import { LEGACY_KEYS, PASSWORD_KEY, STATUS_KEY, loadSettings } from './lib/settings.js';
 
 const ALARM = 'alc-cam-watchdog';
 // 最後の見る人が離れてから host を止めるまで。stop を送った直後に port を切ると、
@@ -37,16 +44,26 @@ chrome.sidePanel
   .setPanelBehavior({ openPanelOnActionClick: true })
   .catch((e) => console.error('sidePanel.setPanelBehavior', e));
 
-export function roomUrl(s) {
+export function roomUrl(s, token) {
   const url = new URL(`${s.signalingUrl}/cam-room/${encodeURIComponent(s.siteId)}`);
   url.searchParams.set('role', 'device');
   url.searchParams.set('proto', '2');
+  if (token) url.searchParams.set('token', token);
   return url.toString();
 }
+
+// ---- 鍵 (メモリだけ) --------------------------------------------------------
+
+/** @type {null | {value: string, exp: number}} */
+let token = null;
+const liveToken = () => (token && token.exp > Date.now() ? token.value : '');
 
 // ---- 状態 (パネルが storage.session を読む) -------------------------------
 
 const status = {
+  /** 鍵の期限 (ミリ秒)。鍵そのものは書かない */
+  tokenExp: 0,
+  config: ['-', ''],
   signal: ['停止', ''],
   host: ['停止', ''],
   camera: ['-', ''],
@@ -72,7 +89,7 @@ class Relay {
     this.idleTimer = null;
 
     this.room = new CamRoom({
-      url: roomUrl(s),
+      url: () => roomUrl(s, liveToken()),
       onState: (state, detail) => {
         const label = { connecting: '接続中…', open: '接続済み', closed: '切断' }[state];
         report({ signal: [detail ? `${label} (${detail})` : label, state === 'open' ? 'ok' : state === 'closed' ? 'warn' : ''] });
@@ -286,20 +303,70 @@ let relay = null;
 let current = '';
 let chain = Promise.resolve();
 
-async function sync() {
+// 担当カメラの取得の失敗 (写しのまま配信を続けるときの添え書き)
+let configNote = '';
+
+/** 配る先を決める。決まらなければ wait に理由 */
+async function resolve() {
   const s = await loadSettings();
+  const base = { enabled: s.enabled, signalingUrl: s.signalingUrl, stun: s.stun };
+  if (s.camera) {
+    const pw = (await chrome.storage.session.get(PASSWORD_KEY))[PASSWORD_KEY];
+    if (pw === undefined) return { ...base, wait: `${s.camera.name}: パスワード待ち (点呼の画面から鍵が届くまで)` };
+    return { ...base, name: s.camera.name, siteId: s.camera.id, rtspUrl: rtspUrl(s.camera.rtsp, pw) };
+  }
+  const legacy = await chrome.storage.local.get(LEGACY_KEYS);
+  if (legacy.siteId && legacy.rtspUrl) return { ...base, name: `${legacy.siteId} (v0.3.0 の手入力。DB から引けたら切り替わります)`, siteId: legacy.siteId, rtspUrl: legacy.rtspUrl };
+  return { ...base, wait: '担当カメラ待ち (点呼の画面を開くと届きます)' };
+}
+
+async function sync() {
+  const s = await resolve();
+  report({ tokenExp: token?.exp ?? 0, config: s.wait ? [configNote || s.wait, 'warn'] : [configNote ? `${s.name} (${configNote})` : s.name, configNote ? 'warn' : 'ok'] });
   const key = JSON.stringify(s);
   if (key === current) return;
   current = key;
   relay?.stop();
   relay = null;
   if (!s.enabled) return report({ signal: ['停止 (パネルで開始)', ''] });
-  if (!isComplete(s)) return report({ signal: ['設定を入れてください', 'warn'] });
+  if (s.wait) return report({ signal: ['担当カメラ待ち', 'warn'] });
   relay = new Relay(s);
   relay.start();
 }
 
 const resync = () => (chain = chain.then(sync).catch((e) => console.error('sync', e)));
+
+// 鍵で担当カメラを引き直す。変わっていれば resync が繋ぎ直す (同じなら今の接続のまま)
+async function refreshConfig() {
+  const t = liveToken();
+  if (!t) return;
+  const s = await loadSettings();
+  try {
+    const r = await fetchMine(s.apiUrl, t);
+    configNote = r.camera ? '' : r.reason;
+    if (r.camera) {
+      // パスワードを先に置く (local の変更で動く resync が新旧の混ざった設定を読まないように)
+      await chrome.storage.session.set({ [PASSWORD_KEY]: r.password });
+      await chrome.storage.local.set({ camera: r.camera });
+      await chrome.storage.local.remove(LEGACY_KEYS);
+    } else {
+      await chrome.storage.session.remove(PASSWORD_KEY);
+      await chrome.storage.local.set({ camera: null });
+    }
+  } catch (e) {
+    configNote = `${e.message}。前の設定のまま`;
+  }
+  resync();
+}
+
+// 点呼の PWA から鍵を受ける (externally_connectable で alc.ippoan.org だけ。送り主の origin も確かめる)
+chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
+  const t = parseTokenMessage(msg, sender);
+  if (!t) return sendResponse({ ok: false });
+  token = { value: t.token, exp: t.exp };
+  sendResponse({ ok: true });
+  refreshConfig().catch((e) => console.error('refreshConfig', e));
+});
 
 chrome.runtime.onStartup.addListener(resync);
 chrome.runtime.onInstalled.addListener(resync);
@@ -311,6 +378,7 @@ reloadIfUpdatedOnDisk();
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.type === 'update_check') checkHostUpdate();
 });
+// local = 担当カメラの写し・「停止」。session (状態・パスワード) は見ない (パスワードは refreshConfig が resync する)
 chrome.storage.onChanged.addListener((changes, area) => area === 'local' && resync());
 
 // keepalive で生きている間は何もしない。worker が止まっていたらこの alarm が起こし、下の resync で繋ぎ直す

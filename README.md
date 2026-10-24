@@ -12,12 +12,20 @@ WebRTC (P2P) で見る側へ届ける。alc-gw (Go の常駐アプリ) を置か
 ```
 
 - 拡張は TCP を張れないので、RTSP と WebRTC は Rust の host が持つ。host は見る人が来たときに拡張が起動し、最後の 1 人が離れると終わる (サービス常駐しない)
-- 配信の本体は拡張の background service worker (`extension/background.js`)。設定が保存済みなら Chrome の起動と同時に cam-room に繋ぎ、
-  パネルを開いていなくても、閉じても配信は続く。サイドパネルは設定と状態の表示だけ (やり取りは `chrome.storage`)
+- 配信の本体は拡張の background service worker (`extension/background.js`)。担当カメラが決まっていれば Chrome の起動と同時に cam-room に繋ぎ、
+  パネルを開いていなくても、閉じても配信は続く。サイドパネルは状態の表示と「停止」だけ (やり取りは `chrome.storage`)
+- 拠点とカメラは手で入れない (v0.4.0〜)。点呼の PWA (`https://alc.ippoan.org`) が CoreS3 の署名で取った鍵
+  (role `device-cam-host`、TTL 900 秒) を `chrome.runtime.sendMessage(拡張 ID, {type:'cam_host_token', token, exp})` で渡し
+  (`externally_connectable`、送り主の origin も確かめる)、拡張がその鍵で auth-worker の
+  `GET /device-data-proxy/api/cam-clips/cameras/mine` を呼んで先頭のカメラの `id` (= 部屋の名前) と RTSP の接続先を受ける。
+  鍵はメモリだけ (cam-room に `?token=` で付けて入る。鍵の更新では今の接続を切らず、次に繋ぐときに使う)。
+  カメラの写し (パスワード以外) は `storage.local`、パスワードは `storage.session` (メモリ) に置くので、鍵が切れても・
+  service worker が止まっても配信は続く。Chrome の再起動と拡張の読み込み直し (自己更新) では `storage.session` が消えるので、
+  次に鍵が届くまで「パスワード待ち」で止まる。v0.3.0 の手入力の設定が残っていれば DB から引けるまではそれで配り、引けたら消す
 - 常時接続の保ち方: 20 秒ごとに `{"type":"ping"}` ちょうどを送る (cam-room は `setWebSocketAutoResponse` で `{"type":"pong"}` を返し、DO は hibernate したまま)。
   この送受信が service worker も生かす。pong が 60 秒来なければ繋ぎ直し、切れたら 1s→60s のバックオフ。
   service worker が止まっても 30 秒ごとの alarm で起き直し、設定から繋ぎ直す (状態をメモリに頼らない)。Chrome 116 以降
-- シグナリングは `cf-alc-signaling` の `/cam-room` を使う。部屋の名前は `alc_api.cameras.id` (拡張の「拠点 ID」に入れる)。見る側は既存の alc-app のまま
+- シグナリングは `cf-alc-signaling` の `/cam-room` を使う。部屋の名前は `alc_api.cameras.id` (担当カメラの id)。見る側は既存の alc-app のまま
 - **1 台のカメラを最大 4 人が同時に見られる** (cam-room v2。DO が見る人ごとに `viewer_id` を付ける)。
   RTSP はカメラにつき 1 本で、最初の 1 人で開き最後の 1 人が離れたら TEARDOWN、映像は見る人ごとの PeerConnection へ複製する。
   上り帯域は 人数 × stream2。v2 に対応していない cam-room (古い DO) でも 1 人なら今までどおり映る
@@ -31,7 +39,7 @@ WebRTC (P2P) で見る側へ届ける。alc-gw (Go の常駐アプリ) を置か
 | `host/` | `alc-cam-host` (str0m で WebRTC、暗号は pure Rust)。`hub.rs` が見る人への複製、`update.rs` が host と拡張の自己更新。`install.ps1` は Windows への初回の登録 |
 | `scripts/` | Release に付ける物 (host・拡張の zip・`alc-cam.json`) を作る `pack-release.ps1` |
 | `crates/cam-rtsp/` | RTSP (Digest・TCP interleaved) → H.264 Annex B。I/O を持たない |
-| `extension/` | 拠点側の Chrome 拡張 (MV3)。配信は `background.js` (service worker)、`panel.*` は設定と状態表示。ID は `key` で `icmmpdjddlphkbokdalofdjpkcgfiggd` に固定 |
+| `extension/` | 拠点側の Chrome 拡張 (MV3)。配信は `background.js` (service worker)、`lib/config.js` が鍵の受け取りと担当カメラの取得、`panel.*` は状態表示。ID は `key` で `icmmpdjddlphkbokdalofdjpkcgfiggd` に固定 |
 | `test/` | 偽カメラ・cam-room のローカル版・見る側のページと、それらを通す `e2e.mjs` |
 | `crates/cam-sd/` | カメラの SD 録画の一覧・取り出し・時刻の扱い (I/O を持たない) |
 | `crates/cam-mp4/` | MP4 を再エンコードせずに切ってつなぐ (moov を読み、出力の頭と写す区間を返す。I/O を持たない) |
@@ -50,12 +58,13 @@ WebRTC (P2P) で見る側へ届ける。alc-gw (Go の常駐アプリ) を置か
    (= `powershell -ExecutionPolicy Bypass -File install.ps1`)。host を `%LOCALAPPDATA%\alc-cam\alc-cam-host.exe` に置いて
    `HKCU` に native messaging として登録し、拡張を `%LOCALAPPDATA%\alc-cam\extension` に置く
 2. 以前に別の場所 (zip を展開したフォルダ等) から拡張を読み込んでいた PC は、install.ps1 がその場所を出して促すので、
-   拠点 ID と RTSP URL を控えてから `chrome://extensions` で「alc-cam 拠点中継」を **削除** する (そこは自動で更新されない)
+   `chrome://extensions` で「alc-cam 拠点中継」を **削除** する (そこは自動で更新されない)
 3. `chrome://extensions` → 右上の「デベロッパー モード」を ON → 「パッケージ化されていない拡張機能を読み込む」→
    `%LOCALAPPDATA%\alc-cam\extension` (パスは install.ps1 がクリップボードに入れる)。ID が `icmmpdjddlphkbokdalofdjpkcgfiggd` であること。
    **デベロッパー モードは以後も OFF に戻さない** (OFF のまま拡張が読み込み直すと、Chrome が拡張を無効にする)
-4. ツールバーのアイコン → サイドパネル → 設定に拠点 ID (= `alc_api.cameras.id`)・カメラの RTSP URL (stream2) を入れて保存。
-   保存した時点で配信が始まる (以後は Chrome を起動するだけで繋ぐ)。パネルは閉じてよい。止めるときはパネルの「停止」
+4. 録画の画面でこの拠点のカメラ (RTSP の接続先 = stream2) にこの PC の CoreS3 の鍵を紐づけておき、この Chrome で点呼の画面
+   (alc.ippoan.org) を開く。鍵が届くと配信が始まり、サイドパネルの「担当カメラ」にカメラ名が出る (以後は Chrome と点呼の画面を
+   開くだけで繋ぐ)。パネルは閉じてよい。止めるときはパネルの「停止」
 
 見る側は alc-app の拠点カメラ画面で同じカメラを開く。外すとき: `uninstall.cmd` (host の登録とフォルダを消す) のあと `chrome://extensions` で削除。
 
@@ -127,13 +136,17 @@ node make-fixture.mjs   # 偽カメラの H.264 を作る (branded Chrome の We
 node e2e.mjs            # 偽カメラ → host → 拡張 → cam-room → 見る側 を通す
 ```
 
-`e2e.mjs` が確かめること: パネルを開かずに設定だけで cam-room に繋ぐ / 見る人が来るまでカメラにも host にも触らない /
+`e2e.mjs` が確かめること: 拠点もカメラも決まらないうちは繋がない / v0.3.0 の手入力の設定が残っていればそれで繋ぐ /
+偽の点呼の PWA (`https://alc.ippoan.org` を route で差し替え) が渡す鍵で偽の `/cameras/mine` を引き、担当カメラの部屋に `?token=` 付きで入る
+(他の origin には `sendMessage` が生えない・0 台なら理由を出して待つ・ディスクにパスワードも鍵も手入力の URL も残らない・
+URL に入れると壊れる文字のパスワードが通る) / 鍵の更新では繋ぎ直さない / パネルを開かずに cam-room に繋ぐ / 見る人が来るまでカメラにも host にも触らない /
 Digest 認証 / 見る側で H.264 がデコードされる / 2 人目が途中から入っても映り、そのあいだ RTSP は 1 本 /
 片方が離れてももう片方は流れ続ける / 最後の 1 人が離れたらカメラへ TEARDOWN し host も止める / 入り直しで再び映る /
 パネルの状態表示と、パネルを閉じても映り続けること / keepalive の ping が `{"type":"ping"}` ちょうど /
-service worker を CDP で止めても起き直して繋ぎ直し、見ている人に再び映る / 設定を変えたら繋ぎ直す (v1 の部屋でも 1 人なら映る) /
+service worker を CDP で止めても起き直して (鍵無しで) 写しから繋ぎ直し、見ている人に再び映る /
+DB の担当カメラが変わったら次の鍵で繋ぎ直す (v1 の部屋でも 1 人なら映る) /
 見る人が居ないときの「今すぐ確認」で確認のためだけに host を起こし、答えがパネルに出て host が止まる (Linux の host は入れ替えないので unsupported) /
-ディスクの拡張の manifest.json の版が上がっていたら確認の答えで読み込み直し、cam-room に繋ぎ直す (拡張は写しを読み込み、デベロッパー モードは ON) /
+ディスクの拡張の manifest.json の版が上がっていたら確認の答えで読み込み直し、パスワード待ちを経て次の鍵で cam-room に繋ぎ直す (拡張は写しを読み込み、デベロッパー モードは ON) /
 「停止」で cam-room から抜ける。`signaling.mjs` は cam-room の v2 (と `v1Sites` に入れた部屋の v1)、
 keepalive の自動応答 (完全一致の ping にだけ pong) を写している。
 
@@ -143,5 +156,8 @@ keepalive の自動応答 (完全一致の ping にだけ pong) を写してい�
   入れ替えの手順は `host/src/update.rs` の単体テスト、拡張の読み込み直しは e2e、GitHub の redirect の辿り方は
   `cargo test -p alc-cam-host -- --ignored real_github` で確かめたビルドは CI の windows-latest で行う (この repo の Linux 環境に MinGW が無い)
 - 本物の C212 と、拠点の外 (NAT 越し) からの視聴。TURN は無いので、対称型 NAT 同士では繋がらない (規約 v1 と同じ)
-- device の認証 (規約 v1 と同じく cam-room は device を検証しない)
+- device の認証: 拡張は `?token=` を付けるが、検証 (role `device-cam-host` の introspect) は cf-alc-signaling 側で移行期間は無しも通す。
+  必須化の後は、鍵の無い繋ぎ直し (service worker の起き直し) は次の鍵が届くまで入れない
+- 本物の `/cameras/mine` と点呼の PWA からの鍵 (e2e は偽物)。v0.3.0 → v0.4.0 の自己更新で `host_permissions` /
+  `externally_connectable` が増えた manifest を、パッケージ化されていない拡張の読み込み直しが黙って受け入れるか (Windows の実機)
 - 音声

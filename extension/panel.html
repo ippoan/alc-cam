@@ -10,9 +10,12 @@
     <h1>alc-cam 拠点中継</h1>
     <button id="toggle" type="button">開始</button>
   </header>
-  <p class="note">配信はパネルを閉じても続きます (Chrome が動いている間ずっと)。「停止」で止めます。</p>
+  <p class="note">配信はパネルを閉じても続きます (Chrome が動いている間ずっと)。「停止」で止めます。
+    拠点とカメラは点呼の画面 (alc.ippoan.org) を開くと届く鍵で、録画の画面の紐づけから決まります。</p>
 
   <dl class="status">
+    <dt>鍵</dt><dd id="st-token">なし</dd>
+    <dt>担当カメラ</dt><dd id="st-config">-</dd>
     <dt>host</dt><dd id="st-host">停止</dd>
     <dt>シグナリング</dt><dd id="st-signal">停止</dd>
     <dt>見る人</dt><dd id="st-viewer">なし</dd>
@@ -20,26 +23,6 @@
     <dt>映像</dt><dd id="st-peer">-</dd>
     <dt>host 更新</dt><dd><span id="st-update">-</span> <button id="update-check" class="small" type="button">今すぐ確認</button></dd>
   </dl>
-
-  <details id="settings-box">
-    <summary>設定</summary>
-    <form id="settings">
-      <label>シグナリング (cf-alc-signaling)
-        <input name="signalingUrl" type="url" required placeholder="wss://alc-signaling.ippoan.org">
-      </label>
-      <label>拠点 ID
-        <input name="siteId" required pattern="[A-Za-z0-9_\-]+">
-      </label>
-      <label>カメラ RTSP URL (stream2 = 360p 推奨)
-        <input name="rtspUrl" type="password" required autocomplete="off" placeholder="rtsp://user:pass@192.168.1.50/stream2">
-      </label>
-      <label>STUN
-        <input name="stun" required placeholder="stun.l.google.com:19302">
-      </label>
-      <button type="submit">保存</button>
-      <span id="saved" hidden>保存しました</span>
-    </form>
-  </details>
 
   <script type="module" src="panel.js"></script>
 </body>

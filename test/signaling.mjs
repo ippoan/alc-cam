@@ -8,6 +8,9 @@
 // - keepalive: `{"type":"ping"}` ちょうどには `{"type":"pong"}` ちょうどを返し、log に残さない
 //   (本物は setWebSocketAutoResponse で runtime が返し DO は起きない)。数は keepalive に数える。
 //   1 文字でも違う ping は従来の `ping` 分岐 (log に `device: ping` が残る = 本物なら DO を起こす)
+// - device の `?token=` は検証せず deviceTokens に残す (本物は introspect で role=device-cam-host を確かめる。移行期間は無しも通す)
+// - auth-worker の `GET /device-data-proxy/api/cam-clips/cameras/mine` の写し: Bearer が mine.tokens に入っていれば
+//   mine.cameras を返す (無ければ 401)。拡張の service worker から呼ばれるので CORS を付ける。呼ばれた Bearer は mine.calls に残す
 // 本物との違い: admin の token を検証しない (ローカル確認用)。
 //   import { startSignaling } from './signaling.mjs'
 
@@ -24,7 +27,9 @@ const MAX_ADMINS = 4;
 const KEEPALIVE_PING = '{"type":"ping"}';
 const KEEPALIVE_PONG = '{"type":"pong"}';
 
-export function startSignaling({ port, v1Sites = [] }) {
+export function startSignaling({ port, v1Sites = [], mine = { tokens: [], cameras: [] } }) {
+  mine.calls = [];
+  const deviceTokens = [];
   /** siteId → { device, v2, admins: Map<viewer_id, ws> } */
   const rooms = new Map();
   const log = [];
@@ -45,6 +50,15 @@ export function startSignaling({ port, v1Sites = [] }) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(await fs.readFile(path.join(here, 'viewer.html')));
       return;
+    }
+    if (req.url === '/device-data-proxy/api/cam-clips/cameras/mine') {
+      const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'authorization' };
+      if (req.method === 'OPTIONS') return res.writeHead(204, cors).end();
+      const bearer = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1] ?? '';
+      mine.calls.push(bearer);
+      if (!mine.tokens.includes(bearer)) return res.writeHead(401, cors).end('{"error":"Unauthorized"}');
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ cameras: mine.cameras }));
     }
     res.writeHead(404).end();
   });
@@ -70,6 +84,7 @@ export function startSignaling({ port, v1Sites = [] }) {
     room.device = ws;
     room.v2 = url.searchParams.get('proto') === '2' && !v1Sites.includes(site);
     log.push(`device joined (${room.v2 ? 'v2' : 'v1'})`);
+    deviceTokens.push({ site, token: url.searchParams.get('token') ?? '' });
     for (const [viewerId, admin] of room.admins) {
       send(admin, { type: 'peer_joined', role: 'device' });
       send(ws, withId(room, { type: 'peer_joined', role: 'admin' }, viewerId));
@@ -144,5 +159,5 @@ export function startSignaling({ port, v1Sites = [] }) {
   }
 
   server.listen(port, '127.0.0.1');
-  return { log, keepalive, close: () => server.close() };
+  return { log, keepalive, deviceTokens, mine, close: () => server.close() };
 }

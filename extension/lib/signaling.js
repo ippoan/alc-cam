@@ -16,7 +16,7 @@ const BACKOFF_MAX_MS = 60_000;
 
 export class CamRoom {
   /**
-   * @param {{url: string,
+   * @param {{url: () => string,
    *          onState: (state: 'connecting'|'open'|'closed', detail?: string) => void,
    *          onMessage: (msg: {type: string, [k: string]: unknown}) => void}} opts
    */
@@ -40,7 +40,8 @@ export class CamRoom {
     this.opts.onState('connecting');
     let ws;
     try {
-      ws = new WebSocket(this.opts.url);
+      // 繋ぐたびに作る (鍵が更新されていれば新しい鍵で入る。開いている接続はそのまま)
+      ws = new WebSocket(this.opts.url());
     } catch (e) {
       this.scheduleRetry(String(e));
       return;

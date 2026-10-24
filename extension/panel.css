@@ -16,18 +16,10 @@ header { display: flex; align-items: center; justify-content: space-between; mar
 h1 { font-size: 15px; margin: 0; }
 button { font: inherit; padding: 4px 14px; border: 1px solid var(--accent); border-radius: 4px; background: var(--accent); color: var(--bg); cursor: pointer; }
 button.running { background: transparent; color: var(--accent); }
-video { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 4px; }
 .status { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 8px 0; }
 .status dt { color: var(--muted); }
 .status dd { margin: 0; overflow-wrap: anywhere; }
 .ok { color: var(--ok); }
 .warn { color: var(--warn); }
-details { border-top: 1px solid var(--line); padding-top: 8px; }
-summary { cursor: pointer; color: var(--muted); }
-form { display: grid; gap: 8px; margin-top: 8px; }
-label { display: grid; gap: 2px; color: var(--muted); }
 .note { margin: 0 0 8px; color: var(--muted); }
-input, select { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); color: var(--fg); min-width: 0; }
-.row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
-#saved { color: var(--ok); }
 button.small { padding: 0 8px; font-size: 12px; }

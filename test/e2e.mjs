@@ -1,6 +1,8 @@
 // 通しの動作確認:
 //   偽カメラ (RTSP, Digest) → alc-cam-host (Rust, native messaging) ⇄ 拡張 (background service worker) ⇄ cam-room (ローカル版)
 //   → 見る側 (viewer.html = alc-app の admin と同じ振る舞い) が WebRTC で受けてデコードする
+// 拠点とカメラは手で入れない: 偽の点呼の PWA (https://alc.ippoan.org を Playwright の route で差し替えたページ) が
+// 鍵を chrome.runtime.sendMessage で拡張に渡し、拡張が偽の /cameras/mine (signaling.mjs) から担当カメラを引く。
 //
 //   cargo build -p alc-cam-host && cd test && npm install && npx playwright-core install chromium && node e2e.mjs
 //
@@ -45,11 +47,19 @@ const hostRunning = () => {
   }
 };
 
-const camera = startFakeRtsp({ host: lanIp, port: 8554 });
+// URL に入れると壊れる文字を含むパスワード (拡張が URL エンコードし、host がデコードすること)
+const CAM_USER = 'admin';
+const CAM_PASS = 'p@ss:w/rd%';
+const camera = startFakeRtsp({ host: lanIp, port: 8554, user: CAM_USER, pass: CAM_PASS });
 // 首振りの CGI (本物は 80 番。host は ALC_CAM_HTTP_PORT を見る。Chromium から起動される host へ環境変数で渡る)
-const cgi = startFakeCgi({ host: lanIp, port: CGI_PORT });
+const cgi = startFakeCgi({ host: lanIp, port: CGI_PORT, user: CAM_USER, pass: CAM_PASS });
 process.env.ALC_CAM_HTTP_PORT = String(CGI_PORT);
-const signaling = startSignaling({ port: SIG_PORT, v1Sites: ['v1-site'] });
+// 担当カメラ (DB の写し)。rtsp は ingest の /cameras/mine と同じ形
+const camEntry = (id) => ({ id, name: `カメラ ${id}`, rtsp: { host: lanIp, port: 8554, path: 'stream2', username: CAM_USER, password: CAM_PASS } });
+const mine = { tokens: [], cameras: [] };
+const signaling = startSignaling({ port: SIG_PORT, v1Sites: ['v1-site'], mine });
+// 鍵の見た目だけ JWT (拡張は形を確かめる)
+const fakeToken = (n) => `eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiZGV2aWNlLWNhbS1ob3N0In0.sig${n}`;
 
 // native messaging host の登録 (Linux の Chromium は <user-data-dir>/NativeMessagingHosts も見る)
 const userDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'alc-cam-e2e-'));
@@ -70,6 +80,9 @@ const ctx = await chromium.launchPersistentContext(userDataDir, {
   headless: false,
   args: ['--headless=new', `--disable-extensions-except=${extDir}`, `--load-extension=${extDir}`],
 });
+// 偽の点呼の PWA と、許されていない origin のページ (どちらも中身は空。chrome.runtime が生えるかを見る)
+await ctx.route(/^https:\/\/(alc\.ippoan\.org|evil\.example)\//, (route) =>
+  route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>pwa</title>' }));
 const viewerBrowser = await chromium.launch({ executablePath: process.env.CHROME ?? '/usr/bin/google-chrome', headless: true });
 
 const results = {};
@@ -80,14 +93,52 @@ try {
   if (results.extId !== EXT_ID) throw new Error(`拡張 ID が manifest の key と合わない: ${results.extId}`);
   sw.on('console', (m) => console.log('[sw]', m.text()));
 
-  // パネルは開かない。設定を保存するだけで background が cam-room に繋ぐ
-  const settings = (siteId) => ({ signalingUrl: `ws://127.0.0.1:${SIG_PORT}`, siteId, rtspUrl: camera.url, stun: 'stun.l.google.com:19302' });
-  // 起動直後の worker は chrome.* がまだ生えていないことがある
+  // 繋ぎ先だけローカルに向ける (画面は無い上書き)。これだけでは拠点もカメラも決まらないので繋がない
   await waitFor(() => sw.evaluate(() => !!globalThis.chrome?.storage), 10_000, 'service worker の chrome.storage');
-  await sw.evaluate((s) => chrome.storage.local.set(s), settings('test-site'));
-  await waitFor(() => deviceJoins() >= 1, 10_000, 'パネル無しで cam-room 接続');
-  await sleep(1000);
-  results.beforeViewer = { ...camera.stats, hostRunning: hostRunning(), pages: ctx.pages().length };
+  await sw.evaluate((s) => chrome.storage.local.set(s), { signalingUrl: `ws://127.0.0.1:${SIG_PORT}`, apiUrl: `http://127.0.0.1:${SIG_PORT}` });
+  await sleep(1500);
+  results.noConfig = { joins: deviceJoins(), mineCalls: mine.calls.length };
+
+  // v0.3.0 からの入れ替え: 手入力の設定 (storage の siteId / rtspUrl) が残っていれば、DB から引けるまではそれで配る
+  await sw.evaluate((s) => chrome.storage.local.set(s), { siteId: 'legacy-site', rtspUrl: camera.url });
+  await waitFor(() => signaling.deviceTokens.some((d) => d.site === 'legacy-site'), 10_000, '手入力の設定で cam-room 接続');
+
+  // 点呼の PWA が鍵を渡す (PWA と同じく sendMessage(拡張 ID, ...))
+  const pwa = await ctx.newPage();
+  await pwa.goto('https://alc.ippoan.org/tenko');
+  const sendToken = (n) =>
+    pwa.evaluate(([id, token]) => chrome.runtime.sendMessage(id, { type: 'cam_host_token', token, exp: Math.floor(Date.now() / 1000) + 900 }), [EXT_ID, fakeToken(n)]);
+  // 許されていない origin には chrome.runtime.sendMessage が生えない
+  const evil = await ctx.newPage();
+  await evil.goto('https://evil.example/');
+  results.evilHasSendMessage = await evil.evaluate(() => typeof globalThis.chrome?.runtime?.sendMessage);
+  await evil.close();
+
+  // 担当カメラが 0 台: 理由を出して待つ (手入力の設定はまだ消さない)
+  mine.tokens.push(fakeToken(1));
+  results.token1Reply = await sendToken(1);
+  await waitFor(() => mine.calls.includes(fakeToken(1)), 10_000, '/cameras/mine (0 台)');
+  const swStatus = () => sw.evaluate(async () => (await chrome.storage.session.get('status')).status);
+  results.zeroCameras = await waitFor(async () => ((await swStatus())?.config?.[0].includes('担当カメラがありません') ? (await swStatus()).config : null), 5_000, '0 台の理由');
+
+  // 担当カメラが入った: 鍵を渡し直すと DB の設定に切り替わり、token 付きで cam-room に入る
+  mine.cameras = [camEntry('test-site')];
+  mine.tokens.push(fakeToken(2));
+  await sendToken(2);
+  await waitFor(() => signaling.deviceTokens.some((d) => d.site === 'test-site'), 10_000, '担当カメラの cam-room 接続');
+  results.joinToken = signaling.deviceTokens.find((d) => d.site === 'test-site').token;
+  results.stored = await sw.evaluate(async () => ({ local: await chrome.storage.local.get(null), session: Object.keys(await chrome.storage.session.get(null)) }));
+
+  // 鍵の更新では今の接続を切らない
+  const joinsAtRefresh = deviceJoins();
+  const leftAtRefresh = signaling.log.filter((l) => l === 'device left').length;
+  mine.tokens.push(fakeToken(3));
+  await sendToken(3);
+  await waitFor(() => mine.calls.includes(fakeToken(3)), 10_000, '/cameras/mine (鍵の更新)');
+  await sleep(1500);
+  results.refresh = { joins: deviceJoins() - joinsAtRefresh, left: signaling.log.filter((l) => l === 'device left').length - leftAtRefresh };
+  // パネル (拡張のページ) は開いていない
+  results.beforeViewer = { ...camera.stats, hostRunning: hostRunning(), extPages: ctx.pages().filter((p) => p.url().startsWith('chrome-extension://')).length };
 
   const openViewer = async (site = 'test-site') => {
     const page = await viewerBrowser.newPage();
@@ -179,7 +230,8 @@ try {
   await waitFor(() => signaling.keepalive.device >= 1, 25_000, 'keepalive の ping');
   results.keepalive = { ...signaling.keepalive, constant: KEEPALIVE_PING, legacyPings: signaling.log.filter((l) => l === 'device: ping').length };
 
-  // service worker を止めても (CDP)、alarm で起き直して設定から繋ぎ直し、C に再び映る
+  // service worker を止めても (CDP)、alarm で起き直して担当カメラの写しから繋ぎ直し、C に再び映る
+  // (鍵はメモリにしか無いので、繋ぎ直しは鍵無し。パスワードは storage.session に残っている)
   const joinsBefore = deviceJoins();
   const offersBefore = await c.evaluate(() => window.camState.offers);
   const cdpPage = await ctx.newPage();
@@ -192,26 +244,31 @@ try {
   const stoppedAt = Date.now();
   await waitFor(() => deviceJoins() > joinsBefore, 70_000, 'service worker の起き直しで再接続');
   results.swRestartSec = (Date.now() - stoppedAt) / 1000;
+  results.swRestartToken = signaling.deviceTokens.at(-1).token;
   await waitFor(async () => (await c.evaluate(() => window.camState.offers)) > offersBefore, 20_000, 'C へ offer し直し');
   await sleep(3000);
   results.afterSwRestart = { cDelta: await stillFlowing(c), camState: await c.evaluate(() => window.camState) };
   await c.close();
   await waitFor(() => !hostRunning(), 15_000, 'host 終了 (SW 再起動後)');
 
-  // 設定を変えたら繋ぎ直す: v1 の部屋 (proto を知らない古い DO) でも 1 人なら映る
-  // パネルの「保存」と同じく、拡張のページから storage を書く (service worker は起き直して別物になっている)
+  // DB の担当カメラが変わったら (次に鍵が届いたとき) 繋ぎ直す: v1 の部屋 (proto を知らない古い DO) でも 1 人なら映る
+  mine.cameras = [camEntry('v1-site')];
+  mine.tokens.push(fakeToken(4));
+  await sendToken(4);
+  await waitFor(() => signaling.log.includes('device joined (v1)'), 10_000, 'cam-room (v1) 接続');
+  results.v1Token = signaling.deviceTokens.at(-1).token;
+  const d = await openViewer('v1-site');
+  results.v1 = await decodes(d, 15, 'v1 の部屋のデコード');
+  await d.close();
+  await waitFor(() => !hostRunning(), 15_000, 'host 終了 (v1)');
+
+  // 拡張のページから storage を書く (service worker は起き直して別物になっている)
   const setStorage = async (obj) => {
     const page = await ctx.newPage();
     await page.goto(`chrome-extension://${EXT_ID}/panel.html`);
     await page.evaluate((o) => chrome.storage.local.set(o), obj);
     await page.close();
   };
-  await setStorage(settings('v1-site'));
-  await waitFor(() => signaling.log.includes('device joined (v1)'), 10_000, 'cam-room (v1) 接続');
-  const d = await openViewer('v1-site');
-  results.v1 = await decodes(d, 15, 'v1 の部屋のデコード');
-  await d.close();
-  await waitFor(() => !hostRunning(), 15_000, 'host 終了 (v1)');
 
   // host の自己更新: 見る人が居なくても「今すぐ確認」で確認のためだけに host を起こし、答えが来たら止める
   // (Linux の host は入れ替えないので unsupported が返る。GitHub には出ない)
@@ -247,8 +304,20 @@ try {
       await p.close().catch(() => {});
     }
   }, 15_000, '拡張の読み込み直し');
-  // 読み込み直した後も設定から cam-room に繋ぎ直す
-  await waitFor(() => deviceJoins() > joins, 15_000, '読み込み直し後の再接続');
+  // 読み込み直すと storage.session (パスワード) も鍵も消える: 次の鍵が届くまでパスワード待ちで止まり、届いたら繋ぎ直す
+  await sleep(2000);
+  results.afterReload = { joins: deviceJoins() - joins, stillHasCamera: await (async () => {
+    const p = await ctx.newPage();
+    await p.goto(`chrome-extension://${EXT_ID}/panel.html`);
+    const st = await p.evaluate(async () => ({ camera: (await chrome.storage.local.get('camera')).camera?.id, config: document.getElementById('st-config').textContent }));
+    await p.close();
+    return st;
+  })() };
+  mine.tokens.push(fakeToken(5));
+  await sendToken(5);
+  await waitFor(() => deviceJoins() > joins, 15_000, '読み込み直し後、鍵が届いて再接続');
+  results.afterReloadToken = signaling.deviceTokens.at(-1).token;
+  await pwa.close();
 
   // 「停止」(enabled=false) で cam-room から抜ける
   const leftBefore = signaling.log.filter((l) => l === 'device left').length;
@@ -268,8 +337,25 @@ try {
 
 console.log(JSON.stringify(results, null, 1));
 const checks = results.error ? {} : {
+  // 拠点もカメラも決まらないうちは繋がない
+  waitsWithoutConfig: results.noConfig.joins === 0 && results.noConfig.mineCalls === 0,
+  // 鍵は alc.ippoan.org からだけ受ける
+  pwaOnly: results.evilHasSendMessage === 'undefined' && results.token1Reply?.ok === true,
+  zeroCamerasReason: !!results.zeroCameras,
+  // 担当カメラの id の部屋に、受けた鍵を付けて入る
+  joinsWithToken: results.joinToken === fakeToken(2),
+  // ディスク (local) にはパスワードも鍵も手入力の rtspUrl も残らない。パスワードは session (メモリ) だけ
+  noSecretOnDisk: (() => {
+    const disk = JSON.stringify(results.stored.local);
+    return !disk.includes(CAM_PASS) && !disk.includes('eyJ') && !('rtspUrl' in results.stored.local) && !('siteId' in results.stored.local) &&
+      results.stored.local.camera?.id === 'test-site' && results.stored.session.includes('rtspPassword');
+  })(),
+  // 鍵の更新では繋ぎ直さない
+  keepsConnectionOnRefresh: results.refresh.joins === 0 && results.refresh.left === 0,
+  // 鍵が無くても (service worker の起き直し) 写しで繋ぎ直す。次の鍵では新しい鍵で入る
+  reconnectsWithoutToken: results.swRestartToken === '' && results.v1Token === fakeToken(4),
   // パネルを開かずに cam-room に繋ぎ、見る人が来るまでカメラにも host にも触らない
-  startsWithoutPanel: results.beforeViewer.pages <= 1 && results.beforeViewer.sessions === 0 && !results.beforeViewer.hostRunning,
+  startsWithoutPanel: results.beforeViewer.extPages === 0 && results.beforeViewer.sessions === 0 && !results.beforeViewer.hostRunning,
   // 2 人同時でも RTSP は 1 本、A も流れ続けている
   oneRtspForTwo: results.bothWatching.camera.sessions === 1 && results.bothWatching.aDelta > 0,
   // 片方が離れてももう片方は流れ、カメラは畳まない
@@ -284,9 +370,12 @@ const checks = results.error ? {} : {
   reconnectsAfterSwStop: results.afterSwRestart.cDelta > 0,
   stoppedByToggle: !!results.stoppedByToggle,
   // 更新の確認は host の版を添えてパネルに出て、確認のためだけの host は残らない
-  updateCheck: results.update?.includes('host v0.3.0') && results.afterUpdateCheck?.hostRunning === false,
+  updateCheck: results.update?.includes('host v0.4.0') && results.afterUpdateCheck?.hostRunning === false,
   // ディスクの拡張が新しくなっていたら読み込み直し、配信に戻る
   reloadsWhenUpdatedOnDisk: results.reloadedVersion === '99.0.0',
+  // 読み込み直しの後はパスワード待ち (写しのカメラ id は残る)、鍵が届けば繋ぎ直す
+  waitsPasswordAfterReload: results.afterReload.joins === 0 && results.afterReload.stillHasCamera.camera === 'v1-site' &&
+    results.afterReload.stillHasCamera.config.includes('パスワード待ち') && results.afterReloadToken === fakeToken(5),
   // データチャネルで caps が届き、押している間ステップが続き (左も上も)、要求は常に 1 本・Digest が通る
   ptzCaps: results.ptzCaps?.dirs?.length === 4 && results.ptzCaps.zoom === false,
   ptzSteps: ['move=left', 'move=up'].every((m) => results.ptz.stats.calls.filter((c) => c.startsWith(m)).length >= 2),

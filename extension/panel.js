@@ -1,12 +1,11 @@
-// サイドパネル = 設定の入力・保存と状態の表示だけ。配信の本体は background.js (service worker) にあり、
-// パネルを閉じても止まらない。やり取りは chrome.storage だけ:
-//   設定 (local) をここで書く → background が storage.onChanged で拾って繋ぎ直す
+// サイドパネル = 状態の表示と「開始/停止」だけ (拠点とカメラは DB から決まるので入力欄は無い)。
+// 配信の本体は background.js (service worker) にあり、パネルを閉じても止まらない。やり取りは chrome.storage だけ:
+//   「停止」(local の enabled) をここで書く → background が storage.onChanged で拾って繋ぎ直す
 //   状態 (session) を background が書く → ここで storage.onChanged を見て描く
 
-import { DEFAULTS, STATUS_KEY, isComplete, loadSettings } from './lib/settings.js';
+import { DEFAULTS, STATUS_KEY, loadSettings } from './lib/settings.js';
 
 const $ = (id) => document.getElementById(id);
-const form = $('settings');
 const toggle = $('toggle');
 
 function setStatus(id, [text, cls]) {
@@ -15,25 +14,19 @@ function setStatus(id, [text, cls]) {
   el.className = cls;
 }
 
-function fillForm(s) {
-  for (const [k, v] of Object.entries(s)) {
-    const el = form.elements.namedItem(k);
-    if (el) el.value = v;
-  }
+/** 鍵の期限 → 表示 (切れても配信は写しで続く) */
+function tokenLabel(exp, now = Date.now()) {
+  if (!exp) return ['なし (点呼の画面を開くと届きます)', 'warn'];
+  const at = new Date(exp).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+  return exp > now ? [`あり (${at} まで)`, 'ok'] : [`期限切れ (${at})。配信は続けます`, ''];
 }
 
-function readForm() {
-  const fd = new FormData(form);
-  return {
-    signalingUrl: fd.get('signalingUrl').trim().replace(/\/+$/, ''),
-    siteId: fd.get('siteId').trim(),
-    rtspUrl: fd.get('rtspUrl').trim(),
-    stun: fd.get('stun').trim(),
-  };
-}
-
+let lastStatus = null;
 function renderStatus(st) {
   if (!st) return;
+  lastStatus = st;
+  setStatus('st-token', tokenLabel(st.tokenExp));
+  if (st.config) setStatus('st-config', st.config);
   setStatus('st-host', st.host);
   setStatus('st-signal', st.signal);
   setStatus('st-camera', st.camera);
@@ -59,12 +52,8 @@ toggle.addEventListener('click', async () => {
 
 $('update-check').addEventListener('click', () => chrome.runtime.sendMessage({ type: 'update_check' }));
 
-form.addEventListener('submit', async (ev) => {
-  ev.preventDefault();
-  await chrome.storage.local.set(readForm());
-  $('saved').hidden = false;
-  setTimeout(() => ($('saved').hidden = true), 1500);
-});
+// 期限切れの表示を進める
+setInterval(() => lastStatus && setStatus('st-token', tokenLabel(lastStatus.tokenExp)), 30_000);
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'session' && changes[STATUS_KEY]) renderStatus(changes[STATUS_KEY].newValue);
@@ -72,7 +61,5 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 
 const initial = await loadSettings();
-fillForm({ signalingUrl: initial.signalingUrl, siteId: initial.siteId, rtspUrl: initial.rtspUrl, stun: initial.stun });
-if (!isComplete(initial)) $('settings-box').open = true;
 renderToggle(initial.enabled);
 renderStatus((await chrome.storage.session.get(STATUS_KEY))[STATUS_KEY]);
