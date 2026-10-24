@@ -19,6 +19,7 @@ POST  /api/cam-clips/cameras                 {name, vpc_binding?, rec_username?,
 PATCH /api/cam-clips/cameras/{id}            同じ項目 (省略 = 変えない、vpc_binding: null = 取り込みをやめる、rec_password: "" = 変えない)
 GET   /api/cam-clips/device-candidates?days=30   直近 days 日 (1〜90) にイベントを出した端末と kind ごとの件数 (行ごとに is_dev: 開発端末の行も軸ごとに読んで返す)
 POST  /api/cam-clips/clips                   {"camera_id": "...", "from": "2026-10-23T12:58:00+09:00", "to": "2026-10-23T12:59:30+09:00"}
+POST  /api/cam-clips/auto-run                 {} か {"camera_id": "..."} → 200 {"cameras": [...]} (cron と同じ自動切り出しを呼び手のテナントだけで今すぐ回す。camera_id で 1 台に絞れる。dev token では 403)
 → 201 {"clip_id": …, "key": "clips/<tenant>/<camera_id>/20261023T125800_20261023T125930.mp4", "size": …,
        "actual_from": "2026-10-23T12:57:58.257+09:00", "actual_to": "…", "sources": [元ファイル…], "reused": false}
 GET   /api/cam-clips/clips/<tenant>/<camera_id>/20261023T125800_20261023T125930.mp4   (Range 対応 = シークできる。他テナントのキーは 404)

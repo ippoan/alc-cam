@@ -88,6 +88,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let result = match op {
         Op::GetClip { key } => return get_clip(&env, &req, key).await,
         Op::CreateClip { camera_id, from_ms, to_ms } => create_clip(&env, &caller, camera_id, from_ms, to_ms).await,
+        Op::AutoRun { camera_id } => auto_run(&env, &caller, camera_id).await,
         op => run(&env, &caller, op).await,
     };
     match result {
@@ -100,6 +101,21 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     auto::run(&env).await;
+}
+
+/// 手動の自動切り出し (`POST /auto-run`)。cron と同じ [`auto::run_tenant`] を、呼び手のテナント
+/// (auth-worker が付け直した X-Tenant-ID) だけに使う。他のテナントには触れない
+async fn auto_run(env: &Env, caller: &Caller, camera_id: Option<Uuid>) -> std::result::Result<Reply, ApiError> {
+    let mut pg = db::connect(env).await?;
+    let mut key = None;
+    let runs = auto::run_tenant(env, &mut pg, caller.tenant, camera_id, &mut key, auto::max_groups(env), "manual")
+        .await
+        .map_err(|e| db_error(&e))?;
+    if camera_id.is_some() && runs.is_empty() {
+        return Err(ApiError::new(404, "そのカメラはありません"));
+    }
+    let cameras: Vec<_> = runs.iter().map(|r| cam_ingest_api::auto::camera_run_json(r.camera_id, &r.result)).collect();
+    Ok(Reply { status: 200, body: serde_json::json!({ "cameras": cameras }) })
 }
 
 /// 台帳と端末の候補の口 (鍵は DB の transaction の外で先に引く)。書く binding がこの Worker に無ければ 400

@@ -131,6 +131,10 @@ pub enum Op {
         from_ms: i64,
         to_ms: i64,
     },
+    /// cron と同じ自動切り出しを呼び手のテナントだけで回す。`camera_id` があればその 1 台だけ
+    AutoRun {
+        camera_id: Option<Uuid>,
+    },
 }
 
 /// `POST /cameras` の入力 (パスワードは平文のまま。暗号化は [`execute`] が鍵を受けて行う)
@@ -200,6 +204,25 @@ struct ClipBody {
     camera_id: String,
     from: String,
     to: String,
+}
+
+#[derive(Deserialize)]
+struct AutoRunBody {
+    camera_id: Option<String>,
+}
+
+/// `POST /auto-run`。本文は空か `{"camera_id": "<uuid>"}` (省略・null = テナントの全カメラ)
+fn auto_run_input(body: &str) -> Result<Op, ApiError> {
+    if body.trim().is_empty() {
+        return Ok(Op::AutoRun { camera_id: None });
+    }
+    let b: AutoRunBody = serde_json::from_str(body)
+        .map_err(|_| bad("本文は空か {\"camera_id\": \"...\"} の JSON にしてください"))?;
+    let camera_id = b
+        .camera_id
+        .map(|v| Uuid::parse_str(&v).map_err(|_| bad("camera_id の形が正しくありません")))
+        .transpose()?;
+    Ok(Op::AutoRun { camera_id })
 }
 
 fn bad(message: &str) -> ApiError {
@@ -408,6 +431,7 @@ pub fn parse(
             days: days_of(query)?,
         }),
         ("POST", "/clips") => clip_input(body, max_clip_ms),
+        ("POST", "/auto-run") => auto_run_input(body),
         ("GET", "/events") => events_input(query),
         ("GET", p) if p.starts_with("/clips/") => Ok(Op::GetClip {
             key: clip_key(&p["/clips/".len()..], caller)?,
@@ -614,7 +638,7 @@ pub async fn execute(
                 body: Value::Array(list),
             })
         }
-        Op::CreateClip { .. } | Op::GetClip { .. } => Err(ApiError::new(404, "Not Found")),
+        Op::CreateClip { .. } | Op::GetClip { .. } | Op::AutoRun { .. } => Err(ApiError::new(404, "Not Found")),
     }
 }
 
@@ -838,6 +862,27 @@ mod tests {
             parse("GET", "/device-candidates", "", "", &admin(false), 60_000),
             Ok(Op::DeviceCandidates { .. })
         ));
+    }
+
+    #[test]
+    fn auto_run_takes_an_empty_body_or_a_camera_id() {
+        let a = admin(false);
+        let run = |body: &str| parse("POST", "/auto-run", "", body, &a, 60_000);
+        assert!(matches!(run(""), Ok(Op::AutoRun { camera_id: None })));
+        assert!(matches!(run("{}"), Ok(Op::AutoRun { camera_id: None })));
+        let id = "00000000-0000-4000-8000-0000000000aa";
+        let Ok(Op::AutoRun { camera_id: Some(got) }) = run(&format!(r#"{{"camera_id":"{id}"}}"#)) else {
+            panic!("camera_id 付きは AutoRun{{Some}} になる");
+        };
+        assert_eq!(got, Uuid::parse_str(id).unwrap());
+        assert_eq!(status(run(r#"{"camera_id":"not-a-uuid"}"#)), 400);
+        assert_eq!(status(run("[")), 400);
+    }
+
+    #[test]
+    fn tenko_manager_cannot_auto_run() {
+        let m = tenko_manager();
+        assert_eq!(status(parse("POST", "/auto-run", "", "", &m, 60_000)), 403);
     }
 
     #[test]

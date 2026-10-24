@@ -211,6 +211,26 @@ impl Outcome {
     }
 }
 
+/// `POST /auto-run` の応答の 1 台分。Ok は [`Outcome`] の各欄、Err (飛ばした・DB が失敗した理由) は数字 0 と `error`
+pub fn camera_run_json(camera_id: Uuid, result: &Result<Outcome, String>) -> serde_json::Value {
+    let (ok, o, error) = match result {
+        Ok(o) => (true, o.clone(), None),
+        Err(e) => (false, Outcome::default(), Some(e.as_str())),
+    };
+    serde_json::json!({
+        "camera_id": camera_id,
+        "ok": ok,
+        "events": o.events,
+        "groups": o.groups,
+        "ready": o.ready,
+        "failed": o.failed,
+        "deferred": o.deferred,
+        "fetched": o.fetched,
+        "listing_failed": o.listing_failed,
+        "error": error,
+    })
+}
+
 /// 1 カメラ分を流す。DB のエラーだけを `Err` で返す (カメラ・R2 の失敗は `cam_clips` の failed か `listing_failed`)
 pub async fn run_camera<R: Recorder>(
     pg: &mut PgClient,
@@ -289,6 +309,22 @@ pub async fn run_camera<R: Recorder>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_run_json_has_the_agreed_shape() {
+        let id = Uuid::from_u128(7);
+        let ok = Outcome { events: 3, groups: 2, ready: 1, failed: 0, deferred: 1, fetched: 4, listing_failed: true };
+        let j = camera_run_json(id, &Ok(ok));
+        assert_eq!(
+            j,
+            serde_json::json!({ "camera_id": id, "ok": true, "events": 3, "groups": 2, "ready": 1, "failed": 0, "deferred": 1, "fetched": 4, "listing_failed": true, "error": null })
+        );
+        let j = camera_run_json(id, &Err("skipped (no credentials)".into()));
+        assert_eq!(
+            j,
+            serde_json::json!({ "camera_id": id, "ok": false, "events": 0, "groups": 0, "ready": 0, "failed": 0, "deferred": 0, "fetched": 0, "listing_failed": false, "error": "skipped (no credentials)" })
+        );
+    }
 
     fn ev(n: u128, at_ms: i64) -> Event {
         Event { source_table: "hub_measurements".into(), source_id: Uuid::from_u128(n), kind: "alcohol".into(), at_ms, device_id: "d".into(), is_dev: false }
