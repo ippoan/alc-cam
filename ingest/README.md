@@ -13,12 +13,13 @@ auth-worker (/api/cam-clips/) ─Service Binding─▶ alc-cam-sd-ingest ─Work
 口 (中身は `ingest/api`。宛先・資格情報は応答にもログにも出さない。パスワードは返さない):
 
 ```
-GET   /api/cam-clips/cameras                 → {"can_edit_destination": bool, "cameras": [{id, name, vpc_binding, rec_username, has_password, recording, lan_ip, rtsp_port, rtsp_path, device_ids, rec_scanned_until}]}
+GET   /api/cam-clips/cameras                 → {"can_edit_destination": bool, "cameras": [{id, name, vpc_binding, rec_username, has_password, recording, lan_ip, rtsp_port, rtsp_path, device_ids, stream_device_ids, rec_scanned_until}]}
                                                運行管理者席の鍵には → {"cameras": [{id, name, device_ids}]} (録画の設定は返さない)
-POST  /api/cam-clips/cameras                 {name, vpc_binding?, rec_username?, rec_password?, lan_ip?, rtsp_port?, rtsp_path?, device_ids?} → 201 (active = false で作る)
+POST  /api/cam-clips/cameras                 {name, vpc_binding?, rec_username?, rec_password?, lan_ip?, rtsp_port?, rtsp_path?, device_ids?, stream_device_ids?} → 201 (active = false で作る)
 PATCH /api/cam-clips/cameras/{id}            同じ項目 (省略 = 変えない、vpc_binding: null = 取り込みをやめる、rec_password: "" = 変えない、
-                                               lan_ip / rtsp_path: null か "" = 消す、rtsp_port: null = 554 に戻す)
-GET   /api/cam-clips/cameras/mine            拠点 PC の配信の鍵だけ → {"cameras": [{id, name, rtsp: {host, port, path, username, password} | null}]}
+                                               lan_ip / rtsp_path: null か "" = 消す、rtsp_port: null = 554 に戻す、
+                                               device_ids / stream_device_ids: 送ると全差し替え)
+GET   /api/cam-clips/cameras/mine            拠点 PC の配信の鍵だけ → {"cameras": [{id, name, rank, rtsp: {host, port, path, username, password} | null}]}
 GET   /api/cam-clips/device-candidates?days=30   直近 days 日 (1〜90) にイベントを出した端末と kind ごとの件数 (行ごとに is_dev: 開発端末の行も軸ごとに読んで返す)
 POST  /api/cam-clips/clips                   {"camera_id": "...", "from": "2026-10-23T12:58:00+09:00", "to": "2026-10-23T12:59:30+09:00"}
 POST  /api/cam-clips/auto-run                 {} か {"camera_id": "..."} → 200 {"cameras": [...]} (cron と同じ自動切り出しを呼び手のテナントだけで今すぐ回す。camera_id で 1 台に絞れる。dev token では 403)
@@ -32,14 +33,19 @@ GET   /api/cam-clips/events?camera_id=<uuid>&date=2026-10-23   (JST の 1 日)
 - RTSP の接続先 (拠点 PC の配信が繋ぐ先。migration 188): `lan_ip` はプライベートの IPv4 (10/8・172.16/12・192.168/16) だけ、
   `rtsp_port` は 1〜65535 (既定 554)、`rtsp_path` は先頭の `/` を落として保存 (英数と `/ _ - . ? = &`、200 文字まで、`..` 不可)。
   ユーザー名・パスワードは録画用の `rec_username` / `rec_password` を使い回す (列を増やさない)。一覧にパスワードは出ない
-- `GET /cameras/mine` は、鍵の端末 (`X-Device-Id`) を `cam_camera_devices` で結び付けたカメラを名前の順に返す。`rtsp` は
+- 配信担当 (migration 189 の `cam_stream_devices`): `stream_device_ids` は並び = 順位 (先頭 = 1 位 = 主)。10 件まで・重複は 400
+  (並べ替えない)。`device_ids` (`cam_camera_devices`。切り出しと遠隔点呼のカメラ引き) とは別に持ち、片方を変えてももう片方は変わらない。
+- `GET /cameras/mine` は、鍵の端末 (`X-Device-Id`) が配信を受け持つカメラを、自分の順位 `rank` (1 = 主) → 名前の順に返す。
+  受け持ち = `cam_stream_devices` に在る。順位表が空のカメラだけは、`cam_camera_devices` で結び付けた端末の全員を `rank: 1` とする
+  (順位を入れる前の紐づけを止めないため。同じ順位どうしは cam-room が先着の 1 台に配信させ、他は待機にする)。
+  拡張は先頭 (自分の順位が最も高い) の 1 台だけを配る。`rtsp` は
   `lan_ip` と `rtsp_path` が両方在るときだけで、無ければ null。`password` は `SSO_ENCRYPTION_KEY` で復号した平文 (未設定なら null)。
   応答にパスワードの平文が出るのはこの口だけ。例 (値は作り物):
 
   ```json
   {"cameras": [
-    {"id": "6f1c…", "name": "入口", "rtsp": {"host": "192.168.10.20", "port": 554, "path": "stream1", "username": "viewer", "password": "example-pass"}},
-    {"id": "9a0e…", "name": "倉庫", "rtsp": null}
+    {"id": "6f1c…", "name": "入口", "rank": 1, "rtsp": {"host": "192.168.10.20", "port": 554, "path": "stream1", "username": "viewer", "password": "example-pass"}},
+    {"id": "9a0e…", "name": "倉庫", "rank": 2, "rtsp": null}
   ]}
   ```
 - `POST /clips` の応答の `truncated` は、要求より短い範囲しか取れなかった (`actual_from` > `from` か `actual_to` < `to`) とき true

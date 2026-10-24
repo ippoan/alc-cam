@@ -38,6 +38,8 @@ pub struct CameraRow {
     pub rec_username: Option<String>,
     pub has_password: bool,
     pub device_ids: Vec<String>,
+    /// 配信担当の端末 (先頭 = 1 位)。空なら `device_ids` の全員が 1 位 ([`my_cameras`])
+    pub stream_device_ids: Vec<String>,
     pub rec_scanned_until_ms: Option<i64>,
     pub lan_ip: Option<String>,
     pub rtsp_port: i32,
@@ -56,6 +58,8 @@ pub struct NewCamera {
     pub rtsp_port: i32,
     pub rtsp_path: Option<String>,
     pub device_ids: Vec<String>,
+    /// 配信担当の端末 (先頭 = 1 位。検査済み = 重複なし・10 件まで)
+    pub stream_device_ids: Vec<String>,
 }
 
 pub struct PatchCamera {
@@ -69,11 +73,13 @@ pub struct PatchCamera {
     pub rtsp_path: Change<Option<String>>,
     /// `Some` なら結び付ける端末を差し替える
     pub device_ids: Option<Vec<String>>,
+    /// `Some` なら配信担当の端末 (順位) を差し替える
+    pub stream_device_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateOutcome {
-    Updated(CameraRow),
+    Updated(Box<CameraRow>),
     NotFound,
     /// developer でないのに宛先を変えようとした (何も変えていない)
     Forbidden,
@@ -105,6 +111,8 @@ pub struct MyCamera {
     pub rtsp_path: Option<String>,
     pub rec_username: Option<String>,
     pub rec_password_encrypted: Option<String>,
+    /// 配信担当の順位 (1 = 主)。順位表が空のカメラは結び付けた端末の全員が 1
+    pub rank: i32,
 }
 impl TxOutput for MyCamera {}
 
@@ -142,7 +150,9 @@ const SELECT_CAMERAS: &str = "\
 SELECT c.id, c.name, c.rec_ip, c.rec_username, c.rec_password_encrypted IS NOT NULL,
        COALESCE(array_agg(d.device_id ORDER BY d.device_id) FILTER (WHERE d.device_id IS NOT NULL), '{}'::text[]),
        (extract(epoch FROM c.rec_scanned_until) * 1000)::int8,
-       c.lan_ip, c.rtsp_port, c.rtsp_path
+       c.lan_ip, c.rtsp_port, c.rtsp_path,
+       ARRAY(SELECT s.device_id FROM alc_api.cam_stream_devices s
+              WHERE s.tenant_id = c.tenant_id AND s.camera_id = c.id ORDER BY s.priority)
   FROM alc_api.cameras c
   LEFT JOIN alc_api.cam_camera_devices d ON d.tenant_id = c.tenant_id AND d.camera_id = c.id
  WHERE c.tenant_id = $1 AND ($2::uuid IS NULL OR c.id = $2)
@@ -161,6 +171,7 @@ fn camera_row(r: &Row) -> CameraRow {
         lan_ip: r.get(7),
         rtsp_port: r.get(8),
         rtsp_path: r.get(9),
+        stream_device_ids: r.get(10),
     }
 }
 
@@ -169,6 +180,12 @@ const REPLACE_DEVICES_DELETE: &str =
 const REPLACE_DEVICES_INSERT: &str = "\
 INSERT INTO alc_api.cam_camera_devices (tenant_id, camera_id, device_id)
 SELECT $1, $2, x FROM unnest($3::text[]) AS x";
+const REPLACE_STREAM_DELETE: &str =
+    "DELETE FROM alc_api.cam_stream_devices WHERE tenant_id = $1 AND camera_id = $2";
+/// 配列の並び = 順位 (1 始まり)
+const REPLACE_STREAM_INSERT: &str = "\
+INSERT INTO alc_api.cam_stream_devices (tenant_id, camera_id, device_id, priority)
+SELECT $1, $2, x, n::int2 FROM unnest($3::text[]) WITH ORDINALITY AS t(x, n)";
 
 /// そのテナントのカメラ全行 (`id` を渡すとその 1 行)
 pub async fn list_cameras(
@@ -214,6 +231,9 @@ pub async fn create_camera(
             let id: Option<Uuid> = Some(row.get(0));
             if !c.device_ids.is_empty() {
                 tx.execute_typed(REPLACE_DEVICES_INSERT, &[(&tenant, Type::UUID), (&id, Type::UUID), (&c.device_ids, Type::TEXT_ARRAY)]).await?;
+            }
+            if !c.stream_device_ids.is_empty() {
+                tx.execute_typed(REPLACE_STREAM_INSERT, &[(&tenant, Type::UUID), (&id, Type::UUID), (&c.stream_device_ids, Type::TEXT_ARRAY)]).await?;
             }
             let row = tx.query_typed_one(SELECT_CAMERAS, &[(&tenant, Type::UUID), (&id, Type::UUID)]).await?;
             Ok(camera_row(&row))
@@ -286,25 +306,41 @@ pub async fn update_camera(
                     tx.execute_typed(REPLACE_DEVICES_INSERT, &[(&tenant, Type::UUID), (&id, Type::UUID), (ids, Type::TEXT_ARRAY)]).await?;
                 }
             }
+            if let Some(ids) = &p.stream_device_ids {
+                tx.execute_typed(REPLACE_STREAM_DELETE, &[(&tenant, Type::UUID), (&id, Type::UUID)]).await?;
+                if !ids.is_empty() {
+                    tx.execute_typed(REPLACE_STREAM_INSERT, &[(&tenant, Type::UUID), (&id, Type::UUID), (ids, Type::TEXT_ARRAY)]).await?;
+                }
+            }
             let some_id = Some(id);
             let row = tx.query_typed_one(SELECT_CAMERAS, &[(&tenant, Type::UUID), (&some_id, Type::UUID)]).await?;
-            Ok(UpdateOutcome::Updated(camera_row(&row)))
+            Ok(UpdateOutcome::Updated(Box::new(camera_row(&row))))
         })
     })
     .await
 }
 
-/// 端末 (`device`) を結び付けたカメラ (名前の順)。RTSP の列が未設定の行も返す (呼び手が rtsp: null にする)
+/// 端末 (`device`) が配信を受け持つカメラ (順位 → 名前の順)。RTSP の列が未設定の行も返す (呼び手が rtsp: null にする)。
+/// 受け持ち = 配信担当の順位表 (`cam_stream_devices`) に在る。順位表が空のカメラだけは、結び付けた端末
+/// (`cam_camera_devices`) の全員を 1 位とする (順位を入れる前の紐づけを止めないため。同順位は cam-room が先着にする)
 pub async fn my_cameras(pg: &mut PgClient, tenant: Uuid, device: String) -> Result<Vec<MyCamera>, Error> {
     pg.tenant_tx(tenant, move |tx| {
         Box::pin(async move {
             let rows = tx
                 .query_typed(
-                    "SELECT c.id, c.name, c.lan_ip, c.rtsp_port, c.rtsp_path, c.rec_username, c.rec_password_encrypted
+                    "SELECT c.id, c.name, c.lan_ip, c.rtsp_port, c.rtsp_path, c.rec_username, c.rec_password_encrypted, r.rank
                        FROM alc_api.cameras c
-                       JOIN alc_api.cam_camera_devices d ON d.tenant_id = c.tenant_id AND d.camera_id = c.id
-                      WHERE c.tenant_id = $1 AND d.device_id = $2
-                      ORDER BY c.name, c.id",
+                       JOIN LATERAL (
+                            SELECT s.priority::int4 AS rank FROM alc_api.cam_stream_devices s
+                             WHERE s.tenant_id = c.tenant_id AND s.camera_id = c.id AND s.device_id = $2
+                            UNION ALL
+                            SELECT 1 FROM alc_api.cam_camera_devices d
+                             WHERE d.tenant_id = c.tenant_id AND d.camera_id = c.id AND d.device_id = $2
+                               AND NOT EXISTS (SELECT 1 FROM alc_api.cam_stream_devices e
+                                                WHERE e.tenant_id = c.tenant_id AND e.camera_id = c.id)
+                       ) r ON true
+                      WHERE c.tenant_id = $1
+                      ORDER BY r.rank, c.name, c.id",
                     &[(&tenant, Type::UUID), (&device, Type::TEXT)],
                 )
                 .await?;
@@ -318,6 +354,7 @@ pub async fn my_cameras(pg: &mut PgClient, tenant: Uuid, device: String) -> Resu
                     rtsp_path: r.get(4),
                     rec_username: r.get(5),
                     rec_password_encrypted: r.get(6),
+                    rank: r.get(7),
                 })
                 .collect())
         })

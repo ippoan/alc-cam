@@ -60,7 +60,7 @@ fn migrations_dir() -> std::path::PathBuf {
     dir
 }
 
-/// 準備をプロセスの中で 1 回だけ流す。187 の関数が在れば (前に流した) 何もしない
+/// 準備をプロセスの中で 1 回だけ流す。189 の表が在れば (前に流した) 何もしない
 async fn prepare() {
     static PREPARED: OnceCell<()> = OnceCell::const_new();
     PREPARED
@@ -71,7 +71,7 @@ async fn prepare() {
                 .unwrap();
             let done: bool = su
                 .query_one(
-                    "SELECT to_regprocedure('alc_api.list_cam_recording_tenant_ids()') IS NOT NULL",
+                    "SELECT to_regclass('alc_api.cam_stream_devices') IS NOT NULL",
                     &[],
                 )
                 .await
@@ -123,6 +123,14 @@ async fn migrate(su: &Client) {
             .ends_with("_cameras_rtsp.sql")),
         "取り出した migrations に 188 (cameras_rtsp) が無い (scripts/ALC_MIGRATIONS_REV が古い)"
     );
+    assert!(
+        files.iter().any(|f| f
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("_cam_stream_devices.sql")),
+        "取り出した migrations に 189 (cam_stream_devices) が無い (scripts/ALC_MIGRATIONS_REV が古い)"
+    );
     for file in files {
         let name = file.file_name().unwrap().to_owned();
         if let Err(e) = su
@@ -150,7 +158,7 @@ async fn rt() -> PgClient {
         .query_one(
             "SELECT (SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user), \
              (SELECT bool_or(tableowner = current_user) FROM pg_tables WHERE schemaname = 'alc_api' \
-              AND tablename IN ('cameras', 'cam_camera_devices', 'cam_clips', 'hub_measurements', 'vein_enroll_events'))",
+              AND tablename IN ('cameras', 'cam_camera_devices', 'cam_stream_devices', 'cam_clips', 'hub_measurements', 'vein_enroll_events'))",
             &[],
         )
         .await
@@ -555,15 +563,15 @@ async fn cam_host_gets_only_its_linked_cameras_with_decrypted_password() {
     let (s, _) = call(&mut pg, &caller(b, false), "POST", "/cameras", "", json!({"name": "B 入口", "lan_ip": "192.168.10.40", "rtsp_path": "stream1", "rec_password": "pw-b", "device_ids": [device]})).await;
     assert_eq!(s, 201);
 
-    // 並びは名前の順 (DB の照合順)
+    // 順位表が空なので結び付けた端末として全員 1 位。並びは名前の順 (DB の照合順)
     let (s, mine) = call(&mut pg, &cam_host(a, &device), "GET", "/cameras/mine", "", Value::Null).await;
     assert_eq!(s, 200, "{mine}");
     assert_eq!(
         mine,
         json!({"cameras": [
-            {"id": nopass["id"], "name": "A 事務所", "rtsp": {"host": "10.1.2.3", "port": 554, "path": "h264", "username": null, "password": null}},
-            {"id": bare["id"], "name": "A 倉庫", "rtsp": null},
-            {"id": full["id"], "name": "A 入口", "rtsp": {"host": "192.168.10.20", "port": 8554, "path": "stream1", "username": "viewer", "password": "pw-host"}},
+            {"id": nopass["id"], "name": "A 事務所", "rank": 1, "rtsp": {"host": "10.1.2.3", "port": 554, "path": "h264", "username": null, "password": null}},
+            {"id": bare["id"], "name": "A 倉庫", "rank": 1, "rtsp": null},
+            {"id": full["id"], "name": "A 入口", "rank": 1, "rtsp": {"host": "192.168.10.20", "port": 8554, "path": "stream1", "username": "viewer", "password": "pw-host"}},
         ]})
     );
     // 担当の無い端末・別テナントの鍵は自分の分だけ
@@ -587,6 +595,88 @@ async fn cam_host_gets_only_its_linked_cameras_with_decrypted_password() {
     let e = execute(op, &cam_host(a, &device), &mut pg, Some("wrong-key")).await.unwrap_err();
     assert_eq!(e.status, 500);
     assert!(!e.body().to_string().contains("pw-host"));
+}
+
+#[tokio::test]
+async fn cam_host_gets_cameras_by_stream_priority() {
+    let a = tenant().await;
+    let b = tenant().await;
+    let mut pg = rt().await;
+    let admin_a = caller(a, false);
+    let pc1 = format!("alarm:{}", Uuid::new_v4().simple());
+    let pc2 = format!("alarm:{}", Uuid::new_v4().simple());
+    let measure = format!("alarm:{}", Uuid::new_v4().simple());
+    let mine = |c: &Value| -> Vec<(Value, Value)> {
+        c["cameras"].as_array().unwrap().iter().map(|x| (x["name"].clone(), x["rank"].clone())).collect()
+    };
+
+    // 入口: 切り出し用に 3 台を結び付け、配信は pc1 → pc2 の順。倉庫: 配信は pc2 → pc1 (pc2 が主)
+    let (s, gate) = call(&mut pg, &admin_a, "POST", "/cameras", "", json!({"name": "入口", "lan_ip": "192.168.10.20", "rtsp_path": "stream1", "device_ids": [pc1, pc2, measure], "stream_device_ids": [pc1, pc2]})).await;
+    assert_eq!(s, 201, "{gate}");
+    assert_eq!(gate["stream_device_ids"], json!([pc1, pc2]));
+    let (s, _) = call(&mut pg, &admin_a, "POST", "/cameras", "", json!({"name": "倉庫", "stream_device_ids": [pc2, pc1]})).await;
+    assert_eq!(s, 201);
+    // 別テナントの同じ鍵 (見えない)
+    let (s, _) = call(&mut pg, &caller(b, false), "POST", "/cameras", "", json!({"name": "B", "stream_device_ids": [pc1]})).await;
+    assert_eq!(s, 201);
+
+    // 順位の順 (同じ順位は名前の順)。切り出し用に結び付けただけの端末は、順位表のあるカメラを受け持たない
+    let (_, m1) = call(&mut pg, &cam_host(a, &pc1), "GET", "/cameras/mine", "", Value::Null).await;
+    assert_eq!(mine(&m1), vec![(json!("入口"), json!(1)), (json!("倉庫"), json!(2))]);
+    let (_, m2) = call(&mut pg, &cam_host(a, &pc2), "GET", "/cameras/mine", "", Value::Null).await;
+    assert_eq!(mine(&m2), vec![(json!("倉庫"), json!(1)), (json!("入口"), json!(2))]);
+    let (_, m3) = call(&mut pg, &cam_host(a, &measure), "GET", "/cameras/mine", "", Value::Null).await;
+    assert_eq!(m3, json!({"cameras": []}));
+    // 結び付け (切り出し・遠隔点呼) は変えていない
+    let (_, list) = call(&mut pg, &admin_a, "GET", "/cameras", "", Value::Null).await;
+    let row = list["cameras"].as_array().unwrap().iter().find(|c| c["id"] == gate["id"]).unwrap().clone();
+    let mut linked = vec![pc1.clone(), pc2.clone(), measure.clone()];
+    linked.sort();
+    assert_eq!(row["device_ids"], json!(linked));
+    assert_eq!(row["stream_device_ids"], json!([pc1, pc2]));
+
+    // 並べ替え (送ると全差し替え)。省略は変えない
+    let path = format!("/cameras/{}", gate["id"].as_str().unwrap());
+    let (s, swapped) = call(&mut pg, &admin_a, "PATCH", &path, "", json!({"stream_device_ids": [pc2, measure, pc1]})).await;
+    assert_eq!(s, 200, "{swapped}");
+    assert_eq!(swapped["stream_device_ids"], json!([pc2, measure, pc1]));
+    let (_, kept) = call(&mut pg, &admin_a, "PATCH", &path, "", json!({"name": "入口 2"})).await;
+    assert_eq!(kept["stream_device_ids"], json!([pc2, measure, pc1]));
+    let (_, m1) = call(&mut pg, &cam_host(a, &pc1), "GET", "/cameras/mine", "", Value::Null).await;
+    assert_eq!(mine(&m1), vec![(json!("倉庫"), json!(2)), (json!("入口 2"), json!(3))]);
+    // 重複は 400 (何も変えない)
+    let (s, _) = call(&mut pg, &admin_a, "PATCH", &path, "", json!({"stream_device_ids": [pc1, pc1]})).await;
+    assert_eq!(s, 400);
+
+    // 空にすると、結び付けた端末の全員が 1 位に戻る (順位を入れる前の扱い)
+    let (s, cleared) = call(&mut pg, &admin_a, "PATCH", &path, "", json!({"stream_device_ids": []})).await;
+    assert_eq!(s, 200);
+    assert_eq!(cleared["stream_device_ids"], json!([]));
+    let (_, m3) = call(&mut pg, &cam_host(a, &measure), "GET", "/cameras/mine", "", Value::Null).await;
+    assert_eq!(mine(&m3), vec![(json!("入口 2"), json!(1))]);
+    let (_, m1) = call(&mut pg, &cam_host(a, &pc1), "GET", "/cameras/mine", "", Value::Null).await;
+    assert_eq!(mine(&m1), vec![(json!("入口 2"), json!(1)), (json!("倉庫"), json!(2))]);
+
+    // 別テナントの鍵には別テナントの分だけ
+    let (_, in_b) = call(&mut pg, &cam_host(b, &pc1), "GET", "/cameras/mine", "", Value::Null).await;
+    assert_eq!(mine(&in_b), vec![(json!("B"), json!(1))]);
+
+    // カメラを消すと順位表も消える (CASCADE。残っているのは倉庫の 2 行だけ)
+    let su = admin().await;
+    let rows: i64 = su
+        .query_one("SELECT count(*) FROM alc_api.cam_stream_devices WHERE tenant_id = $1", &[&a])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 2);
+    let warehouse = Uuid::parse_str(m1["cameras"][1]["id"].as_str().unwrap()).unwrap();
+    su.execute("DELETE FROM alc_api.cameras WHERE id = $1", &[&warehouse]).await.unwrap();
+    let rows: i64 = su
+        .query_one("SELECT count(*) FROM alc_api.cam_stream_devices WHERE tenant_id = $1", &[&a])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 0);
 }
 
 #[tokio::test]

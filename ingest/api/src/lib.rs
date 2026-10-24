@@ -13,7 +13,8 @@
 //! 応答・ログに資格情報を出さない。一覧の応答は `vpc_binding` を返すが、パスワードは返さない。
 //! 運行管理者席の鍵 ([`Role::TenkoManager`]) に許すのは一覧 (`GET /cameras`) だけで、応答は `id`・`name`・`device_ids` に絞る。
 //! 拠点 PC の配信の鍵 ([`Role::CamHost`]) に許すのは `GET /cameras/mine` だけで、鍵の端末 (`X-Device-Id`) を
-//! `cam_camera_devices` で結び付けたカメラの RTSP の接続先を、パスワードを復号して返す (応答に平文が出る口はここだけ)。
+//! 配信担当の順位表 (`cam_stream_devices`) に入れたカメラの RTSP の接続先を、自分の順位 (`rank`、1 = 主) と
+//! パスワードを復号して返す (応答に平文が出る口はここだけ)。順位表が空のカメラは `cam_camera_devices` の全員を 1 位とする。
 
 pub mod auto;
 pub mod dest;
@@ -33,6 +34,8 @@ pub const DEFAULT_DAYS: i32 = 30;
 pub const MAX_DAYS: i32 = 90;
 /// 結び付ける端末の数の上限・端末 id の長さの上限
 const MAX_DEVICES: usize = 50;
+/// 配信担当の端末の数の上限 (migration 189 の priority の CHECK と同じ)
+const MAX_STREAM_DEVICES: usize = 10;
 const MAX_DEVICE_ID_LEN: usize = 200;
 const MAX_NAME_CHARS: usize = 100;
 const MAX_USERNAME_CHARS: usize = 100;
@@ -174,6 +177,7 @@ pub struct CameraInput {
     rec_password: Option<String>,
     rtsp: RtspInput,
     device_ids: Vec<String>,
+    stream_device_ids: Vec<String>,
 }
 
 /// RTSP の接続先 (`POST` は省略 = 無し・ポートは 554)
@@ -193,6 +197,7 @@ pub struct CameraPatchInput {
     rtsp_port: Change<i32>,
     rtsp_path: Change<Option<String>>,
     device_ids: Option<Vec<String>>,
+    stream_device_ids: Option<Vec<String>>,
 }
 
 impl Op {
@@ -244,6 +249,8 @@ struct CameraBody {
     rtsp_path: Option<Option<String>>,
     #[serde(default)]
     device_ids: Option<Vec<String>>,
+    #[serde(default)]
+    stream_device_ids: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -367,7 +374,25 @@ fn device_ids_of(v: Vec<String>) -> Result<Vec<String>, ApiError> {
     Ok(ids)
 }
 
-const BODY_SHAPE: &str = "本文は {\"name\", \"vpc_binding\", \"rec_username\", \"rec_password\", \"lan_ip\", \"rtsp_port\", \"rtsp_path\", \"device_ids\"} の JSON にしてください";
+/// 配信担当の端末の並び (先頭 = 1 位)。前後の空白を落とす。並びに意味があるので重複は直さず 400
+fn stream_device_ids_of(v: Vec<String>) -> Result<Vec<String>, ApiError> {
+    let ids: Vec<String> = v.into_iter().map(|s| s.trim().to_owned()).collect();
+    if ids
+        .iter()
+        .any(|s| s.is_empty() || s.len() > MAX_DEVICE_ID_LEN)
+    {
+        return Err(bad("stream_device_ids の要素は 1〜200 文字にしてください"));
+    }
+    if ids.len() > MAX_STREAM_DEVICES {
+        return Err(bad("stream_device_ids は 10 件までにしてください"));
+    }
+    if ids.iter().enumerate().any(|(i, id)| ids[..i].contains(id)) {
+        return Err(bad("stream_device_ids に同じ端末が 2 回あります"));
+    }
+    Ok(ids)
+}
+
+const BODY_SHAPE: &str = "本文は {\"name\", \"vpc_binding\", \"rec_username\", \"rec_password\", \"lan_ip\", \"rtsp_port\", \"rtsp_path\", \"device_ids\", \"stream_device_ids\"} の JSON にしてください";
 
 fn camera_input(body: &str, caller: &Caller) -> Result<CameraInput, ApiError> {
     let b: CameraBody = serde_json::from_str(body).map_err(|_| bad(BODY_SHAPE))?;
@@ -393,6 +418,7 @@ fn camera_input(body: &str, caller: &Caller) -> Result<CameraInput, ApiError> {
             rtsp_path: rtsp_path_of(b.rtsp_path.flatten())?,
         },
         device_ids: device_ids_of(b.device_ids.unwrap_or_default())?,
+        stream_device_ids: stream_device_ids_of(b.stream_device_ids.unwrap_or_default())?,
     })
 }
 
@@ -429,6 +455,7 @@ fn camera_patch(body: &str) -> Result<CameraPatchInput, ApiError> {
         rtsp_port: change(b.rtsp_port, rtsp_port_of)?,
         rtsp_path: change(b.rtsp_path, rtsp_path_of)?,
         device_ids: b.device_ids.map(device_ids_of).transpose()?,
+        stream_device_ids: b.stream_device_ids.map(stream_device_ids_of).transpose()?,
     })
 }
 
@@ -581,6 +608,7 @@ fn camera_json(c: &CameraRow) -> Value {
         "rtsp_port": c.rtsp_port,
         "rtsp_path": c.rtsp_path,
         "device_ids": c.device_ids,
+        "stream_device_ids": c.stream_device_ids,
         "rec_scanned_until": c.rec_scanned_until_ms.map(jst_iso),
     })
 }
@@ -594,7 +622,7 @@ fn camera_json_for_tenko_manager(c: &CameraRow) -> Value {
     })
 }
 
-/// 拠点 PC への 1 件。RTSP は `lan_ip` と `rtsp_path` が両方在るときだけ (無ければ null)。
+/// 拠点 PC への 1 件 (`rank` = この端末の配信担当の順位、1 = 主)。RTSP は `lan_ip` と `rtsp_path` が両方在るときだけ (無ければ null)。
 /// ユーザー名・パスワードは録画用 (`rec_*`) を使い回し、パスワードは復号した平文 (未設定なら null)
 fn my_camera_json(c: &MyCamera, key: &str) -> Result<Value, ApiError> {
     let rtsp = match (&c.lan_ip, &c.rtsp_path) {
@@ -617,7 +645,7 @@ fn my_camera_json(c: &MyCamera, key: &str) -> Result<Value, ApiError> {
         }
         _ => Value::Null,
     };
-    Ok(json!({ "id": c.id, "name": c.name, "rtsp": rtsp }))
+    Ok(json!({ "id": c.id, "name": c.name, "rank": c.rank, "rtsp": rtsp }))
 }
 
 fn db_error(e: &tokio_postgres::Error) -> ApiError {
@@ -690,6 +718,7 @@ pub async fn execute(
                 rtsp_port: c.rtsp.rtsp_port,
                 rtsp_path: c.rtsp.rtsp_path,
                 device_ids: c.device_ids,
+                stream_device_ids: c.stream_device_ids,
             };
             let row = pg::create_camera(pg, tenant, new)
                 .await
@@ -716,6 +745,7 @@ pub async fn execute(
                 rtsp_port: p.rtsp_port,
                 rtsp_path: p.rtsp_path,
                 device_ids: p.device_ids,
+                stream_device_ids: p.stream_device_ids,
             };
             match pg::update_camera(pg, tenant, id, patch, caller.developer)
                 .await
@@ -1167,12 +1197,14 @@ mod tests {
             rtsp_path: Some("stream1".to_owned()),
             rec_username: Some("viewer".to_owned()),
             rec_password_encrypted: Some(enc.clone()),
+            rank: 2,
         };
         assert_eq!(
             my_camera_json(&cam, key).unwrap(),
             json!({
                 "id": "00000000-0000-4000-8000-0000000000aa",
                 "name": "入口",
+                "rank": 2,
                 "rtsp": {"host": "192.168.1.64", "port": 554, "path": "stream1", "username": "viewer", "password": "p@ss"},
             })
         );
@@ -1222,6 +1254,7 @@ mod tests {
             rec_username: Some("viewer".to_owned()),
             has_password: true,
             device_ids: vec!["dev-1".to_owned(), "dev-2".to_owned()],
+            stream_device_ids: vec!["dev-2".to_owned(), "dev-1".to_owned()],
             rec_scanned_until_ms: Some(1_761_191_880_000),
             lan_ip: Some("192.168.1.64".to_owned()),
             rtsp_port: 554,
@@ -1237,6 +1270,7 @@ mod tests {
         );
         // 管理者の 1 件は今までどおり録画の設定まで返す
         let full = camera_json(&row);
+        assert_eq!(full["stream_device_ids"], json!(["dev-2", "dev-1"]));
         for k in ["vpc_binding", "rec_username", "has_password", "recording", "rec_scanned_until", "lan_ip", "rtsp_port", "rtsp_path"] {
             assert!(full.get(k).is_some(), "{k}");
         }
@@ -1335,6 +1369,43 @@ mod tests {
         assert_eq!(binding("PATCH", &path, r#"{"vpc_binding":null}"#), None);
         assert_eq!(binding("PATCH", &path, r#"{"name":"y"}"#), None);
         assert_eq!(binding("GET", "/cameras", ""), None);
+    }
+
+    #[test]
+    fn stream_device_ids_keep_order_and_reject_duplicates() {
+        let c = admin(false);
+        let Ok(Op::CreateCamera(input)) = parse("POST", "/cameras", "", r#"{"name":"x","stream_device_ids":[" alarm:b ","alarm:a"]}"#, &c, 0) else {
+            panic!("作成になる");
+        };
+        // 並びが順位なので並べ替えない (device_ids は並べ替える)
+        assert_eq!(input.stream_device_ids, vec!["alarm:b".to_owned(), "alarm:a".to_owned()]);
+        let Ok(Op::CreateCamera(none)) = parse("POST", "/cameras", "", r#"{"name":"x"}"#, &c, 0) else {
+            panic!("作成になる");
+        };
+        assert!(none.stream_device_ids.is_empty());
+        let id = "/cameras/00000000-0000-4000-8000-0000000000aa";
+        let Ok(Op::UpdateCamera(_, keep)) = parse("PATCH", id, "", r#"{"name":"y"}"#, &c, 0) else {
+            panic!("編集になる");
+        };
+        assert_eq!(keep.stream_device_ids, None);
+        let Ok(Op::UpdateCamera(_, clear)) = parse("PATCH", id, "", r#"{"stream_device_ids":[]}"#, &c, 0) else {
+            panic!("編集になる");
+        };
+        assert_eq!(clear.stream_device_ids, Some(vec![]));
+        for body in [
+            r#"{"name":"x","stream_device_ids":["a","a"]}"#,
+            r#"{"name":"x","stream_device_ids":["a"," a"]}"#,
+            r#"{"name":"x","stream_device_ids":[""]}"#,
+            r#"{"name":"x","stream_device_ids":["1","2","3","4","5","6","7","8","9","10","11"]}"#,
+            r#"{"name":"x","stream_device_ids":"a"}"#,
+        ] {
+            assert_eq!(status(parse("POST", "/cameras", "", body, &c, 0)), 400, "{body}");
+        }
+        let long = format!(r#"{{"stream_device_ids":["{}"]}}"#, "x".repeat(201));
+        assert_eq!(status(parse("PATCH", id, "", &long, &c, 0)), 400);
+        let ten: Vec<String> = (1..=10).map(|n| format!("d{n}")).collect();
+        let body = json!({ "name": "x", "stream_device_ids": ten }).to_string();
+        assert!(parse("POST", "/cameras", "", &body, &c, 0).is_ok());
     }
 
     #[test]
