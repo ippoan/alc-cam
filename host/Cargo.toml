@@ -3,7 +3,7 @@
 # シグナリング (cf-alc-signaling の /cam-room) は拡張が持ち、ここへは stdin/stdout の JSON で中継される。
 [package]
 name = "alc-cam-host"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 publish = false
 

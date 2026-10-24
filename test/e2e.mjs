@@ -370,7 +370,7 @@ const checks = results.error ? {} : {
   reconnectsAfterSwStop: results.afterSwRestart.cDelta > 0,
   stoppedByToggle: !!results.stoppedByToggle,
   // 更新の確認は host の版を添えてパネルに出て、確認のためだけの host は残らない
-  updateCheck: results.update?.includes('host v0.4.0') && results.afterUpdateCheck?.hostRunning === false,
+  updateCheck: results.update?.includes('host v0.4.1') && results.afterUpdateCheck?.hostRunning === false,
   // ディスクの拡張が新しくなっていたら読み込み直し、配信に戻る
   reloadsWhenUpdatedOnDisk: results.reloadedVersion === '99.0.0',
   // 読み込み直しの後はパスワード待ち (写しのカメラ id は残る)、鍵が届けば繋ぎ直す
