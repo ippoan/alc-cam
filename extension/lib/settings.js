@@ -24,3 +24,6 @@ export const LEGACY_KEYS = ['siteId', 'rtspUrl'];
 export async function loadSettings() {
   return { ...DEFAULTS, ...(await chrome.storage.local.get(Object.keys(DEFAULTS))) };
 }
+
+/** 「停止」/「開始」(パネルと点呼の画面の両方から)。background は storage.onChanged で繋ぎ直す */
+export const setEnabled = (enabled) => chrome.storage.local.set({ enabled });

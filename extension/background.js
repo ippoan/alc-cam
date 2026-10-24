@@ -19,15 +19,19 @@
 // 担当カメラの写し (パスワード以外) は storage.local、パスワードは storage.session (メモリ) に置くので、
 // 鍵が切れても・service worker が止まっても配信は続く。v0.3.0 の手入力の設定は DB から引けるまでの間だけ使い、引けたら消す。
 //
-// 自己更新: 6 時間ごと (最初は 10 分後) とパネルの「今すぐ確認」で host に update_check を送る。
+// 点呼の画面から: 同じ PWA (alc.ippoan.org) が {type:'cam_status'} で状態を読み、{type:'cam_control', action} で
+// 停止/開始・更新確認・担当カメラの取り直しをする (拠点 PC は点呼を PWA で開いていてパネルが見えないため)。
+// 中身はパネルと同じ (状態 = status、停止/開始 = storage.local の enabled、更新確認 = checkHostUpdate)。docs/extension-messages.md
+//
+// 自己更新: 6 時間ごと (最初は 10 分後) とパネル・点呼の画面の「今すぐ確認」で host に update_check を送る。
 // host が動いていなければ (見る人なし) 確認のためだけに起動し、答えが来たら切る。host は自分の exe (次の起動から) と、
 // この拡張のフォルダ (%LOCALAPPDATA%\alc-cam\extension、見る人が居ない時だけ) を Release の版に入れ替える。
 // 拡張はディスクの manifest.json の版が動いている版と違えば chrome.runtime.reload() で読み込み直す。
 
 import { HOST_NAME, Host } from './lib/host.js';
 import { CamRoom } from './lib/signaling.js';
-import { fetchMine, parseTokenMessage, rtspUrl } from './lib/config.js';
-import { LEGACY_KEYS, PASSWORD_KEY, STATUS_KEY, loadSettings } from './lib/settings.js';
+import { CONTROL_ACTIONS, fetchMine, fromPwa, parseTokenMessage, redactRtsp, rtspUrl, tokenSub } from './lib/config.js';
+import { LEGACY_KEYS, PASSWORD_KEY, STATUS_KEY, loadSettings, setEnabled } from './lib/settings.js';
 
 const ALARM = 'alc-cam-watchdog';
 // 最後の見る人が離れてから host を止めるまで。stop を送った直後に port を切ると、
@@ -61,16 +65,28 @@ const liveToken = () => (token && token.exp > Date.now() ? token.value : '');
 // ---- 状態 (パネルが storage.session を読む) -------------------------------
 
 const status = {
-  /** 鍵の期限 (ミリ秒)。鍵そのものは書かない */
+  /** 鍵の期限 (ミリ秒) と sub。鍵そのものは書かない */
   tokenExp: 0,
+  tokenSub: '',
   config: ['-', ''],
+  /** 配っている (配る) 担当カメラ。決まっていなければ null */
+  assigned: null,
+  /** host の版 (起動したか更新の確認で分かったら) */
+  hostVersion: '',
   signal: ['停止', ''],
   host: ['停止', ''],
   camera: ['-', ''],
   /** @type {{ok: boolean, message: string}[]} */
   viewers: [],
   update: ['-', ''],
+  /** 最後の更新確認の結果 (host の update の state か 'error') と時刻 (ミリ秒) */
+  updateState: '',
+  updateAt: 0,
+  /** @type {null | {message: string, at: number}} 直近のエラー */
+  lastError: null,
 };
+
+const noteError = (message) => report({ lastError: { message, at: Date.now() } });
 
 function report(patch) {
   Object.assign(status, patch);
@@ -116,6 +132,7 @@ class Relay {
         this.hostReady = false;
         for (const v of this.viewers.values()) Object.assign(v, { ok: false, message: 'host 停止' });
         report({ host: [`停止: ${reason}`, 'warn'] });
+        noteError(`host: ${reason}`);
         this.renderViewers();
       },
     });
@@ -175,6 +192,7 @@ class Relay {
         break;
       case 'error':
         console.warn('cam-room:', msg.message);
+        noteError(`cam-room: ${msg.message}`);
         break;
     }
   }
@@ -183,7 +201,7 @@ class Relay {
     switch (msg.type) {
       case 'ready':
         this.hostReady = true;
-        report({ host: [`起動 (v${msg.version})`, 'ok'] });
+        report({ host: [`起動 (v${msg.version})`, 'ok'], hostVersion: msg.version });
         // 起動直後・host が落ちて起動し直したとき、見る人がまだ居れば offer を作らせる
         for (const id of this.viewers.keys()) this.host.send({ type: 'start', viewer_id: id });
         this.idleHost();
@@ -245,7 +263,8 @@ export function updateLabel(msg, now = new Date()) {
 
 /** @returns {boolean} 確認が終わった (checking 以外) */
 function reportUpdate(msg) {
-  report({ update: updateLabel(msg) });
+  report({ update: updateLabel(msg), hostVersion: msg.current, updateState: msg.state, updateAt: Date.now() });
+  if (msg.state === 'error') noteError(`更新: ${msg.message}`);
   if (msg.state === 'checking') return false;
   reloadIfUpdatedOnDisk();
   return true;
@@ -264,13 +283,23 @@ async function reloadIfUpdatedOnDisk() {
   }
 }
 
+// 拡張の中で終わった確認の失敗 (host の答えが無い)
+function updateFailed(label) {
+  report({ update: [label, 'warn'], updateState: 'error', updateAt: Date.now() });
+  noteError(label);
+}
+
+/** @returns {string} 何をしたか (点呼の画面に返す) */
 function checkHostUpdate() {
-  if (relay?.hostReady) return relay.host.send({ type: 'update_check' });
+  if (relay?.hostReady) {
+    relay.host.send({ type: 'update_check' });
+    return '確認を始めました (配信中の host)';
+  }
   // 見る人のための host が起動中: 次の回に回す
-  if (relay?.host) return;
+  if (relay?.host) return 'host の起動中です。次の回 (6 時間ごと) か、少し待ってもう一度';
   const port = chrome.runtime.connectNative(HOST_NAME);
   const timer = setTimeout(() => {
-    report({ update: ['更新の確認が終わりません (中断)', 'warn'] });
+    updateFailed('更新の確認が終わりません (中断)');
     port.disconnect();
   }, UPDATE_TIMEOUT_MS);
   // 自己更新を知らない古い host は update を返さない
@@ -278,7 +307,7 @@ function checkHostUpdate() {
   const legacy = setTimeout(() => {
     if (heard) return;
     clearTimeout(timer);
-    report({ update: ['この host は自己更新に対応していません (alc-cam.msi で入れ直してください)', 'warn'] });
+    updateFailed('この host は自己更新に対応していません (alc-cam.msi で入れ直してください)');
     port.disconnect();
   }, UPDATE_LEGACY_MS);
   port.onMessage.addListener((msg) => {
@@ -292,9 +321,10 @@ function checkHostUpdate() {
   port.onDisconnect.addListener(() => {
     clearTimeout(timer);
     clearTimeout(legacy);
-    report({ update: [`更新を確認できません: ${chrome.runtime.lastError?.message ?? 'host が終了しました'}`, 'warn'] });
+    updateFailed(`更新を確認できません: ${chrome.runtime.lastError?.message ?? 'host が終了しました'}`);
   });
   port.postMessage({ type: 'update_check' });
+  return '確認を始めました (確認のためだけに host を起動)';
 }
 
 // ---- 設定から繋ぐ (何度呼んでもよい) -------------------------------------
@@ -322,7 +352,12 @@ async function resolve() {
 
 async function sync() {
   const s = await resolve();
-  report({ tokenExp: token?.exp ?? 0, config: s.wait ? [configNote || s.wait, 'warn'] : [configNote ? `${s.name} (${configNote})` : s.name, configNote ? 'warn' : 'ok'] });
+  report({
+    tokenExp: token?.exp ?? 0,
+    tokenSub: token ? tokenSub(token.value) : '',
+    assigned: s.siteId ? { id: s.siteId, name: s.name } : null,
+    config: s.wait ? [configNote || s.wait, 'warn'] : [configNote ? `${s.name} (${configNote})` : s.name, configNote ? 'warn' : 'ok'],
+  });
   const key = JSON.stringify(s);
   if (key === current) return;
   current = key;
@@ -334,12 +369,17 @@ async function sync() {
   relay.start();
 }
 
-const resync = () => (chain = chain.then(sync).catch((e) => console.error('sync', e)));
+const resync = () =>
+  (chain = chain.then(sync).catch((e) => {
+    console.error('sync', e);
+    noteError(`繋ぎ直し: ${e.message}`);
+  }));
 
 // 鍵で担当カメラを引き直す。変わっていれば resync が繋ぎ直す (同じなら今の接続のまま)
+/** @returns {Promise<{ok: boolean, message: string}>} */
 async function refreshConfig() {
   const t = liveToken();
-  if (!t) return;
+  if (!t) return { ok: false, message: '鍵がありません (点呼の画面が鍵を渡すまで待ってください)' };
   const s = await loadSettings();
   try {
     const r = await fetchMine(s.apiUrl, t);
@@ -355,17 +395,58 @@ async function refreshConfig() {
     }
   } catch (e) {
     configNote = `${e.message}。前の設定のまま`;
+    noteError(configNote);
   }
-  resync();
+  await resync();
+  return { ok: !configNote, message: configNote || '担当カメラを取り直しました' };
 }
 
-// 点呼の PWA から鍵を受ける (externally_connectable で alc.ippoan.org だけ。送り主の origin も確かめる)
-chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
+// ---- 点呼の画面 (alc.ippoan.org) から ----------------------------------------
+
+/** パネルと同じ状態に版と「停止」を添える (鍵の中身・パスワード・RTSP の URL は入れない) */
+async function snapshot() {
+  const { enabled } = await loadSettings();
+  const st = { ...status, version: chrome.runtime.getManifest().version, enabled, tokenLive: !!liveToken() };
+  return JSON.parse(redactRtsp(JSON.stringify(st)));
+}
+
+async function control(action) {
+  switch (action) {
+    case 'stop':
+    case 'start':
+      await setEnabled(action === 'start');
+      await resync();
+      return { ok: true, message: action === 'start' ? '開始しました' : '停止しました' };
+    case 'update_check':
+      return { ok: true, message: checkHostUpdate() };
+    case 'refetch':
+      return refreshConfig();
+  }
+}
+
+async function onExternal(msg, sender) {
+  // 鍵 (parseTokenMessage が origin も確かめる)
   const t = parseTokenMessage(msg, sender);
-  if (!t) return sendResponse({ ok: false });
-  token = { value: t.token, exp: t.exp };
-  sendResponse({ ok: true });
-  refreshConfig().catch((e) => console.error('refreshConfig', e));
+  if (t) {
+    token = { value: t.token, exp: t.exp };
+    refreshConfig().catch((e) => console.error('refreshConfig', e));
+    return { ok: true };
+  }
+  if (!fromPwa(sender)) return { ok: false, error: 'origin' };
+  if (msg?.type === 'cam_status') return { ok: true, status: await snapshot() };
+  if (msg?.type === 'cam_control' && CONTROL_ACTIONS.includes(msg.action)) {
+    const r = await control(msg.action);
+    return { ...r, status: await snapshot() };
+  }
+  return { ok: false, error: 'unknown' };
+}
+
+// externally_connectable で alc.ippoan.org のページだけが送れる。送り主の origin も確かめる
+chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
+  onExternal(msg, sender)
+    .then(sendResponse)
+    .catch((e) => sendResponse({ ok: false, error: e.message }));
+  return true;
 });
 
 chrome.runtime.onStartup.addListener(resync);

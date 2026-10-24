@@ -14,6 +14,8 @@ WebRTC (P2P) で見る側へ届ける。alc-gw (Go の常駐アプリ) を置か
 - 拡張は TCP を張れないので、RTSP と WebRTC は Rust の host が持つ。host は見る人が来たときに拡張が起動し、最後の 1 人が離れると終わる (サービス常駐しない)
 - 配信の本体は拡張の background service worker (`extension/background.js`)。担当カメラが決まっていれば Chrome の起動と同時に cam-room に繋ぎ、
   パネルを開いていなくても、閉じても配信は続く。サイドパネルは状態の表示と「停止」だけ (やり取りは `chrome.storage`)
+- 点呼の画面 (同じ PWA のメンテナンス) から、その端末の拡張の状態を読み、停止/開始・更新確認・担当カメラの取り直しができる (v0.4.2〜)。
+  `{type:'cam_status'}` / `{type:'cam_control', action}` をパネルと同じ実装で受ける。形は [docs/extension-messages.md](docs/extension-messages.md)
 - 拠点とカメラは手で入れない (v0.4.0〜)。点呼の PWA (`https://alc.ippoan.org`) が CoreS3 の署名で取った鍵
   (role `device-cam-host`、TTL 900 秒) を `chrome.runtime.sendMessage(拡張 ID, {type:'cam_host_token', token, exp})` で渡し
   (`externally_connectable`、送り主の origin も確かめる)、拡張がその鍵で auth-worker の
