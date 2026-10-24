@@ -2,7 +2,8 @@
 //
 //   点呼の PWA (https://alc.ippoan.org) ─chrome.runtime.sendMessage({type:'cam_host_token', token, exp})─▶ background
 //   background ─GET ${apiUrl}/device-data-proxy/api/cam-clips/cameras/mine (Bearer 鍵)─▶ auth-worker ─▶ alc-cam ingest
-//     → { cameras: [{ id, name, rtsp: { host, port, path, username, password } | null }] }
+//     → { cameras: [{ id, name, rank, rtsp: { host, port, path, username, password } | null }] }
+//   rank = この端末の配信担当の順位 (1 = 主。並びは rank の順なので先頭が最も上位)。cam-room に ?rank= で付ける
 //
 // 鍵は role=device-cam-host の device JWT (TTL 900 秒、PWA が期限の 60 秒前に取り直して渡し直す)。
 // /device-data-proxy は Bearer の device JWT を直接検証する口なので、alc-app の /api/proxy (cookie を優先する) を通さない。
@@ -49,8 +50,8 @@ export function rtspUrl({ host, port, path, username }, password) {
 }
 
 /**
- * 担当カメラを引く。先頭の 1 台だけ使う (1 PC 1 カメラ)。
- * @returns {Promise<{camera: null, reason: string} | {camera: {id, name, rtsp: object}, password: string}>}
+ * 担当カメラを引く。先頭の 1 台だけ使う (1 PC 1 カメラ。並びは順位の順)。rank を返さない ingest なら 0 (= 順位を付けずに入る)
+ * @returns {Promise<{camera: null, reason: string} | {camera: {id, name, rank, rtsp: object}, password: string}>}
  * 通信の失敗・401/403 等は throw (呼び手は写しのまま配信を続ける)
  */
 export async function fetchMine(apiUrl, token) {
@@ -66,5 +67,6 @@ export async function fetchMine(apiUrl, token) {
   if (!r?.host) return { camera: null, reason: `${first.name ?? first.id}: RTSP の接続先が未設定です (録画の画面で入れてください)` };
   const { password = '', ...rest } = r;
   const rtsp = { host: String(rest.host), port: Number(rest.port) || 0, path: String(rest.path ?? ''), username: String(rest.username ?? '') };
-  return { camera: { id: String(first.id), name: String(first.name ?? first.id), rtsp }, password: String(password ?? '') };
+  const rank = Number.isInteger(first.rank) && first.rank >= 1 ? first.rank : 0;
+  return { camera: { id: String(first.id), name: String(first.name ?? first.id), rank, rtsp }, password: String(password ?? '') };
 }

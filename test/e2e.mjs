@@ -372,7 +372,7 @@ const checks = results.error ? {} : {
   extStatus: (() => {
     const st = results.extStatus;
     const json = JSON.stringify(st);
-    return st?.version === '0.4.2' && st.enabled === true && st.tokenLive === true && st.tokenSub === TOKEN_SUB &&
+    return st?.version === '0.4.3' && st.enabled === true && st.tokenLive === true && st.tokenSub === TOKEN_SUB &&
       st.assigned?.id === 'test-site' && st.signal?.[0] === '接続済み' && !json.includes(CAM_PASS) && !json.includes('eyJ') && !json.includes('rtsp://');
   })(),
   // 取り直しは /cameras/mine を 1 回呼び、同じカメラなら繋ぎ直さない
@@ -380,7 +380,7 @@ const checks = results.error ? {} : {
   extStopStart: results.extStop?.ok === true && results.extStoppedStatus?.enabled === false && results.extStart?.ok === true &&
     results.extStart.status?.enabled === true,
   extUnknownRejected: results.extUnknown?.ok === false,
-  extUpdateCheck: results.extUpdate?.ok === true && results.extUpdateStatus?.updateState === 'unsupported' && results.extUpdateStatus.hostVersion === '0.4.2',
+  extUpdateCheck: results.extUpdate?.ok === true && results.extUpdateStatus?.updateState === 'unsupported' && results.extUpdateStatus.hostVersion === '0.4.3',
   // 鍵は alc.ippoan.org からだけ受ける (他の origin には chrome.runtime.sendMessage 自体が生えない = 状態も操作も届かない)
   pwaOnly: results.evilHasSendMessage === 'undefined' && results.token1Reply?.ok === true,
   zeroCamerasReason: !!results.zeroCameras,
@@ -412,7 +412,7 @@ const checks = results.error ? {} : {
   reconnectsAfterSwStop: results.afterSwRestart.cDelta > 0,
   stoppedByToggle: !!results.stoppedByToggle,
   // 更新の確認は host の版を添えてパネルに出て、確認のためだけの host は残らない
-  updateCheck: results.update?.includes('host v0.4.2') && results.afterUpdateCheck?.hostRunning === false,
+  updateCheck: results.update?.includes('host v0.4.3') && results.afterUpdateCheck?.hostRunning === false,
   // ディスクの拡張が新しくなっていたら読み込み直し、配信に戻る
   reloadsWhenUpdatedOnDisk: results.reloadedVersion === '99.0.0',
   // 読み込み直しの後はパスワード待ち (写しのカメラ id は残る)、鍵が届けば繋ぎ直す

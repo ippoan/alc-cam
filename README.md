@@ -27,6 +27,9 @@ WebRTC (P2P) で見る側へ届ける。alc-gw (Go の常駐アプリ) を置か
 - 常時接続の保ち方: 20 秒ごとに `{"type":"ping"}` ちょうどを送る (cam-room は `setWebSocketAutoResponse` で `{"type":"pong"}` を返し、DO は hibernate したまま)。
   この送受信が service worker も生かす。pong が 60 秒来なければ繋ぎ直し、切れたら 1s→60s のバックオフ。
   service worker が止まっても 30 秒ごとの alarm で起き直し、設定から繋ぎ直す (状態をメモリに頼らない)。Chrome 116 以降
+- 配信担当の順位 (v0.4.3〜): 同じカメラを複数の拠点 PC が担当するとき、`/cameras/mine` の `rank` (1 = 主。録画の画面の「配信担当 (順位)」) を
+  cam-room に `?rank=N` で付けて入る。上位か同位の端末が配信中なら cam-room が受け入れてすぐ 4011 で閉じ、上位の端末が来れば今の接続を 4010 で切る。
+  どちらも「待機中」になり、30〜60 秒 (乱数) おきに入り直す (上位が落ちていれば入れる = 引き継ぐ)。パネルと点呼の画面の状態に順位と待機が出る
 - シグナリングは `cf-alc-signaling` の `/cam-room` を使う。部屋の名前は `alc_api.cameras.id` (担当カメラの id)。見る側は既存の alc-app のまま
 - **1 台のカメラを最大 4 人が同時に見られる** (cam-room v2。DO が見る人ごとに `viewer_id` を付ける)。
   RTSP はカメラにつき 1 本で、最初の 1 人で開き最後の 1 人が離れたら TEARDOWN、映像は見る人ごとの PeerConnection へ複製する。
@@ -153,7 +156,11 @@ cargo build -p alc-cam-host
 cd test && npm install && npx playwright-core install chromium
 node make-fixture.mjs   # 偽カメラの H.264 を作る (branded Chrome の WebCodecs を使う)
 node e2e.mjs            # 偽カメラ → host → 拡張 → cam-room → 見る側 を通す
+node e2e-priority.mjs   # 拠点 PC 2 台 (rank 1 / 2) で待機・引き継ぎ・1 位への戻り
 ```
+
+`e2e-priority.mjs` が確かめること: 1 位が配信し 2 位は待機 (状態に順位と待機) / 待機は入り直しても見る人の接続を揺らさない /
+1 位を停止すると 2 位が入り直して引き継ぎ、見る人に映る / 1 位を開始すると 2 位を 4010 で切って 1 位に戻り、見る人に再び映り、2 位は待機に戻る。
 
 `e2e.mjs` が確かめること: 拠点もカメラも決まらないうちは繋がない / v0.3.0 の手入力の設定が残っていればそれで繋ぐ /
 偽の点呼の PWA (`https://alc.ippoan.org` を route で差し替え) が渡す鍵で偽の `/cameras/mine` を引き、担当カメラの部屋に `?token=` 付きで入る
@@ -166,7 +173,7 @@ service worker を CDP で止めても起き直して (鍵無しで) 写しか�
 DB の担当カメラが変わったら次の鍵で繋ぎ直す (v1 の部屋でも 1 人なら映る) /
 見る人が居ないときの「今すぐ確認」で確認のためだけに host を起こし、答えがパネルに出て host が止まる (Linux の host は入れ替えないので unsupported) /
 ディスクの拡張の manifest.json の版が上がっていたら確認の答えで読み込み直し、パスワード待ちを経て次の鍵で cam-room に繋ぎ直す (拡張は写しを読み込み、デベロッパー モードは ON) /
-「停止」で cam-room から抜ける。`signaling.mjs` は cam-room の v2 (と `v1Sites` に入れた部屋の v1)、
+「停止」で cam-room から抜ける。`signaling.mjs` は cam-room の v2 (と `v1Sites` に入れた部屋の v1)、配信担当の順位 (4010 / 4011)、
 keepalive の自動応答 (完全一致の ping にだけ pong) を写している。
 
 ## 未確認・未対応
