@@ -21,12 +21,20 @@ function tokenLabel(exp, now = Date.now()) {
   return exp > now ? [`あり (${at} まで)`, 'ok'] : [`期限切れ (${at})。配信は続けます`, ''];
 }
 
+/** 配信の順位と待機 (順位を知らなければ '-') */
+function rankLabel(st) {
+  if (!st.rank) return ['-', ''];
+  const head = `${st.rank} 位${st.rank === 1 ? ' (主)' : ''}`;
+  return st.standby ? [`${head}・待機中 (上位の端末が配信中)`, ''] : [head, 'ok'];
+}
+
 let lastStatus = null;
 function renderStatus(st) {
   if (!st) return;
   lastStatus = st;
   setStatus('st-token', tokenLabel(st.tokenExp));
   if (st.config) setStatus('st-config', st.config);
+  setStatus('st-rank', rankLabel(st));
   setStatus('st-host', st.host);
   setStatus('st-signal', st.signal);
   setStatus('st-camera', st.camera);

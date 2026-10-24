@@ -19,6 +19,9 @@
 // 担当カメラの写し (パスワード以外) は storage.local、パスワードは storage.session (メモリ) に置くので、
 // 鍵が切れても・service worker が止まっても配信は続く。v0.3.0 の手入力の設定は DB から引けるまでの間だけ使い、引けたら消す。
 //
+// 配信担当の順位: 担当カメラの rank (1 = 主) を cam-room に ?rank= で付ける。上位の端末が配信中なら cam-room が閉じて
+// (4011 / 上位が来たら 4010) 待機に回り、30〜60 秒おきに入り直す (lib/signaling.js)。状態の rank / standby で見える。
+//
 // 点呼の画面から: 同じ PWA (alc.ippoan.org) が {type:'cam_status'} で状態を読み、{type:'cam_control', action} で
 // 停止/開始・更新確認・担当カメラの取り直しをする (拠点 PC は点呼を PWA で開いていてパネルが見えないため)。
 // 中身はパネルと同じ (状態 = status、停止/開始 = storage.local の enabled、更新確認 = checkHostUpdate)。docs/extension-messages.md
@@ -52,6 +55,7 @@ export function roomUrl(s, token) {
   const url = new URL(`${s.signalingUrl}/cam-room/${encodeURIComponent(s.siteId)}`);
   url.searchParams.set('role', 'device');
   url.searchParams.set('proto', '2');
+  if (s.rank) url.searchParams.set('rank', String(s.rank));
   if (token) url.searchParams.set('token', token);
   return url.toString();
 }
@@ -71,6 +75,10 @@ const status = {
   config: ['-', ''],
   /** 配っている (配る) 担当カメラ。決まっていなければ null */
   assigned: null,
+  /** 担当カメラの配信の順位 (1 = 主)。順位を知らない (手入力・古い ingest) なら 0 */
+  rank: 0,
+  /** 上位の端末が配信中で、cam-room に入れず待っている */
+  standby: false,
   /** host の版 (起動したか更新の確認で分かったら) */
   hostVersion: '',
   signal: ['停止', ''],
@@ -106,9 +114,11 @@ class Relay {
 
     this.room = new CamRoom({
       url: () => roomUrl(s, liveToken()),
+      standbyRetryMs: s.standbyRetryMs,
       onState: (state, detail) => {
+        if (state === 'standby') return report({ standby: true, signal: [detail, 'ok'] });
         const label = { connecting: '接続中…', open: '接続済み', closed: '切断' }[state];
-        report({ signal: [detail ? `${label} (${detail})` : label, state === 'open' ? 'ok' : state === 'closed' ? 'warn' : ''] });
+        report({ standby: false, signal: [detail ? `${label} (${detail})` : label, state === 'open' ? 'ok' : state === 'closed' ? 'warn' : ''] });
       },
       onMessage: (msg) => this.onRoom(msg),
     });
@@ -339,11 +349,11 @@ let configNote = '';
 /** 配る先を決める。決まらなければ wait に理由 */
 async function resolve() {
   const s = await loadSettings();
-  const base = { enabled: s.enabled, signalingUrl: s.signalingUrl, stun: s.stun };
+  const base = { enabled: s.enabled, signalingUrl: s.signalingUrl, stun: s.stun, standbyRetryMs: s.standbyRetryMs };
   if (s.camera) {
     const pw = (await chrome.storage.session.get(PASSWORD_KEY))[PASSWORD_KEY];
     if (pw === undefined) return { ...base, wait: `${s.camera.name}: パスワード待ち (点呼の画面から鍵が届くまで)` };
-    return { ...base, name: s.camera.name, siteId: s.camera.id, rtspUrl: rtspUrl(s.camera.rtsp, pw) };
+    return { ...base, name: s.camera.name, siteId: s.camera.id, rank: s.camera.rank || 0, rtspUrl: rtspUrl(s.camera.rtsp, pw) };
   }
   const legacy = await chrome.storage.local.get(LEGACY_KEYS);
   if (legacy.siteId && legacy.rtspUrl) return { ...base, name: `${legacy.siteId} (v0.3.0 の手入力。DB から引けたら切り替わります)`, siteId: legacy.siteId, rtspUrl: legacy.rtspUrl };
@@ -356,6 +366,7 @@ async function sync() {
     tokenExp: token?.exp ?? 0,
     tokenSub: token ? tokenSub(token.value) : '',
     assigned: s.siteId ? { id: s.siteId, name: s.name } : null,
+    rank: s.rank || 0,
     config: s.wait ? [configNote || s.wait, 'warn'] : [configNote ? `${s.name} (${configNote})` : s.name, configNote ? 'warn' : 'ok'],
   });
   const key = JSON.stringify(s);
@@ -363,6 +374,7 @@ async function sync() {
   current = key;
   relay?.stop();
   relay = null;
+  report({ standby: false });
   if (!s.enabled) return report({ signal: ['停止 (パネルで開始)', ''] });
   if (s.wait) return report({ signal: ['担当カメラ待ち', 'warn'] });
   relay = new Relay(s);

@@ -12,8 +12,10 @@ export const DEFAULTS = {
   stun: 'stun.l.google.com:19302',
   // パネルの「停止」で false。既定は配信する (担当カメラが決まっていれば Chrome の起動と同時に繋ぐ)
   enabled: true,
-  /** @type {null | {id: string, name: string, rtsp: {host: string, port: number, path: string, username: string}}} */
+  /** @type {null | {id: string, name: string, rank?: number, rtsp: {host: string, port: number, path: string, username: string}}} */
   camera: null,
+  // 待機 (上位の端末が配信中) から入り直すまで (これ〜2 倍の乱数)。画面は無い上書き (e2e が短くする)
+  standbyRetryMs: 30_000,
 };
 
 export const STATUS_KEY = 'status';

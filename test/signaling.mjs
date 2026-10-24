@@ -8,6 +8,9 @@
 // - keepalive: `{"type":"ping"}` ちょうどには `{"type":"pong"}` ちょうどを返し、log に残さない
 //   (本物は setWebSocketAutoResponse で runtime が返し DO は起きない)。数は keepalive に数える。
 //   1 文字でも違う ping は従来の `ping` 分岐 (log に `device: ping` が残る = 本物なら DO を起こす)
+// - 配信担当の順位 (`?rank=N`): 部屋に device が居るとき、rank 無しは 409、上位 (数が小さい) か居る方が rank 無しなら
+//   居る方を 4010 で切って見る人に peer_left を出してから入れる、同位・下位は受け入れて 4011 で閉じる (本物の decideDeviceEntry。
+//   応答の無い device の判定は写していない)。log に `device preempted` / `device standby (rank N)` を残す
 // - device の `?token=` は検証せず deviceTokens に残す (本物は introspect で role=device-cam-host を確かめる。移行期間は無しも通す)
 // - auth-worker の `GET /device-data-proxy/api/cam-clips/cameras/mine` の写し: Bearer が mine.tokens に入っていれば
 //   mine.cameras を返す (無ければ 401)。拡張の service worker から呼ばれるので CORS を付ける。呼ばれた Bearer は mine.calls に残す
@@ -58,7 +61,8 @@ export function startSignaling({ port, v1Sites = [], mine = { tokens: [], camera
       mine.calls.push(bearer);
       if (!mine.tokens.includes(bearer)) return res.writeHead(401, cors).end('{"error":"Unauthorized"}');
       res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ cameras: mine.cameras }));
+      // 鍵 (端末) ごとに違う担当 (順位) を返すときは byToken
+      return res.end(JSON.stringify({ cameras: mine.byToken?.[bearer] ?? mine.cameras }));
     }
     res.writeHead(404).end();
   });
@@ -72,19 +76,33 @@ export function startSignaling({ port, v1Sites = [], mine = { tokens: [], camera
     const site = m[1];
     const room = rooms.get(site) ?? { device: null, v2: false, admins: new Map() };
     rooms.set(site, room);
-    if (role === 'device' && room.device) return socket.end('HTTP/1.1 409 Conflict\r\n\r\n');
+    const rank = role === 'device' ? parseRank(url.searchParams.get('rank')) : undefined;
+    if (role === 'device' && room.device) {
+      if (rank === undefined) return socket.end('HTTP/1.1 409 Conflict\r\n\r\n');
+      if (room.deviceRank !== undefined && rank >= room.deviceRank) {
+        log.push(`device standby (rank ${rank})`);
+        return wss.handleUpgrade(req, socket, head, (ws) => ws.close(4011, 'standby: higher rank streaming'));
+      }
+      // 入れ替え: 居た device の close では peer_left を出さない (room.device から外す) ので、ここで出す
+      const old = room.device;
+      room.device = null;
+      log.push('device preempted');
+      old.close(4010, 'preempted by higher rank');
+      for (const admin of room.admins.values()) send(admin, { type: 'peer_left', role: 'device' });
+    }
     if (role === 'admin') {
       const limit = room.device && !room.v2 ? 1 : MAX_ADMINS;
       if (room.admins.size >= limit) return socket.end('HTTP/1.1 409 Conflict\r\n\r\nviewer limit');
     }
-    wss.handleUpgrade(req, socket, head, (ws) => (role === 'device' ? onDevice(site, room, ws, url) : onAdmin(site, room, ws)));
+    wss.handleUpgrade(req, socket, head, (ws) => (role === 'device' ? onDevice(site, room, ws, url, rank) : onAdmin(site, room, ws)));
   });
 
-  function onDevice(site, room, ws, url) {
+  function onDevice(site, room, ws, url, rank) {
     room.device = ws;
+    room.deviceRank = rank;
     room.v2 = url.searchParams.get('proto') === '2' && !v1Sites.includes(site);
     log.push(`device joined (${room.v2 ? 'v2' : 'v1'})`);
-    deviceTokens.push({ site, token: url.searchParams.get('token') ?? '' });
+    deviceTokens.push({ site, token: url.searchParams.get('token') ?? '', rank: rank ?? 0 });
     for (const [viewerId, admin] of room.admins) {
       send(admin, { type: 'peer_joined', role: 'device' });
       send(ws, withId(room, { type: 'peer_joined', role: 'admin' }, viewerId));
@@ -147,6 +165,10 @@ export function startSignaling({ port, v1Sites = [], mine = { tokens: [], camera
       log.push(`admin left ${viewerId}`);
       send(room.device, withId(room, { type: 'peer_left', role: 'admin' }, viewerId));
     });
+  }
+
+  function parseRank(v) {
+    return v !== null && /^[1-9]\d?$/.test(v) ? Number(v) : undefined;
   }
 
   function parse(ws, data) {

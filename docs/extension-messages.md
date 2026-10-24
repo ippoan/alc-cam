@@ -34,6 +34,8 @@ callback で `chrome.runtime.lastError` が立つ (呼び手は「拡張が見�
 | `tokenExp` | number | 鍵の期限 (ミリ秒、無ければ 0) |
 | `tokenSub` | string | 鍵の sub (`alarm:<fp>`。照合の確認用。署名は確かめていない) |
 | `assigned` | `{id, name}` \| null | 配る担当カメラ (cam-room の部屋 = id) |
+| `rank` | number | 担当カメラの配信の順位 (1 = 主。ingest の `/cameras/mine` の rank)。順位を知らなければ 0 (0.4.3〜) |
+| `standby` | boolean | 上位か同位の端末が配信中で待機している (cam-room が 4011 / 4010 で閉じた。30〜60 秒おきに入り直す) (0.4.3〜) |
 | `config` | `[文言, class]` | 担当カメラの表示 (取得の失敗・待ちの理由を含む) |
 | `host` / `signal` / `camera` | `[文言, class]` | host・シグナリング (cam-room)・カメラ (RTSP) の状態 |
 | `viewers` | `{ok, message}[]` | 見る人ごとの映像の状態 |
