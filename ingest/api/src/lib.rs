@@ -12,6 +12,9 @@
 //! `cameras.rec_ip` 列に入る ([`pg`])。その binding がこの Worker に在るかは Worker が確かめる ([`Op::vpc_binding`])。
 //! 応答・ログに資格情報を出さない。一覧の応答は `vpc_binding` を返すが、パスワードは返さない。
 //! 運行管理者席の鍵 ([`Role::TenkoManager`]) に許すのは一覧 (`GET /cameras`) だけで、応答は `id`・`name`・`device_ids` に絞る。
+//! カメラの `device_ids` は応答で機体の鍵の ID (`alarm:<fp>`) に畳む (hub の ID は、結び付いた鍵があればその ID。
+//! [`pg::fold_device_ids`])。結び付きの無い hub の ID はそのまま返し、管理者向けには `pending_device_ids` にも入れる
+//! (機体の鍵への置き換え待ち)。保存 (POST / PATCH) は送られた ID のまま。
 //! 拠点 PC の配信の鍵 ([`Role::CamHost`]) に許すのは `GET /cameras/mine` だけで、鍵の端末 (`X-Device-Id`) を
 //! 配信担当の順位表 (`cam_stream_devices`) に入れたカメラの RTSP の接続先を、自分の順位 (`rank`、1 = 主) と
 //! パスワードを復号して返す (応答に平文が出る口はここだけ)。順位表が空のカメラは `cam_camera_devices` の全員を 1 位とする。
@@ -608,6 +611,7 @@ fn camera_json(c: &CameraRow) -> Value {
         "rtsp_port": c.rtsp_port,
         "rtsp_path": c.rtsp_path,
         "device_ids": c.device_ids,
+        "pending_device_ids": c.pending_device_ids,
         "stream_device_ids": c.stream_device_ids,
         "rec_scanned_until": c.rec_scanned_until_ms.map(jst_iso),
     })
@@ -1254,6 +1258,7 @@ mod tests {
             rec_username: Some("viewer".to_owned()),
             has_password: true,
             device_ids: vec!["dev-1".to_owned(), "dev-2".to_owned()],
+            pending_device_ids: vec!["dev-1".to_owned()],
             stream_device_ids: vec!["dev-2".to_owned(), "dev-1".to_owned()],
             rec_scanned_until_ms: Some(1_761_191_880_000),
             lan_ip: Some("192.168.1.64".to_owned()),
@@ -1271,9 +1276,29 @@ mod tests {
         // 管理者の 1 件は今までどおり録画の設定まで返す
         let full = camera_json(&row);
         assert_eq!(full["stream_device_ids"], json!(["dev-2", "dev-1"]));
+        assert_eq!(full["device_ids"], json!(["dev-1", "dev-2"]));
+        assert_eq!(full["pending_device_ids"], json!(["dev-1"]));
         for k in ["vpc_binding", "rec_username", "has_password", "recording", "rec_scanned_until", "lan_ip", "rtsp_port", "rtsp_path"] {
             assert!(full.get(k).is_some(), "{k}");
         }
+    }
+
+    #[test]
+    fn camera_device_ids_fold_hub_ids_into_key_ids() {
+        let links: std::collections::HashMap<String, String> =
+            [("hub-1".to_owned(), "alarm:aaaa".to_owned())].into_iter().collect();
+        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        // hub の ID は結び付いた鍵に畳まれ、鍵が既に在れば 1 つになる (並びは昇順)
+        assert_eq!(
+            pg::fold_device_ids(&ids(&["hub-1", "alarm:aaaa", "alarm:0001"]), &links),
+            (ids(&["alarm:0001", "alarm:aaaa"]), vec![])
+        );
+        // 結び付きの無い hub の ID はそのまま返り、pending にも入る (alarm: で始まる ID は入らない)
+        assert_eq!(
+            pg::fold_device_ids(&ids(&["hub-2", "hub-1", "alarm:bbbb"]), &links),
+            (ids(&["alarm:aaaa", "alarm:bbbb", "hub-2"]), ids(&["hub-2"]))
+        );
+        assert_eq!(pg::fold_device_ids(&[], &links), (vec![], vec![]));
     }
 
     #[test]
