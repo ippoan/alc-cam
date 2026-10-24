@@ -12,6 +12,8 @@
 //! `cameras.rec_ip` 列に入る ([`pg`])。その binding がこの Worker に在るかは Worker が確かめる ([`Op::vpc_binding`])。
 //! 応答・ログに資格情報を出さない。一覧の応答は `vpc_binding` を返すが、パスワードは返さない。
 //! 運行管理者席の鍵 ([`Role::TenkoManager`]) に許すのは一覧 (`GET /cameras`) だけで、応答は `id`・`name`・`device_ids` に絞る。
+//! 拠点 PC の配信の鍵 ([`Role::CamHost`]) に許すのは `GET /cameras/mine` だけで、鍵の端末 (`X-Device-Id`) を
+//! `cam_camera_devices` で結び付けたカメラの RTSP の接続先を、パスワードを復号して返す (応答に平文が出る口はここだけ)。
 
 pub mod auto;
 pub mod dest;
@@ -24,7 +26,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::dest::VpcBinding;
-use crate::pg::{CameraRow, Change, NewCamera, PatchCamera, UpdateOutcome};
+use crate::pg::{CameraRow, Change, MyCamera, NewCamera, PatchCamera, UpdateOutcome};
 
 /// 端末の候補を集計する日数の既定と上限
 pub const DEFAULT_DAYS: i32 = 30;
@@ -35,6 +37,9 @@ const MAX_DEVICE_ID_LEN: usize = 200;
 const MAX_NAME_CHARS: usize = 100;
 const MAX_USERNAME_CHARS: usize = 100;
 const MAX_PASSWORD_CHARS: usize = 200;
+const MAX_RTSP_PATH_LEN: usize = 200;
+/// RTSP のポートの既定 (migration 188 の DEFAULT と同じ)
+pub const DEFAULT_RTSP_PORT: i32 = 554;
 
 /// 利用者に返す失敗。文言は固定の語で、宛先・資格情報・SQL の文を入れない
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,28 +76,38 @@ pub enum Role {
     /// 運行管理者席の鍵 (auth-worker の端末用の proxy が付ける `X-Device-Role: device-tenko-manager`)。
     /// 遠隔点呼の画面が乗務員の端末からカメラを引くための一覧 (`GET /cameras`) だけを使える
     TenkoManager,
+    /// 拠点 PC の配信の鍵 (auth-worker の端末用の proxy が付ける `X-Device-Role: device-cam-host`)。
+    /// 鍵の端末 (`X-Device-Id`) が映すカメラの RTSP の接続先 (`GET /cameras/mine`) だけを使える
+    CamHost,
 }
 
 /// 運行管理者席の鍵の role (auth-worker `DEVICE_ROLE_TENKO_MANAGER`)
 pub const TENKO_MANAGER_DEVICE_ROLE: &str = "device-tenko-manager";
+/// 拠点 PC の配信の鍵の role (auth-worker の usage `cam-host`)
+pub const CAM_HOST_DEVICE_ROLE: &str = "device-cam-host";
 
 /// auth-worker が付け直したヘッダから決めた呼び手
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
     pub tenant: Uuid,
     /// 開発者の Google ログイン (`X-User-Developer: 1`)。宛先 (`vpc_binding`) を書けるのはこのときだけ (管理者に限る)
     pub developer: bool,
     pub role: Role,
+    /// 鍵の端末 (`X-Device-Id`、CoreS3 の鍵の JWT の sub)。[`Role::CamHost`] のときだけ `Some`
+    pub device_id: Option<String>,
 }
 
 /// ヘッダから呼び手を決める。`header` は名前で引いて、無ければ `None`。
 /// - `X-User-Role: admin` だけ → 管理者。`X-Device-Role: device-tenko-manager` だけ → 運行管理者席。
+///   `X-Device-Role: device-cam-host` だけ → 拠点 PC の配信。
 ///   それ以外 (どちらも無い・他の値・両方ある) → 403。auth-worker はどちらか片方しか付けないので、両方は拒否側に倒す
 /// - `X-Tenant-ID` が無い (空を含む) → 401、UUID でない → 400
+/// - 拠点 PC の配信は `X-Device-Id` も要る。無い (空を含む) → 401、200 文字を超える → 400
 pub fn caller(header: impl Fn(&str) -> Option<String>) -> Result<Caller, ApiError> {
     let role = match (header("X-User-Role"), header("X-Device-Role")) {
         (Some(u), None) if u == "admin" => Role::Admin,
         (None, Some(d)) if d == TENKO_MANAGER_DEVICE_ROLE => Role::TenkoManager,
+        (None, Some(d)) if d == CAM_HOST_DEVICE_ROLE => Role::CamHost,
         _ => return Err(ApiError::new(403, "管理者だけが使えます")),
     };
     let tenant = header("X-Tenant-ID")
@@ -100,17 +115,31 @@ pub fn caller(header: impl Fn(&str) -> Option<String>) -> Result<Caller, ApiErro
         .ok_or_else(|| ApiError::new(401, "テナントがありません"))?;
     let tenant = Uuid::parse_str(&tenant)
         .map_err(|_| ApiError::new(400, "テナントの形が正しくありません"))?;
+    let device_id = if role == Role::CamHost {
+        let d = header("X-Device-Id")
+            .filter(|d| !d.is_empty())
+            .ok_or_else(|| ApiError::new(401, "端末がありません"))?;
+        if d.len() > MAX_DEVICE_ID_LEN {
+            return Err(ApiError::new(400, "端末の形が正しくありません"));
+        }
+        Some(d)
+    } else {
+        None
+    };
     Ok(Caller {
         tenant,
         // 端末の経路で X-User-Developer は付かないが、付いていても席の鍵には宛先を書かせない
         developer: role == Role::Admin && header("X-User-Developer").as_deref() == Some("1"),
         role,
+        device_id,
     })
 }
 
 /// 口ごとの仕事 (入力は検査済み)
 pub enum Op {
     ListCameras,
+    /// 拠点 PC の配信の鍵の端末が映すカメラと、その RTSP の接続先 (パスワードは復号して返す)
+    MyCameras,
     CreateCamera(CameraInput),
     UpdateCamera(Uuid, CameraPatchInput),
     DeviceCandidates {
@@ -143,7 +172,15 @@ pub struct CameraInput {
     vpc_binding: Option<VpcBinding>,
     rec_username: Option<String>,
     rec_password: Option<String>,
+    rtsp: RtspInput,
     device_ids: Vec<String>,
+}
+
+/// RTSP の接続先 (`POST` は省略 = 無し・ポートは 554)
+struct RtspInput {
+    lan_ip: Option<String>,
+    rtsp_port: i32,
+    rtsp_path: Option<String>,
 }
 
 /// `PATCH /cameras/{id}` の入力 (省略 = 変えない)
@@ -152,13 +189,17 @@ pub struct CameraPatchInput {
     vpc_binding: Change<Option<VpcBinding>>,
     rec_username: Change<Option<String>>,
     rec_password: Change<Option<String>>,
+    lan_ip: Change<Option<String>>,
+    rtsp_port: Change<i32>,
+    rtsp_path: Change<Option<String>>,
     device_ids: Option<Vec<String>>,
 }
 
 impl Op {
-    /// Secrets Store の鍵 (`SSO_ENCRYPTION_KEY`) が要るか (パスワードを書くときだけ)
+    /// Secrets Store の鍵 (`SSO_ENCRYPTION_KEY`) が要るか (パスワードを書くときと、拠点 PC へ復号して返すとき)
     pub fn needs_key(&self) -> bool {
         match self {
+            Op::MyCameras => true,
             Op::CreateCamera(c) => c.rec_password.is_some(),
             Op::UpdateCamera(_, p) => matches!(p.rec_password, Change::Set(Some(_))),
             _ => false,
@@ -195,6 +236,12 @@ struct CameraBody {
     rec_username: Option<Option<String>>,
     #[serde(default, deserialize_with = "present")]
     rec_password: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    lan_ip: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    rtsp_port: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "present")]
+    rtsp_path: Option<Option<String>>,
     #[serde(default)]
     device_ids: Option<Vec<String>>,
 }
@@ -262,6 +309,47 @@ fn password_ok(p: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// 拠点の LAN から見たカメラの IP。null と空は「無し」。プライベートの IPv4 (10/8・172.16/12・192.168/16) だけ
+/// (パスワードを返す先なので、LAN の外の宛先を書かせない)
+fn lan_ip_of(v: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(s) = v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    match s.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) if ip.is_private() => Ok(Some(ip.to_string())),
+        _ => Err(bad("lan_ip はプライベートの IPv4 (例 192.168.1.64) にしてください")),
+    }
+}
+
+/// RTSP のポート。null は既定 (554)
+fn rtsp_port_of(v: Option<i64>) -> Result<i32, ApiError> {
+    match v {
+        None => Ok(DEFAULT_RTSP_PORT),
+        Some(p) if (1..=65_535).contains(&p) => Ok(p as i32),
+        Some(_) => Err(bad("rtsp_port は 1〜65535 にしてください")),
+    }
+}
+
+/// RTSP のパス (先頭の / は落とす)。null と空は「無し」。URL にそのまま足すので、英数と `/ _ - . ? = &` だけ
+fn rtsp_path_of(v: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(p) = v.map(|s| s.trim().trim_start_matches('/').to_owned()).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if p.len() > MAX_RTSP_PATH_LEN
+        || !p
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/_-.?=&".contains(&b))
+        || p.split('/').any(|seg| seg == "..")
+    {
+        return Err(bad("rtsp_path は 200 文字までの英数と / _ - . ? = & にしてください (例 stream1)"));
+    }
+    Ok(Some(p))
+}
+
+fn change<T, U>(v: Option<Option<T>>, f: impl FnOnce(Option<T>) -> Result<U, ApiError>) -> Result<Change<U>, ApiError> {
+    v.map(f).transpose().map(|v| v.map_or(Change::Keep, Change::Set))
+}
+
 /// 端末 id の並び (前後の空白を落とし、重複を除いて並べる)
 fn device_ids_of(v: Vec<String>) -> Result<Vec<String>, ApiError> {
     let mut ids: Vec<String> = v.into_iter().map(|s| s.trim().to_owned()).collect();
@@ -279,8 +367,10 @@ fn device_ids_of(v: Vec<String>) -> Result<Vec<String>, ApiError> {
     Ok(ids)
 }
 
+const BODY_SHAPE: &str = "本文は {\"name\", \"vpc_binding\", \"rec_username\", \"rec_password\", \"lan_ip\", \"rtsp_port\", \"rtsp_path\", \"device_ids\"} の JSON にしてください";
+
 fn camera_input(body: &str, caller: &Caller) -> Result<CameraInput, ApiError> {
-    let b: CameraBody = serde_json::from_str(body).map_err(|_| bad("本文は {\"name\", \"vpc_binding\", \"rec_username\", \"rec_password\", \"device_ids\"} の JSON にしてください"))?;
+    let b: CameraBody = serde_json::from_str(body).map_err(|_| bad(BODY_SHAPE))?;
     let vpc_binding = vpc_binding_of(b.vpc_binding.flatten())?;
     if vpc_binding.is_some() && !caller.developer {
         return Err(ApiError::new(
@@ -297,12 +387,17 @@ fn camera_input(body: &str, caller: &Caller) -> Result<CameraInput, ApiError> {
         vpc_binding,
         rec_username: username_of(b.rec_username.flatten())?,
         rec_password,
+        rtsp: RtspInput {
+            lan_ip: lan_ip_of(b.lan_ip.flatten())?,
+            rtsp_port: rtsp_port_of(b.rtsp_port.flatten())?,
+            rtsp_path: rtsp_path_of(b.rtsp_path.flatten())?,
+        },
         device_ids: device_ids_of(b.device_ids.unwrap_or_default())?,
     })
 }
 
 fn camera_patch(body: &str) -> Result<CameraPatchInput, ApiError> {
-    let b: CameraBody = serde_json::from_str(body).map_err(|_| bad("本文は {\"name\", \"vpc_binding\", \"rec_username\", \"rec_password\", \"device_ids\"} の JSON にしてください"))?;
+    let b: CameraBody = serde_json::from_str(body).map_err(|_| bad(BODY_SHAPE))?;
     let name = match b.name {
         None => Change::Keep,
         Some(v) => Change::Set(name_of(v)?),
@@ -330,6 +425,9 @@ fn camera_patch(body: &str) -> Result<CameraPatchInput, ApiError> {
         vpc_binding,
         rec_username,
         rec_password,
+        lan_ip: change(b.lan_ip, lan_ip_of)?,
+        rtsp_port: change(b.rtsp_port, rtsp_port_of)?,
+        rtsp_path: change(b.rtsp_path, rtsp_path_of)?,
         device_ids: b.device_ids.map(device_ids_of).transpose()?,
     })
 }
@@ -419,6 +517,12 @@ pub fn parse(
     if caller.role == Role::TenkoManager && (method, path) != ("GET", "/cameras") {
         return Err(ApiError::new(403, "運行管理者席はカメラの一覧だけを使えます"));
     }
+    if caller.role == Role::CamHost {
+        if (method, path) != ("GET", "/cameras/mine") {
+            return Err(ApiError::new(403, "拠点 PC の鍵は担当カメラの取得だけを使えます"));
+        }
+        return Ok(Op::MyCameras);
+    }
     match (method, path) {
         ("GET", "/cameras") => Ok(Op::ListCameras),
         ("POST", "/cameras") => Ok(Op::CreateCamera(camera_input(body, caller)?)),
@@ -473,6 +577,9 @@ fn camera_json(c: &CameraRow) -> Value {
         "rec_username": c.rec_username,
         "has_password": c.has_password,
         "recording": c.vpc_binding.is_some(),
+        "lan_ip": c.lan_ip,
+        "rtsp_port": c.rtsp_port,
+        "rtsp_path": c.rtsp_path,
         "device_ids": c.device_ids,
         "rec_scanned_until": c.rec_scanned_until_ms.map(jst_iso),
     })
@@ -485,6 +592,32 @@ fn camera_json_for_tenko_manager(c: &CameraRow) -> Value {
         "name": c.name,
         "device_ids": c.device_ids,
     })
+}
+
+/// 拠点 PC への 1 件。RTSP は `lan_ip` と `rtsp_path` が両方在るときだけ (無ければ null)。
+/// ユーザー名・パスワードは録画用 (`rec_*`) を使い回し、パスワードは復号した平文 (未設定なら null)
+fn my_camera_json(c: &MyCamera, key: &str) -> Result<Value, ApiError> {
+    let rtsp = match (&c.lan_ip, &c.rtsp_path) {
+        (Some(host), Some(path)) => {
+            let password = c
+                .rec_password_encrypted
+                .as_deref()
+                .map(|enc| {
+                    alc_worker_crypto::secret::decrypt_secret(enc, key)
+                        .map_err(|_| ApiError::new(500, "カメラのパスワードを復号できません"))
+                })
+                .transpose()?;
+            json!({
+                "host": host,
+                "port": c.rtsp_port,
+                "path": path,
+                "username": c.rec_username,
+                "password": password,
+            })
+        }
+        _ => Value::Null,
+    };
+    Ok(json!({ "id": c.id, "name": c.name, "rtsp": rtsp }))
 }
 
 fn db_error(e: &tokio_postgres::Error) -> ApiError {
@@ -524,8 +657,28 @@ pub async fn execute(
             let body = match caller.role {
                 Role::Admin => json!({ "can_edit_destination": caller.developer, "cameras": cameras.iter().map(camera_json).collect::<Vec<_>>() }),
                 Role::TenkoManager => json!({ "cameras": cameras.iter().map(camera_json_for_tenko_manager).collect::<Vec<_>>() }),
+                // parse が通さない
+                Role::CamHost => return Err(ApiError::new(403, "拠点 PC の鍵は担当カメラの取得だけを使えます")),
             };
             Ok(Reply { status: 200, body })
+        }
+        Op::MyCameras => {
+            let device = caller
+                .device_id
+                .clone()
+                .ok_or_else(|| ApiError::new(401, "端末がありません"))?;
+            let key = key.ok_or_else(|| ApiError::new(500, "暗号化の鍵がありません"))?;
+            let cameras = pg::my_cameras(pg, tenant, device)
+                .await
+                .map_err(|e| db_error(&e))?;
+            let list = cameras
+                .iter()
+                .map(|c| my_camera_json(c, key))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Reply {
+                status: 200,
+                body: json!({ "cameras": list }),
+            })
         }
         Op::CreateCamera(c) => {
             let new = NewCamera {
@@ -533,6 +686,9 @@ pub async fn execute(
                 vpc_binding: c.vpc_binding.map(VpcBinding::into_string),
                 rec_username: c.rec_username,
                 rec_password_encrypted: encrypt(c.rec_password, key)?,
+                lan_ip: c.rtsp.lan_ip,
+                rtsp_port: c.rtsp.rtsp_port,
+                rtsp_path: c.rtsp.rtsp_path,
                 device_ids: c.device_ids,
             };
             let row = pg::create_camera(pg, tenant, new)
@@ -556,6 +712,9 @@ pub async fn execute(
                 },
                 rec_username: p.rec_username,
                 rec_password_encrypted,
+                lan_ip: p.lan_ip,
+                rtsp_port: p.rtsp_port,
+                rtsp_path: p.rtsp_path,
                 device_ids: p.device_ids,
             };
             match pg::update_camera(pg, tenant, id, patch, caller.developer)
@@ -662,6 +821,7 @@ mod tests {
             tenant: Uuid::parse_str(TENANT).unwrap(),
             developer,
             role: Role::Admin,
+            device_id: None,
         }
     }
 
@@ -670,6 +830,18 @@ mod tests {
             tenant: Uuid::parse_str(TENANT).unwrap(),
             developer: false,
             role: Role::TenkoManager,
+            device_id: None,
+        }
+    }
+
+    const DEVICE: &str = "alarm:0123456789abcdef";
+
+    fn cam_host() -> Caller {
+        Caller {
+            tenant: Uuid::parse_str(TENANT).unwrap(),
+            developer: false,
+            role: Role::CamHost,
+            device_id: Some(DEVICE.to_owned()),
         }
     }
 
@@ -865,6 +1037,162 @@ mod tests {
     }
 
     #[test]
+    fn caller_accepts_cam_host_device_role_with_device_id() {
+        let c = caller(headers(&[
+            ("X-Device-Role", "device-cam-host"),
+            ("X-Device-Id", DEVICE),
+            ("X-Tenant-ID", TENANT),
+        ]))
+        .unwrap();
+        assert_eq!(c, cam_host());
+        // 端末が無い・空 → 401、長すぎ → 400
+        for pairs in [
+            &[("X-Device-Role", "device-cam-host"), ("X-Tenant-ID", TENANT)][..],
+            &[("X-Device-Role", "device-cam-host"), ("X-Device-Id", ""), ("X-Tenant-ID", TENANT)][..],
+        ] {
+            assert_eq!(caller(headers(pairs)).unwrap_err().status, 401, "{pairs:?}");
+        }
+        let long = "a".repeat(201);
+        assert_eq!(
+            caller(headers(&[
+                ("X-Device-Role", "device-cam-host"),
+                ("X-Device-Id", &long),
+                ("X-Tenant-ID", TENANT)
+            ]))
+            .unwrap_err()
+            .status,
+            400
+        );
+        // 管理者と同時は拒否 (X-Device-Id があっても)
+        assert_eq!(
+            caller(headers(&[
+                ("X-User-Role", "admin"),
+                ("X-Device-Role", "device-cam-host"),
+                ("X-Device-Id", DEVICE),
+                ("X-Tenant-ID", TENANT)
+            ]))
+            .unwrap_err()
+            .status,
+            403
+        );
+        // 他の role の X-Device-Id は読まない
+        let m = caller(headers(&[
+            ("X-Device-Role", "device-tenko-manager"),
+            ("X-Device-Id", DEVICE),
+            ("X-Tenant-ID", TENANT),
+        ]))
+        .unwrap();
+        assert_eq!(m.device_id, None);
+    }
+
+    #[test]
+    fn cam_host_can_only_get_its_cameras() {
+        let h = cam_host();
+        let op = parse("GET", "/cameras/mine", "", "", &h, 60_000).unwrap();
+        assert!(matches!(op, Op::MyCameras));
+        assert!(op.needs_key());
+        let id = "00000000-0000-4000-8000-0000000000aa";
+        let patch = format!("/cameras/{id}");
+        for (method, path, body) in [
+            ("GET", "/cameras", ""),
+            ("POST", "/cameras", r#"{"name":"入口"}"#),
+            ("PATCH", patch.as_str(), r#"{"name":"入口"}"#),
+            ("GET", "/device-candidates", ""),
+            ("POST", "/clips", ""),
+            ("POST", "/auto-run", ""),
+            ("POST", "/cameras/mine", ""),
+            ("GET", "/cameras/mine/", ""),
+            ("GET", "/nothing", ""),
+        ] {
+            assert_eq!(status(parse(method, path, "", body, &h, 60_000)), 403, "{method} {path}");
+        }
+        // 管理者・運行管理者席には無い口
+        assert_eq!(status(parse("GET", "/cameras/mine", "", "", &admin(true), 0)), 404);
+        assert_eq!(status(parse("GET", "/cameras/mine", "", "", &tenko_manager(), 0)), 403);
+    }
+
+    #[test]
+    fn rtsp_fields_are_checked() {
+        let c = admin(false);
+        let post = |body: &str| status(parse("POST", "/cameras", "", body, &c, 0));
+        assert_eq!(post(r#"{"name":"x","lan_ip":"192.168.1.64","rtsp_port":8554,"rtsp_path":"/stream1"}"#), 200);
+        assert_eq!(post(r#"{"name":"x","lan_ip":"10.0.0.5"}"#), 200);
+        assert_eq!(post(r#"{"name":"x","lan_ip":"172.16.0.9","rtsp_path":"Streaming/Channels/101"}"#), 200);
+        assert_eq!(post(r#"{"name":"x","lan_ip":null,"rtsp_port":null,"rtsp_path":""}"#), 200);
+        for body in [
+            // LAN の外・形が違う
+            r#"{"name":"x","lan_ip":"8.8.8.8"}"#,
+            r#"{"name":"x","lan_ip":"127.0.0.1"}"#,
+            r#"{"name":"x","lan_ip":"192.168.1.256"}"#,
+            r#"{"name":"x","lan_ip":"camera.local"}"#,
+            r#"{"name":"x","lan_ip":"fd00::1"}"#,
+            // ポート
+            r#"{"name":"x","rtsp_port":0}"#,
+            r#"{"name":"x","rtsp_port":65536}"#,
+            r#"{"name":"x","rtsp_port":"554"}"#,
+            // パス (URL を崩す文字・上る)
+            r#"{"name":"x","rtsp_path":"a b"}"#,
+            r#"{"name":"x","rtsp_path":"x@evil"}"#,
+            r#"{"name":"x","rtsp_path":"a#b"}"#,
+            r#"{"name":"x","rtsp_path":"../x"}"#,
+        ] {
+            assert_eq!(post(body), 400, "{body}");
+        }
+        let long = format!(r#"{{"name":"x","rtsp_path":"{}"}}"#, "a".repeat(201));
+        assert_eq!(post(&long), 400);
+        // RTSP の項目だけならパスワードの鍵は要らない
+        assert!(!parse("POST", "/cameras", "", r#"{"name":"x","lan_ip":"192.168.1.64"}"#, &c, 0).unwrap().needs_key());
+    }
+
+    #[test]
+    fn rtsp_inputs_are_normalized() {
+        assert_eq!(lan_ip_of(Some(" 192.168.1.64 ".into())).unwrap().as_deref(), Some("192.168.1.64"));
+        assert_eq!(lan_ip_of(Some("".into())).unwrap(), None);
+        assert_eq!(rtsp_port_of(None).unwrap(), 554);
+        assert_eq!(rtsp_port_of(Some(8554)).unwrap(), 8554);
+        assert_eq!(rtsp_path_of(Some("//stream1".into())).unwrap().as_deref(), Some("stream1"));
+        assert_eq!(rtsp_path_of(Some("/".into())).unwrap(), None);
+        assert_eq!(rtsp_path_of(Some("live?channel=1&subtype=0".into())).unwrap().as_deref(), Some("live?channel=1&subtype=0"));
+    }
+
+    #[test]
+    fn my_camera_json_decrypts_only_when_rtsp_is_set() {
+        let key = "unit-test-key";
+        let enc = alc_worker_crypto::secret::encrypt_secret("p@ss", key).unwrap();
+        let cam = MyCamera {
+            id: Uuid::parse_str("00000000-0000-4000-8000-0000000000aa").unwrap(),
+            name: "入口".to_owned(),
+            lan_ip: Some("192.168.1.64".to_owned()),
+            rtsp_port: 554,
+            rtsp_path: Some("stream1".to_owned()),
+            rec_username: Some("viewer".to_owned()),
+            rec_password_encrypted: Some(enc.clone()),
+        };
+        assert_eq!(
+            my_camera_json(&cam, key).unwrap(),
+            json!({
+                "id": "00000000-0000-4000-8000-0000000000aa",
+                "name": "入口",
+                "rtsp": {"host": "192.168.1.64", "port": 554, "path": "stream1", "username": "viewer", "password": "p@ss"},
+            })
+        );
+        // パスワード未設定 → null (他は返す)
+        let no_pass = MyCamera { rec_password_encrypted: None, rec_username: None, ..cam.clone() };
+        assert_eq!(
+            my_camera_json(&no_pass, key).unwrap()["rtsp"],
+            json!({"host": "192.168.1.64", "port": 554, "path": "stream1", "username": null, "password": null})
+        );
+        // lan_ip か rtsp_path が無ければ rtsp: null (鍵が違っても復号しない)
+        for c in [MyCamera { lan_ip: None, ..cam.clone() }, MyCamera { rtsp_path: None, ..cam.clone() }] {
+            assert_eq!(my_camera_json(&c, "wrong-key").unwrap()["rtsp"], Value::Null);
+        }
+        // 鍵が違う → 500 (文言に暗号文も平文も入れない)
+        let e = my_camera_json(&cam, "wrong-key").unwrap_err();
+        assert_eq!(e.status, 500);
+        assert!(!e.message.contains(&enc) && !e.message.contains("p@ss"));
+    }
+
+    #[test]
     fn auto_run_takes_an_empty_body_or_a_camera_id() {
         let a = admin(false);
         let run = |body: &str| parse("POST", "/auto-run", "", body, &a, 60_000);
@@ -895,6 +1223,9 @@ mod tests {
             has_password: true,
             device_ids: vec!["dev-1".to_owned(), "dev-2".to_owned()],
             rec_scanned_until_ms: Some(1_761_191_880_000),
+            lan_ip: Some("192.168.1.64".to_owned()),
+            rtsp_port: 554,
+            rtsp_path: Some("stream1".to_owned()),
         };
         assert_eq!(
             camera_json_for_tenko_manager(&row),
@@ -906,7 +1237,7 @@ mod tests {
         );
         // 管理者の 1 件は今までどおり録画の設定まで返す
         let full = camera_json(&row);
-        for k in ["vpc_binding", "rec_username", "has_password", "recording", "rec_scanned_until"] {
+        for k in ["vpc_binding", "rec_username", "has_password", "recording", "rec_scanned_until", "lan_ip", "rtsp_port", "rtsp_path"] {
             assert!(full.get(k).is_some(), "{k}");
         }
     }

@@ -39,6 +39,9 @@ pub struct CameraRow {
     pub has_password: bool,
     pub device_ids: Vec<String>,
     pub rec_scanned_until_ms: Option<i64>,
+    pub lan_ip: Option<String>,
+    pub rtsp_port: i32,
+    pub rtsp_path: Option<String>,
 }
 impl TxOutput for CameraRow {}
 
@@ -48,6 +51,10 @@ pub struct NewCamera {
     pub vpc_binding: Option<String>,
     pub rec_username: Option<String>,
     pub rec_password_encrypted: Option<String>,
+    /// 検査済みの RTSP の接続先
+    pub lan_ip: Option<String>,
+    pub rtsp_port: i32,
+    pub rtsp_path: Option<String>,
     pub device_ids: Vec<String>,
 }
 
@@ -57,6 +64,9 @@ pub struct PatchCamera {
     pub vpc_binding: Change<Option<String>>,
     pub rec_username: Change<Option<String>>,
     pub rec_password_encrypted: Change<Option<String>>,
+    pub lan_ip: Change<Option<String>>,
+    pub rtsp_port: Change<i32>,
+    pub rtsp_path: Change<Option<String>>,
     /// `Some` なら結び付ける端末を差し替える
     pub device_ids: Option<Vec<String>>,
 }
@@ -84,6 +94,19 @@ pub struct Candidate {
     pub is_dev: bool,
 }
 impl TxOutput for Candidate {}
+
+/// 拠点 PC の配信の鍵の端末が映すカメラの 1 行 (パスワードは暗号文のまま。復号は呼び手)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MyCamera {
+    pub id: Uuid,
+    pub name: String,
+    pub lan_ip: Option<String>,
+    pub rtsp_port: i32,
+    pub rtsp_path: Option<String>,
+    pub rec_username: Option<String>,
+    pub rec_password_encrypted: Option<String>,
+}
+impl TxOutput for MyCamera {}
 
 /// 切り出しに要るカメラの値 (宛先は fetch の直前にもう一度検査する)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,7 +141,8 @@ pub fn is_vpc_binding_conflict(e: &Error) -> bool {
 const SELECT_CAMERAS: &str = "\
 SELECT c.id, c.name, c.rec_ip, c.rec_username, c.rec_password_encrypted IS NOT NULL,
        COALESCE(array_agg(d.device_id ORDER BY d.device_id) FILTER (WHERE d.device_id IS NOT NULL), '{}'::text[]),
-       (extract(epoch FROM c.rec_scanned_until) * 1000)::int8
+       (extract(epoch FROM c.rec_scanned_until) * 1000)::int8,
+       c.lan_ip, c.rtsp_port, c.rtsp_path
   FROM alc_api.cameras c
   LEFT JOIN alc_api.cam_camera_devices d ON d.tenant_id = c.tenant_id AND d.camera_id = c.id
  WHERE c.tenant_id = $1 AND ($2::uuid IS NULL OR c.id = $2)
@@ -134,6 +158,9 @@ fn camera_row(r: &Row) -> CameraRow {
         has_password: r.get(4),
         device_ids: r.get(5),
         rec_scanned_until_ms: r.get(6),
+        lan_ip: r.get(7),
+        rtsp_port: r.get(8),
+        rtsp_path: r.get(9),
     }
 }
 
@@ -170,14 +197,17 @@ pub async fn create_camera(
         Box::pin(async move {
             let row = tx
                 .query_typed_one(
-                    "INSERT INTO alc_api.cameras (tenant_id, name, rec_ip, rec_username, rec_password_encrypted, active)
-                     VALUES ($1, $2, $3, $4, $5, false) RETURNING id",
+                    "INSERT INTO alc_api.cameras (tenant_id, name, rec_ip, rec_username, rec_password_encrypted, lan_ip, rtsp_port, rtsp_path, active)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false) RETURNING id",
                     &[
                         (&tenant, Type::UUID),
                         (&c.name, Type::TEXT),
                         (&c.vpc_binding, Type::TEXT),
                         (&c.rec_username, Type::TEXT),
                         (&c.rec_password_encrypted, Type::TEXT),
+                        (&c.lan_ip, Type::TEXT),
+                        (&c.rtsp_port, Type::INT4),
+                        (&c.rtsp_path, Type::TEXT),
                     ],
                 )
                 .await?;
@@ -216,12 +246,18 @@ pub async fn update_camera(
             let (set_ip, ip) = (p.vpc_binding.set(), p.vpc_binding.value().cloned().flatten());
             let (set_user, user) = (p.rec_username.set(), p.rec_username.value().cloned().flatten());
             let (set_pass, pass) = (p.rec_password_encrypted.set(), p.rec_password_encrypted.value().cloned().flatten());
+            let (set_lan, lan) = (p.lan_ip.set(), p.lan_ip.value().cloned().flatten());
+            let (set_port, port) = (p.rtsp_port.set(), p.rtsp_port.value().copied().unwrap_or(0));
+            let (set_path, path) = (p.rtsp_path.set(), p.rtsp_path.value().cloned().flatten());
             tx.execute_typed(
                 "UPDATE alc_api.cameras SET
                     name = CASE WHEN $3 THEN $4 ELSE name END,
                     rec_ip = CASE WHEN $5 THEN $6 ELSE rec_ip END,
                     rec_username = CASE WHEN $7 THEN $8 ELSE rec_username END,
                     rec_password_encrypted = CASE WHEN $9 THEN $10 ELSE rec_password_encrypted END,
+                    lan_ip = CASE WHEN $11 THEN $12 ELSE lan_ip END,
+                    rtsp_port = CASE WHEN $13 THEN $14 ELSE rtsp_port END,
+                    rtsp_path = CASE WHEN $15 THEN $16 ELSE rtsp_path END,
                     updated_at = now()
                   WHERE tenant_id = $1 AND id = $2",
                 &[
@@ -235,6 +271,12 @@ pub async fn update_camera(
                     (&user, Type::TEXT),
                     (&set_pass, Type::BOOL),
                     (&pass, Type::TEXT),
+                    (&set_lan, Type::BOOL),
+                    (&lan, Type::TEXT),
+                    (&set_port, Type::BOOL),
+                    (&port, Type::INT4),
+                    (&set_path, Type::BOOL),
+                    (&path, Type::TEXT),
                 ],
             )
             .await?;
@@ -247,6 +289,37 @@ pub async fn update_camera(
             let some_id = Some(id);
             let row = tx.query_typed_one(SELECT_CAMERAS, &[(&tenant, Type::UUID), (&some_id, Type::UUID)]).await?;
             Ok(UpdateOutcome::Updated(camera_row(&row)))
+        })
+    })
+    .await
+}
+
+/// 端末 (`device`) を結び付けたカメラ (名前の順)。RTSP の列が未設定の行も返す (呼び手が rtsp: null にする)
+pub async fn my_cameras(pg: &mut PgClient, tenant: Uuid, device: String) -> Result<Vec<MyCamera>, Error> {
+    pg.tenant_tx(tenant, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(
+                    "SELECT c.id, c.name, c.lan_ip, c.rtsp_port, c.rtsp_path, c.rec_username, c.rec_password_encrypted
+                       FROM alc_api.cameras c
+                       JOIN alc_api.cam_camera_devices d ON d.tenant_id = c.tenant_id AND d.camera_id = c.id
+                      WHERE c.tenant_id = $1 AND d.device_id = $2
+                      ORDER BY c.name, c.id",
+                    &[(&tenant, Type::UUID), (&device, Type::TEXT)],
+                )
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| MyCamera {
+                    id: r.get(0),
+                    name: r.get(1),
+                    lan_ip: r.get(2),
+                    rtsp_port: r.get(3),
+                    rtsp_path: r.get(4),
+                    rec_username: r.get(5),
+                    rec_password_encrypted: r.get(6),
+                })
+                .collect())
         })
     })
     .await
