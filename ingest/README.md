@@ -94,15 +94,31 @@ GET   /api/cam-clips/events?camera_id=<uuid>&date=2026-10-23   (JST の 1 日)
   この Worker に在ることを確かめる (無ければ登録時 400・切り出し時 500)。URL は `http://camera.vpc.internal/...` (host は
   Host ヘッダになるだけ。公開名を書くと VPC の外へ出る)、転送 (3xx) は追わない。同じ binding を別のテナントが持っていれば 409
 
+### 拠点を足す (システム管理者 + 拠点)
+
+この Tunnel を通るのは SD 録画の切り出し (Worker → カメラの HTTP 80 番) だけ。ライブ映像 (RTSP 554 番) は拠点 PC の host が
+LAN で直接カメラに繋ぎ P2P で届けるので、Tunnel は要らない。
+
+1. **Tunnel を作る** (ダッシュボード、Networks → Tunnels): 拠点ごとに 1 本 (例 `kushiro`)。コネクタは Windows を選び、
+   出てくる `cloudflared service install <トークン>` のコマンドを控える。トークンは repo・DB・チャットに残さない
+2. **拠点 PC に cloudflared を入れる** (拠点、初回だけ管理者権限): Cloudflare 公式の Windows 版インストーラー (MSI) で
+   cloudflared を入れ、管理者のコマンドプロンプトで 1 のコマンドを実行する。Windows のサービスとして常駐するので、Chrome や
+   点呼の画面が閉じていても PC が起動していれば繋がる。ダッシュボードの Tunnel が Healthy になれば完了。
+   版は `cloudflared --version` で見る (ダッシュボードの Tunnel の一覧にもコネクタの版が出る)。古ければ公式の MSI を入れ直す
+3. 下の「カメラを足す」をその拠点の Tunnel で行う
+
 ### カメラを足す (システム管理者)
 
-1. Cloudflare のダッシュボードの Workers VPC で VPC Service を作る (種類 HTTP、宛先 = カメラの IP、ポート 80、
-   ohishi-data の Tunnel)。CI のトークンは VPC Service の bind までで、作るのは人の手
-2. `ingest/wrangler.toml` のトップレベルに `[[vpc_services]]` を 1 表足す (`binding = "CAM_<型番など>"`、
+1. Cloudflare のダッシュボードの Workers VPC で VPC Service を作る (種類 HTTP、宛先 = カメラの IP、ポート 80 (既定)、
+   そのカメラの拠点の Tunnel)。CI のトークンは VPC Service の bind までで、作るのは人の手
+2. `ingest/wrangler.toml` のトップレベルに `[[vpc_services]]` を 1 表足す (`binding = "CAM_<型番や拠点名など>"`、
    `service_id` = 1 の id、`remote = true`) → PR を merge すると CI が本番へ出す
-3. 画面でそのカメラの「VPC binding」に 2 の binding 名を入れる (書けるのは開発者の Google ログインのときだけ)
+3. 画面 (拠点カメラの録画) でカメラを登録し、「VPC binding」に 2 の binding 名を入れる (書けるのは開発者の Google ログインの
+   ときだけ)。ライブ配信もするなら、同じ画面で RTSP の接続先 (LAN の IP・554・パス) と、結び付ける端末・配信担当 (順位) を入れる
 
-今の binding: `CAM_TS_NS320W_55` (TS-NS320W-55)
+今の binding:
+- `CAM_TS_NS320W_55` (TS-NS320W-55、ohishi-data の Tunnel)
+- `CAM_KUSHIRO` (釧路、拠点 PC の Tunnel `kushiro`)
 
 確認 (`wrangler dev --env local`: Hyperdrive・VPC Service を持たず、DB は `DATABASE_URL`、R2 は手元の模擬。カメラには届かず、
 `vpc_binding` を書く登録は 400 になる):
