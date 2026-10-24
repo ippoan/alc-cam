@@ -1,5 +1,7 @@
 // 偽カメラ (RTSP over TCP interleaved)。fixture.h264bin を 15fps でループ再生する。
 // Tapo と同じく Digest 認証を求め、SDP の sprop-parameter-sets に SPS/PPS を載せる。
+// 音声は TS-NS 系と同じ AAC 32kHz モノラル (RFC 3640 mpeg4-generic)。fixture.aacbin の AU を 32ms ごとに流す
+// (track2 を SETUP された時だけ。interleaved は track ごとに 0-1 / 2-3)。
 //   import { startFakeRtsp } from './fake-rtsp.mjs'
 
 import crypto from 'node:crypto';
@@ -23,6 +25,17 @@ function loadFrames() {
     i += 5 + len;
   }
   return frames;
+}
+
+function loadAacUnits() {
+  const buf = fs.readFileSync(path.join(here, 'fixture.aacbin'));
+  const aus = [];
+  for (let i = 0; i < buf.length; ) {
+    const len = buf.readUInt16BE(i);
+    aus.push(buf.subarray(i + 2, i + 2 + len));
+    i += 2 + len;
+  }
+  return aus;
 }
 
 function splitNals(au) {
@@ -56,15 +69,22 @@ function rtpPayloads(nal) {
 
 export function startFakeRtsp({ host, port, user = 'admin', pass = 'secret' }) {
   const frames = loadFrames();
+  const aacUnits = loadAacUnits();
   const first = splitNals(frames[0].data);
   const sps = first.find((n) => (n[0] & 0x1f) === 7);
   const pps = first.find((n) => (n[0] & 0x1f) === 8);
-  const stats = { sessions: 0, playing: 0, teardowns: 0, closed: 0, authFailures: 0 };
+  // sessions: 映像の SETUP の数 (= RTSP のセッション数)。audioSetups: 音声の SETUP の数
+  const stats = { sessions: 0, audioSetups: 0, playing: 0, teardowns: 0, closed: 0, authFailures: 0 };
 
   const server = net.createServer((sock) => {
     const nonce = crypto.randomBytes(8).toString('hex');
     let buf = Buffer.alloc(0);
     let timer = null;
+    let audioTimer = null;
+    let audio = false;
+    let aseq = 0;
+    let ats = 0;
+    let aidx = 0;
     let seq = 0;
     let ts = 0;
     let idx = 0;
@@ -107,6 +127,21 @@ export function startFakeRtsp({ host, port, user = 'admin', pass = 'secret' }) {
       ts += 90000 / FPS;
     };
 
+    const sendAudio = () => {
+      const au = aacUnits[aidx++ % aacUnits.length];
+      // AU ヘッダ 1 つ (sizelength=13, indexlength=3)
+      const payload = Buffer.concat([Buffer.from([0, 16, (au.length >> 5) & 0xff, (au.length << 3) & 0xff]), au]);
+      const h = Buffer.alloc(12);
+      h[0] = 0x80;
+      h[1] = 0x80 | 97;
+      h.writeUInt16BE(aseq++ & 0xffff, 2);
+      h.writeUInt32BE(ats >>> 0, 4);
+      h.writeUInt32BE(0x0a0b0c0d, 8);
+      ats += 1024;
+      const rtp = Buffer.concat([h, payload]);
+      sock.write(Buffer.concat([Buffer.from([0x24, 2, rtp.length >> 8, rtp.length & 0xff]), rtp]));
+    };
+
     const handle = (text) => {
       const [head] = text.split('\r\n\r\n');
       const lines = head.split('\r\n');
@@ -125,20 +160,28 @@ export function startFakeRtsp({ host, port, user = 'admin', pass = 'secret' }) {
           const sdp = `v=0\r\no=- 0 0 IN IP4 ${host}\r\ns=fake\r\nt=0 0\r\na=control:*\r\n` +
             `m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n` +
             `a=fmtp:96 packetization-mode=1;profile-level-id=4d001e;sprop-parameter-sets=${sprop}\r\na=control:track1\r\n` +
-            `m=audio 0 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\na=control:track2\r\n`;
+            `m=audio 0 RTP/AVP 97\r\na=rtpmap:97 MPEG4-GENERIC/32000/1\r\n` +
+            `a=fmtp:97 streamtype=5;profile-level-id=15;mode=AAC-hbr;config=1288;SizeLength=13;IndexLength=3;IndexDeltaLength=3\r\na=control:track2\r\n`;
           return reply(cseq, '200 OK', { 'Content-Type': 'application/sdp', 'Content-Base': `${uri}/` }, sdp);
         }
         case 'SETUP':
+          if (uri.endsWith('track2')) {
+            stats.audioSetups++;
+            audio = true;
+            return reply(cseq, '200 OK', { Session: `${sessionId};timeout=60`, Transport: 'RTP/AVP/TCP;unicast;interleaved=2-3' });
+          }
           stats.sessions++;
           return reply(cseq, '200 OK', { Session: `${sessionId};timeout=60`, Transport: 'RTP/AVP/TCP;unicast;interleaved=0-1' });
         case 'PLAY':
           stats.playing++;
           reply(cseq, '200 OK', { Session: sessionId });
           timer = setInterval(sendFrame, 1000 / FPS);
+          if (audio) audioTimer = setInterval(sendAudio, 1024 / 32);
           return;
         case 'TEARDOWN':
           stats.teardowns++;
           clearInterval(timer);
+          clearInterval(audioTimer);
           return reply(cseq, '200 OK', { Session: sessionId });
         default:
           return reply(cseq, '200 OK', { Session: sessionId });
@@ -157,6 +200,7 @@ export function startFakeRtsp({ host, port, user = 'admin', pass = 'secret' }) {
     sock.on('error', () => {});
     sock.on('close', () => {
       clearInterval(timer);
+      clearInterval(audioTimer);
       stats.closed++;
     });
   });

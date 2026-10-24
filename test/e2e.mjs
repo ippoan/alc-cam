@@ -85,7 +85,12 @@ const ctx = await chromium.launchPersistentContext(userDataDir, {
 // 偽の点呼の PWA と、許されていない origin のページ (どちらも中身は空。chrome.runtime が生えるかを見る)
 await ctx.route(/^https:\/\/(alc\.ippoan\.org|evil\.example)\//, (route) =>
   route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>pwa</title>' }));
-const viewerBrowser = await chromium.launch({ executablePath: process.env.CHROME ?? '/usr/bin/google-chrome', headless: true });
+// マイクは Chrome の偽物 (ビープ音)。許可の確認も出さない
+const viewerBrowser = await chromium.launch({
+  executablePath: process.env.CHROME ?? '/usr/bin/google-chrome',
+  headless: true,
+  args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required'],
+});
 
 const results = {};
 const deviceJoins = () => signaling.log.filter((l) => l.startsWith('device joined')).length;
@@ -220,6 +225,39 @@ try {
     a: await a.evaluate(() => window.camState.ptz.results),
     b: await b.evaluate(() => window.camState.ptz.results),
   };
+
+  // 音声: カメラのマイク (RTSP の AAC) が PCMU で 2 人に届く
+  const audioOf = (page) => page.evaluate(() => window.camState.audio);
+  results.audio = {
+    a: await waitFor(async () => ((await audioOf(a)).energy > 0 ? audioOf(a) : null), 15_000, 'A に音が届く'),
+    b: await waitFor(async () => ((await audioOf(b)).energy > 0 ? audioOf(b) : null), 15_000, 'B に音が届く'),
+    audioSetups: camera.stats.audioSetups,
+  };
+  // 通話: A が押す → カメラのスピーカーへ 1 本。B が後から押すと B に替わる (繋ぎ直さない)。離したら切る
+  results.talkCaps = await waitFor(() => a.evaluate(() => window.camState.talk.caps), 10_000, 'talk の caps');
+  await a.evaluate(() => window.talkPress());
+  await waitFor(() => cgi.talk.frames > 5, 15_000, 'A の声がカメラへ');
+  const framesByA = cgi.talk.frames;
+  await b.evaluate(() => window.talkPress());
+  await sleep(1500);
+  results.talkTakeover = {
+    sessions: cgi.talk.sessions,
+    framesAfterB: cgi.talk.frames - framesByA,
+    a: await a.evaluate(() => window.camState.talk),
+    b: await b.evaluate(() => window.camState.talk),
+  };
+  await a.evaluate(() => window.talkRelease()); // 外された A の離しは効かない
+  await sleep(600);
+  results.talkAfterAStop = { open: cgi.talk.open };
+  await b.evaluate(() => window.talkRelease(false)); // stop が届かなくても送り直しが途切れたら切る
+  await waitFor(() => cgi.talk.closed >= 1, 10_000, '離して通話を切る');
+  results.talkReleased = { ...cgi.talk, rates: [...cgi.talk.rates] };
+  // 他の人がカメラで通話中 (Too many users)
+  cgi.talk.busy = true;
+  await a.evaluate(() => window.talkPress());
+  results.talkBusy = await waitFor(async () => (await a.evaluate(() => window.camState.talk.results)).find((r) => r.busy), 10_000, '通話中の知らせ');
+  await a.evaluate(() => window.talkRelease());
+  cgi.talk.busy = false;
 
   // A が離れても B は流れ続け、カメラは畳まない
   await a.close();
@@ -372,7 +410,7 @@ const checks = results.error ? {} : {
   extStatus: (() => {
     const st = results.extStatus;
     const json = JSON.stringify(st);
-    return st?.version === '0.4.3' && st.enabled === true && st.tokenLive === true && st.tokenSub === TOKEN_SUB &&
+    return st?.version === '0.4.4' && st.enabled === true && st.tokenLive === true && st.tokenSub === TOKEN_SUB &&
       st.assigned?.id === 'test-site' && st.signal?.[0] === '接続済み' && !json.includes(CAM_PASS) && !json.includes('eyJ') && !json.includes('rtsp://');
   })(),
   // 取り直しは /cameras/mine を 1 回呼び、同じカメラなら繋ぎ直さない
@@ -380,7 +418,7 @@ const checks = results.error ? {} : {
   extStopStart: results.extStop?.ok === true && results.extStoppedStatus?.enabled === false && results.extStart?.ok === true &&
     results.extStart.status?.enabled === true,
   extUnknownRejected: results.extUnknown?.ok === false,
-  extUpdateCheck: results.extUpdate?.ok === true && results.extUpdateStatus?.updateState === 'unsupported' && results.extUpdateStatus.hostVersion === '0.4.3',
+  extUpdateCheck: results.extUpdate?.ok === true && results.extUpdateStatus?.updateState === 'unsupported' && results.extUpdateStatus.hostVersion === '0.4.4',
   // 鍵は alc.ippoan.org からだけ受ける (他の origin には chrome.runtime.sendMessage 自体が生えない = 状態も操作も届かない)
   pwaOnly: results.evilHasSendMessage === 'undefined' && results.token1Reply?.ok === true,
   zeroCamerasReason: !!results.zeroCameras,
@@ -412,7 +450,7 @@ const checks = results.error ? {} : {
   reconnectsAfterSwStop: results.afterSwRestart.cDelta > 0,
   stoppedByToggle: !!results.stoppedByToggle,
   // 更新の確認は host の版を添えてパネルに出て、確認のためだけの host は残らない
-  updateCheck: results.update?.includes('host v0.4.3') && results.afterUpdateCheck?.hostRunning === false,
+  updateCheck: results.update?.includes('host v0.4.4') && results.afterUpdateCheck?.hostRunning === false,
   // ディスクの拡張が新しくなっていたら読み込み直し、配信に戻る
   reloadsWhenUpdatedOnDisk: results.reloadedVersion === '99.0.0',
   // 読み込み直しの後はパスワード待ち (写しのカメラ id は残る)、鍵が届けば繋ぎ直す
@@ -420,6 +458,18 @@ const checks = results.error ? {} : {
     results.afterReload.stillHasCamera.config.includes('パスワード待ち') && results.afterReloadToken === fakeToken(5),
   // データチャネルで caps が届き、押している間ステップが続き (左も上も)、要求は常に 1 本・Digest が通る
   ptzCaps: results.ptzCaps?.dirs?.length === 4 && results.ptzCaps.zoom === false,
+  // カメラの音: 2 人とも PCMU で受けて鳴っている。音声の SETUP は RTSP 1 本につき 1 回
+  audioToAll: [results.audio.a, results.audio.b].every((x) => x.codec === 'audio/PCMU' && x.packets > 50 && x.energy > 0) &&
+    results.audio.audioSetups === 1,
+  // 通話: 後から押した B に替わっても繋ぎ直さず、B の声が届き、A は「他の人が話している」になる。16kHz の AAC (index 8)
+  talkCaps: results.talkCaps?.speak === true,
+  talkTakeover: results.talkTakeover.sessions === 1 && results.talkTakeover.framesAfterB > 3 &&
+    results.talkTakeover.a.results.some((r) => r.ok) && results.talkTakeover.b.states.at(-1)?.mine === true &&
+    results.talkTakeover.a.states.length === 2 && results.talkTakeover.a.states[1].talking === true && results.talkTakeover.a.states[1].mine === false,
+  talkOnlyTalkerStops: results.talkAfterAStop.open === 1,
+  talkReleased: results.talkReleased.open === 0 && results.talkReleased.closed === 1 && results.talkReleased.challenges >= 1 &&
+    results.talkReleased.rates.length === 1 && results.talkReleased.rates[0] === 8,
+  talkBusy: results.talkBusy?.ok === false && results.talkBusy.busy === true,
   ptzSteps: ['move=left', 'move=up'].every((m) => results.ptz.stats.calls.filter((c) => c.startsWith(m)).length >= 2),
   ptzOneAtATime: results.ptz.stats.maxInFlight === 1 && results.ptz.stats.unauthorized === 0,
   // A の stop で B は止まらない・B の stop の後は送らない・stop が無くても 1 秒で止まる

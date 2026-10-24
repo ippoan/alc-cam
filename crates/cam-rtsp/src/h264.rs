@@ -174,16 +174,16 @@ pub fn codec_string(sps: &[u8]) -> Option<String> {
     Some(format!("avc1.{:02x}{:02x}{:02x}", b[0], b[1], b[2]))
 }
 
-struct Rtp<'a> {
-    marker: bool,
-    payload_type: u8,
-    seq: u16,
-    timestamp: u32,
-    payload: &'a [u8],
+pub(crate) struct Rtp<'a> {
+    pub(crate) marker: bool,
+    pub(crate) payload_type: u8,
+    pub(crate) seq: u16,
+    pub(crate) timestamp: u32,
+    pub(crate) payload: &'a [u8],
 }
 
 impl<'a> Rtp<'a> {
-    fn parse(b: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(b: &'a [u8]) -> Option<Self> {
         if b.len() < 12 || b[0] >> 6 != 2 {
             return None;
         }

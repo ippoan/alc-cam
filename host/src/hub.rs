@@ -5,6 +5,7 @@
 //!   キーフレームの AU は先頭に SPS/PPS を必ず含む (`cam_rtsp` の h264) ので、途中参加でもデコーダが組める
 //! - viewer ごとに「キーフレームを渡したか」を持ち、渡す前の差分フレームは捨てる (次の IDR から流す)
 //! - 1 人の送信の失敗はその人だけ外す。他の人とカメラには響かない
+//! - 音声 (PCMU 20ms) は映像を流し始めた人へそのまま配る。送れなくても外さない (映像は続ける)
 //!
 //! I/O を持たない (WebRTC は [`Sink`] の向こう)。カメラを開く/畳むのは呼び手が `is_empty` を見て決める。
 
@@ -29,6 +30,8 @@ pub trait Sink {
     /// ICE/DTLS が繋がって映像を書ける
     fn is_connected(&self) -> bool;
     fn write(&mut self, f: &Frame) -> Result<(), String>;
+    /// カメラの音 (PCMU 20ms ぶん)
+    fn write_audio(&mut self, pcmu: &[u8]) -> Result<(), String>;
 }
 
 struct Slot<V> {
@@ -118,6 +121,13 @@ impl<V: Sink> Hub<V> {
         self.take_failed(failed)
     }
 
+    /// カメラの音 (PCMU 20ms) を、映像を流し始めた全員へ。送れない人は飛ばす (音が出ないだけ)
+    pub fn on_audio(&mut self, pcmu: &[u8]) {
+        for slot in self.viewers.values_mut().filter(|s| s.flushed) {
+            let _ = slot.v.write_audio(pcmu);
+        }
+    }
+
     /// viewer の状態が進んだあとに呼ぶ: 繋がったばかりの人へ GOP を流す。送れなかった人は外して返す
     pub fn flush_connected(&mut self) -> Vec<(String, V, String)> {
         let mut failed = Vec::new();
@@ -162,6 +172,7 @@ mod tests {
     struct Fake {
         connected: bool,
         got: Vec<u64>,
+        audio: usize,
         fail: bool,
     }
 
@@ -174,6 +185,13 @@ mod tests {
                 return Err("boom".into());
             }
             self.got.push(f.ts);
+            Ok(())
+        }
+        fn write_audio(&mut self, _: &[u8]) -> Result<(), String> {
+            if self.fail {
+                return Err("boom".into());
+            }
+            self.audio += 1;
             Ok(())
         }
     }
@@ -251,6 +269,22 @@ mod tests {
         hub.on_frame(frame(4, false));
         assert_eq!(hub.get_mut("a").unwrap().got, [1, 2, 3, 4]);
         assert_eq!(hub.len(), 1);
+    }
+
+    #[test]
+    fn audio_goes_to_connected_viewers_and_failures_do_not_drop() {
+        let mut hub = Hub::default();
+        hub.insert("a", Fake::default()).unwrap();
+        hub.insert("b", Fake::default()).unwrap();
+        hub.insert("c", Fake::default()).unwrap();
+        connect(&mut hub, "a");
+        connect(&mut hub, "b");
+        hub.get_mut("b").unwrap().fail = true;
+        hub.on_audio(&[0xff; 160]);
+        hub.on_audio(&[0xff; 160]);
+        assert_eq!(hub.get_mut("a").unwrap().audio, 2);
+        assert_eq!(hub.get_mut("c").unwrap().audio, 0); // まだ繋がっていない
+        assert_eq!(hub.len(), 3);
     }
 
     #[test]

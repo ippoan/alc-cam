@@ -5,16 +5,35 @@
 <!-- 見る側 (role=admin)。alc-app の useWebRtc('admin') の cam-room 分岐と同じ振る舞い:
      offer を受けて answer を作り、ICE の収集が終わってから候補入りの answer を 1 通で返す (non-trickle)。 -->
 <video id="v" autoplay muted playsinline style="width:640px;background:#000"></video>
+<audio id="a" autoplay></audio>
 <pre id="st"></pre>
 <script>
   const params = new URLSearchParams(location.search);
   const ws = new WebSocket(`ws://${location.host}/cam-room/${params.get('site') ?? 'test-site'}?role=admin`);
   const video = document.getElementById('v');
-  window.camState = { ws: 'connecting', pc: 'new', offers: 0, ptz: { caps: null, results: [] } };
+  window.camState = { ws: 'connecting', pc: 'new', offers: 0, ptz: { caps: null, results: [] }, talk: { caps: null, states: [], results: [] }, audio: {} };
   // 首振り (データチャネル ptz)。e2e が ptzSend({action, dir, preset}) で押す
   let ptzChannel = null;
   window.ptzSend = (m) => ptzChannel?.readyState === 'open' && (ptzChannel.send(JSON.stringify({ type: 'ptz', ...m })), true);
   let pc = null;
+  // 通話 (alc-app の useCamTalk と同じ): 押している間 talk start を 500ms ごとに送り直し、マイクを音声の送り口に付ける
+  let talkTimer = null;
+  let mic = null;
+  const audioSender = () => pc?.getTransceivers().find((t) => t.receiver.track.kind === 'audio')?.sender;
+  window.talkPress = async () => {
+    mic ??= await navigator.mediaDevices.getUserMedia({ audio: true });
+    await audioSender().replaceTrack(mic.getAudioTracks()[0]);
+    const send = () => ptzChannel?.readyState === 'open' && ptzChannel.send(JSON.stringify({ type: 'talk', action: 'start' }));
+    send();
+    clearInterval(talkTimer);
+    talkTimer = setInterval(send, 500);
+  };
+  // stop を送らずに止める (閉じた・届かなかった) こともできるように
+  window.talkRelease = async (sendStop = true) => {
+    clearInterval(talkTimer);
+    await audioSender()?.replaceTrack(null);
+    if (sendStop) ptzChannel?.send(JSON.stringify({ type: 'talk', action: 'stop' }));
+  };
 
   ws.onopen = () => (camState.ws = 'open');
   ws.onclose = () => (camState.ws = 'closed');
@@ -26,18 +45,28 @@
     camState.framesDecoded = 0;
     pc?.close();
     pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-    pc.ontrack = (e) => (video.srcObject = new MediaStream([e.track]));
+    pc.ontrack = (e) => {
+      if (e.track.kind === 'audio') document.getElementById('a').srcObject = new MediaStream([e.track]);
+      else video.srcObject = new MediaStream([e.track]);
+    };
     pc.onconnectionstatechange = () => (camState.pc = pc.connectionState);
     pc.ondatachannel = (e) => {
       if (e.channel.label !== 'ptz') return;
       ptzChannel = e.channel;
       e.channel.onmessage = (m) => {
         const msg = JSON.parse(m.data);
-        if (msg.event === 'caps') camState.ptz.caps = msg;
+        if (msg.type === 'talk') {
+          if (msg.event === 'caps') camState.talk.caps = msg;
+          else if (msg.event === 'state') camState.talk.states.push(msg);
+          else camState.talk.results.push(msg);
+        } else if (msg.event === 'caps') camState.ptz.caps = msg;
         else camState.ptz.results.push(msg);
       };
     };
     await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+    // 音声は送受信で答える (送るトラックは押したときに付ける)
+    const at = pc.getTransceivers().find((t) => t.receiver.track.kind === 'audio');
+    if (at) at.direction = 'sendrecv';
     await pc.setLocalDescription(await pc.createAnswer());
     await new Promise((r) => {
       if (pc.iceGatheringState === 'complete') return r();
@@ -51,6 +80,10 @@
   setInterval(async () => {
     if (!pc) return;
     for (const r of (await pc.getStats()).values()) {
+      if (r.type === 'inbound-rtp' && r.kind === 'audio') {
+        camState.audio = { ...camState.audio, packets: r.packetsReceived, energy: r.totalAudioEnergy, codec: [...(await pc.getStats()).values()].find((c) => c.id === r.codecId)?.mimeType };
+      }
+      if (r.type === 'outbound-rtp' && r.kind === 'audio') camState.audio.sent = r.packetsSent;
       if (r.type === 'inbound-rtp' && r.kind === 'video') {
         camState.framesDecoded = r.framesDecoded;
         camState.codec = [...(await pc.getStats()).values()].find((c) => c.id === r.codecId)?.mimeType;

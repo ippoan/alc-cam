@@ -39,8 +39,9 @@ host は拡張の background service worker が、見る人が来た時に `conn
 
 1. カメラへ向かう経路で LAN の IP を決め、その IP の UDP を 1 本開く (見る人ごとに別の UDP)
 2. STUN で外から見えるアドレスを 1 回聞く (取れなければ LAN 内だけで繋がる)
-3. host 候補 + srflx 候補を入れた offer (映像のみ・H.264・sendonly) を作って返す
-4. answer を受け、ICE が繋がったら H.264 をそのまま (再エンコードなし) 送る
+3. host 候補 + srflx 候補を入れた offer (映像 H.264 sendonly + 音声 PCMU sendrecv + データチャネル `ptz`) を作って返す。
+   音声は映像と同じ stream id (`alc-cam`) なので、`event.streams[0]` を video に付けるだけの見る側でも映像は変わらない
+4. answer を受け、ICE が繋がったら H.264 をそのまま (再エンコードなし) 送る。カメラの音は PCMU 20ms ごと (下の「音声」)
 5. `stop` / 切断 / 30 秒繋がらない → その人の分だけ畳む。他の人には響かない
 
 カメラ (`host/src/camera.rs`・`host/src/hub.rs`):
@@ -53,7 +54,7 @@ host は拡張の background service worker が、見る人が来た時に `conn
   GOP が無ければ (キーフレームがまだ来ていなければ) 次の IDR から流す
 
 カメラ中継規約 (ippoan/alc-gw の `docs/camera-relay-convention.md`) との対応:
-映像のみ・H.264 パススルー・STUN のみ (TURN なし)・device 側 non-trickle・見る人の出入りで
+映像は H.264 パススルー (規約の「映像のみ」に対し、0.4.4 から音声を足した)・STUN のみ (TURN なし)・device 側 non-trickle・見る人の出入りで
 RTSP と PeerConnection を起こす/畳む、はすべて同じ。違いは device (拡張の service worker) が Chrome の動いている間だけ居ることと、
 cam-room v2 で見る人を複数持てることだけ。上り帯域は 人数 × stream2 になる。
 
@@ -99,3 +100,64 @@ host の中 (`host/src/ptz.rs`、交通整理は `crates/cam-ptz`):
   ステップの間は最短 200ms。見る人 4 人の命令は最後に来たもの優先 (押し続けの再送は間引かれ、まだ送っていない
   プリセットは後の命令で上書きされる)。失敗したら押し続けでも繰り返さない。見る人が離れたらその人の命令は捨てる
 - e2e の偽カメラだけ、管理画面の port を環境変数 `ALC_CAM_HTTP_PORT` で変える
+
+## 音声 (カメラのマイクとスピーカー、0.4.4〜)
+
+聞く (カメラのマイク → 見る人全員) と話す (見る人 1 人の声 → カメラのスピーカー) を、映像と同じ PeerConnection の
+音声 1 本 (PCMU・8kHz・sendrecv) で運ぶ。拡張・cam-room は関わらない。0.4.3 までの host の offer には音声が無いので、
+見る側は音声のトラックが無ければ音のボタンを、`talk` の `caps` が来なければ「押して話す」を出さない。
+
+形式 (I-O DATA の公開仕様 iodata-solution/qwatch-api の `QwatchAPI_Specification.html`。対象は TS-NS310W 等で、
+TS-NS320W も同じとみなしている):
+
+| 向き | カメラ側 | WebRTC 側 | 変換 (`crates/cam-audio`、pure Rust) |
+|---|---|---|---|
+| 聞く | RTSP の音声トラック。仕様は「音声 AAC (32kHz)」。SDP の `m=audio` の `a=rtpmap:<pt> MPEG4-GENERIC/<rate>` と `a=fmtp: … config=<AudioSpecificConfig>` で見分ける | PCMU 8kHz | AAC (RFC 3640 AAC-hbr の AU) をデコード → モノラル → 8kHz → μ-law。G.711 (PCMU / PCMA) のカメラはそのまま 8kHz の μ-law に |
+| 話す | `GET /camera-cgi/audio/transmit.cgi` (Keep-Alive、HTTP Digest、管理画面の port = 80)。受ける形式は応答の `Content-Type` で `audio/aac-lc` (ADTS・8kHz) / `audio/aac` (ADTS・16kHz) / `audio/gsm` | PCMU 8kHz | μ-law → 8kHz / 16kHz → AAC-LC (ADTS、16 / 24kbps、TNS なし)。GSM は非対応 (仕様では TS-NS310W は AAC のみ) |
+
+- RTSP: 映像の SETUP のあとに音声のトラックも同じセッションで SETUP する (interleaved 2-3)。カメラが断ったら (2xx 以外・
+  映像と同じ番号を返した) 音声なしで PLAY する。AAC のデコーダは filmcraft-aac、LATM (`MP4A-LATM`) と HE-AAC は使わない
+- 聞く: 音は映像を流し始めた人 (GOP を渡した人) 全員へ同じものを書く。送れない人がいても外さない (映像は続ける)
+- 話す: `transmit.cgi` は 401 なら Digest を付けて**繋ぎ直して**送り直す (仕様: 一部の版は切断・再接続しないと受けない)。
+  `200 OK` の後ろ (ヘッダか本文) に `Content-Type: audio/…` が来たら送り始める。1.5 秒待っても来なければ `audio/aac` とみなす。
+  `Too many users` は他の誰か (カメラのアプリ等) が通話中。1 回に書くのは 330 バイトまで (仕様の受信の上限)。
+  誰かが話している間だけ接続を 1 本保ち、話す人が替わっても繋ぎ直さない。誰も話さなくなったら切る (= カメラ側の通話も終わる)
+
+### 見る側 ⇄ host: 通話の順番 (データチャネル `ptz` の `type: "talk"`)
+
+首振りと同じデータチャネル `ptz` に `type` が `talk` のメッセージを載せる (首振りの見る側は `type` が `ptz` でないものを捨てる)。
+
+見る側 → host:
+
+| action | 意味 |
+|---|---|
+| `start` | 押した。**押している間 500ms ごとに送り直す** (1.5 秒送り直しが無ければ host は離したとみなす) |
+| `stop` | 離した。今話しているのが自分のときだけ効く |
+
+```json
+{"type":"talk","action":"start"}
+```
+
+声は、押している間だけ音声の送り口 (`RTCRtpSender`) にマイクのトラックを付けて送る (離したら `replaceTrack(null)`)。
+answer で音声を `sendrecv` にしておけば付け外しに再ネゴシエーションは要らない。host は話している人以外の声を捨てる。
+
+順番 (`cam_audio::Floor`): 同時に話せるのは 1 人。**後から押した人が優先**。外された人は押したまま (送り直し) では取り返さず、
+離して押し直すと取り返す。カメラ側で話せなかった人 (`result` の `ok: false`) も押し直すまで受けない。
+
+host → 見る側:
+
+| event | 中身 | いつ |
+|---|---|---|
+| `caps` | `speak: true` | チャネルが開いた直後に 1 回 (首振りの `caps` の直後)。見る側はこれを見て「押して話す」を出す |
+| `state` | `talking` (誰かが話している), `mine` (受け取った人自身が話している) | 話す人が替わるたびに全員へ |
+| `result` | `ok`, `busy` (他の誰かがカメラで通話中), `message` | 話している人へ、カメラのスピーカーに繋がった (`ok: true`、`message` に形式) か、繋がらなかった・切れたか |
+
+```json
+{"type":"talk","event":"caps","speak":true}
+{"type":"talk","event":"state","talking":true,"mine":false}
+{"type":"talk","event":"result","ok":false,"busy":true,"message":"他の人がカメラで通話中です"}
+```
+
+e2e の偽カメラ (`test/fake-rtsp.mjs` / `test/fake-cgi.mjs`) は AAC 32kHz の音声トラック (`test/fixture.aacbin`、
+`cargo run -p cam-audio --example aac-fixture -- test/fixture.aacbin` で作り直せる) と `transmit.cgi` (Digest・`audio/aac`・
+2 本目は `Too many users`) を持つ。見る側 (`test/viewer.html`) は Chrome の偽マイクで話す。

@@ -1,0 +1,21 @@
+# 拠点カメラの音声の変換と交通整理 (I/O を持たない。TCP/UDP は host が持つ)。
+#   聞く: カメラの RTSP の AAC (または G.711) → 8kHz の G.711 μ-law (WebRTC の PCMU) 20ms ごと
+#   話す: 見る側の PCMU → カメラの audio/transmit.cgi が受ける ADTS の AAC-LC (8kHz / 16kHz)
+#   通話の順番 (同時に話せるのは 1 人・後から押した人が優先・押している間だけ)
+# コーデックは pure Rust (Windows へのクロスビルドで C のライブラリを持ち込まない)
+[package]
+name = "cam-audio"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+cam-rtsp = { path = "../cam-rtsp" }
+cam-ptz = { path = "../cam-ptz" }
+# FFT の MDCT・逐次エンコード・unsafe なし (filmcraft-bitstream と thiserror だけに依存)
+filmcraft-aac = "0.9"
+
+[dev-dependencies]
+# 自前のエンコーダの出力を、別の実装のデコーダでも読めるか確かめる
+symphonia-core = "0.6"
+symphonia-codec-aac = "0.6"

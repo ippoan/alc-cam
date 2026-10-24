@@ -1,6 +1,8 @@
 //! 見る人 1 人ぶんの WebRTC (str0m)。UDP は 1 人に 1 本。カメラの受信は持たない (`hub` が束ねて配る)。
-//! カメラ中継規約どおり、映像のみ・H.264 パススルー・non-trickle の offer (候補は offer に全部入れる)。
-//! 首振り用にデータチャネル `ptz` を 1 本だけ offer に足す (中身は JSON 文字列。`ptz.rs`)。
+//! カメラ中継規約どおり、映像は H.264 パススルー・non-trickle の offer (候補は offer に全部入れる)。
+//! 音声は PCMU (8kHz) の sendrecv を 1 本: カメラのマイクを全員へ、話している人の声をカメラのスピーカーへ (`talk.rs`)。
+//! 映像と同じ stream id にするので、古い見る側 (`event.streams[0]` を video に付けるだけ) も映像はそのまま出る。
+//! 首振り・通話の合図用にデータチャネル `ptz` を 1 本だけ offer に足す (中身は JSON 文字列。`ptz.rs` / `talk.rs`)。
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -9,13 +11,16 @@ use serde_json::Value;
 use str0m::change::{SdpAnswer, SdpPendingOffer};
 use str0m::channel::ChannelId;
 use str0m::format::Codec;
-use str0m::media::{Direction, MediaKind, MediaTime, Mid, Pt};
+use str0m::media::{Direction, Frequency, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
 use crate::hub::{Frame, Sink};
 use crate::native::Out;
-use crate::{ptz, stun};
+use crate::{ptz, stun, talk};
+
+/// 見る人の声の溜め置きの上限 (20ms × 50 = 1 秒)。main が毎巡引き取るので普通は溜まらない
+const MAX_MIC: usize = 50;
 
 /// answer が来てから繋がるまでの猶予
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -28,6 +33,12 @@ pub struct Viewer {
     local: SocketAddr,
     mid: Mid,
     pt: Option<Pt>,
+    audio_mid: Mid,
+    audio_pt: Option<Pt>,
+    /// カメラの音を送った量 (8kHz のサンプル数 = RTP の時刻)
+    audio_ts: u64,
+    /// 見る人の声 (PCMU のペイロード)。main が `take_mic` で引き取る
+    mic: Vec<Vec<u8>>,
     pending: Option<SdpPendingOffer>,
     answered_at: Option<Instant>,
     connected: bool,
@@ -46,7 +57,7 @@ impl Viewer {
         let socket = UdpSocket::bind((lan_ip, 0)).map_err(|e| format!("UDP を開けません ({})", e.kind()))?;
         let local = socket.local_addr().map_err(|e| e.to_string())?;
 
-        let mut rtc = RtcConfig::new().clear_codecs().enable_h264(true).build(Instant::now());
+        let mut rtc = RtcConfig::new().clear_codecs().enable_h264(true).enable_pcmu(true, false).build(Instant::now());
         let host = Candidate::host(local, "udp").map_err(|e| format!("host 候補: {e}"))?;
         rtc.add_local_candidate(host);
         if let Some(server) = stun_addr {
@@ -59,6 +70,7 @@ impl Viewer {
 
         let mut api = rtc.sdp_api();
         let mid = api.add_media(MediaKind::Video, Direction::SendOnly, Some("alc-cam".into()), Some("camera".into()), None);
+        let audio_mid = api.add_media(MediaKind::Audio, Direction::SendRecv, Some("alc-cam".into()), Some("camera-audio".into()), None);
         api.add_channel("ptz".into());
         let (offer, pending) = api.apply().ok_or("offer を作れません")?;
 
@@ -69,6 +81,10 @@ impl Viewer {
             local,
             mid,
             pt: None,
+            audio_mid,
+            audio_pt: None,
+            audio_ts: 0,
+            mic: Vec::new(),
             pending: Some(pending),
             answered_at: None,
             connected: false,
@@ -113,6 +129,12 @@ impl Viewer {
                 Output::Event(Event::ChannelOpen(id, label)) if label == "ptz" => {
                     self.ptz = Some(id);
                     self.send_ptz(&ptz::caps());
+                    self.send_ptz(&talk::caps());
+                }
+                Output::Event(Event::MediaData(d)) if d.mid == self.audio_mid && d.params.spec().codec == Codec::PCMU => {
+                    if self.mic.len() < MAX_MIC {
+                        self.mic.push(d.data.to_vec());
+                    }
                 }
                 Output::Event(Event::ChannelData(d)) if Some(d.id) == self.ptz && !d.binary => {
                     self.inbox.push(String::from_utf8_lossy(&d.data).into_owned());
@@ -147,6 +169,10 @@ impl Viewer {
         Ok(true)
     }
 
+    pub fn take_mic(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.mic)
+    }
+
     pub fn take_ptz(&mut self) -> Vec<String> {
         std::mem::take(&mut self.inbox)
     }
@@ -177,6 +203,23 @@ impl Sink for Viewer {
             }
         };
         writer.write(pt, Instant::now(), MediaTime::from_90khz(f.ts), f.data.clone()).map_err(|e| e.to_string())
+    }
+
+    fn write_audio(&mut self, pcmu: &[u8]) -> Result<(), String> {
+        let Some(writer) = self.rtc.writer(self.audio_mid) else { return Ok(()) };
+        let pt = match self.audio_pt {
+            Some(pt) => pt,
+            None => {
+                let Some(pt) = writer.payload_params().find(|p| p.spec().codec == Codec::PCMU).map(|p| p.pt()) else {
+                    return Err("見る側が PCMU を受けません".into());
+                };
+                self.audio_pt = Some(pt);
+                pt
+            }
+        };
+        let ts = self.audio_ts;
+        self.audio_ts += pcmu.len() as u64;
+        writer.write(pt, Instant::now(), MediaTime::new(ts, Frequency::EIGHT_KHZ), pcmu.to_vec()).map_err(|e| e.to_string())
     }
 }
 

@@ -1,13 +1,14 @@
 # alc-cam: 拠点のカメラを、Chrome 拡張を開いている間だけ WebRTC (P2P) で見る側へ届ける。
-#   host/            native messaging の常駐 alc-cam-host (RTSP → WebRTC、再エンコードなし)
-#   crates/cam-rtsp  RTSP (TCP interleaved) → H.264 Annex B のアクセスユニット (I/O を持たない)
+#   host/            native messaging の常駐 alc-cam-host (RTSP → WebRTC、映像は再エンコードなし・音声はカメラのマイクとスピーカー)
+#   crates/cam-rtsp  RTSP (TCP interleaved) → H.264 Annex B のアクセスユニットと音声 (I/O を持たない)
 #   extension/       拠点側の Chrome 拡張 (cf-alc-signaling の /cam-room に device として繋ぎ、host と中継する)
 #   crates/cam-sd    カメラの SD 録画の一覧・取り出し・時刻の扱い (I/O を持たない)
 #   crates/cam-mp4   MP4 を再エンコードせずに切ってつなぐ (I/O を持たない)
 #   crates/cam-ptz   カメラの首振り (パン・チルト・プリセット) の間引きと CGI の組み立て (I/O を持たない)
+#   crates/cam-audio 音声の変換 (AAC ⇄ PCMU) と通話の順番 (I/O を持たない)
 #   ingest/          SD 録画の時間指定の切り出しを R2 に置く Worker `alc-cam-sd-ingest` (wasm32 専用なので別 workspace)
 [workspace]
-members = ["host", "crates/cam-rtsp", "crates/cam-sd", "crates/cam-mp4", "crates/cam-ptz"]
+members = ["host", "crates/cam-rtsp", "crates/cam-sd", "crates/cam-mp4", "crates/cam-ptz", "crates/cam-audio"]
 exclude = ["ingest"]
 resolver = "2"
 
