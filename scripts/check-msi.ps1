@@ -15,34 +15,33 @@ $wi = New-Object -ComObject WindowsInstaller.Installer
 function Call($o, [string]$m, $a) { $o.GetType().InvokeMember($m, 'InvokeMethod', $null, $o, $a) }
 function Prop($o, [string]$m, $a) { $o.GetType().InvokeMember($m, 'GetProperty', $null, $o, $a) }
 $db = Call $wi 'OpenDatabase' @($Msi, 0)
+# 1 行 = .c に列の配列を持つオブジェクト (配列のままだと PowerShell が行と列を展開して混ぜる)。呼ぶ側は @() で受ける
 function Rows([string]$sql, [int]$cols) {
-    try { $v = Call $db 'OpenView' @($sql) } catch { return @() }  # 表が無い
+    try { $v = Call $db 'OpenView' @($sql) } catch { return }  # 表が無い
     [void](Call $v 'Execute' $null)
-    $out = @()
-    while ($r = Call $v 'Fetch' $null) { $out += , @(1..$cols | ForEach-Object { Prop $r 'StringData' @([int]$_) }) }
+    while ($r = Call $v 'Fetch' $null) { [pscustomobject]@{ c = @(1..$cols | ForEach-Object { Prop $r 'StringData' @([int]$_) }) } }
     [void](Call $v 'Close' $null)
-    return , $out
 }
 $props = @{}
-foreach ($r in Rows 'SELECT `Property`, `Value` FROM `Property`' 2) { $props[$r[0]] = $r[1] }
+foreach ($r in @(Rows 'SELECT `Property`, `Value` FROM `Property`' 2)) { $props[$r.c[0]] = $r.c[1] }
 $words = Prop (Prop $db 'SummaryInformation' @(0)) 'Property' @(15)
 Check (-not $props['ALLUSERS'] -and ($words -band 8)) "perUser (ALLUSERS 無し・昇格不要の印。Word Count=$words)"
 Check ($props['ProductVersion'] -eq $Version) "ProductVersion = $Version ($($props['ProductVersion']))"
 Check ($props['ARPNOREPAIR'] -eq '1' -and $props['ARPNOMODIFY'] -eq '1') 'アプリと機能に修復・変更を出さない'
 
-$names = @(Rows 'SELECT `FileName` FROM `File`' 1 | ForEach-Object { ($_[0] -split '\|')[-1] })
+$names = @(Rows 'SELECT `FileName` FROM `File`' 1 | ForEach-Object { ($_.c[0] -split '\|')[-1] })
 $want = @('alc-cam-host.exe', 'org.ippoan.alc_cam_host.json') + @(Get-ChildItem -Recurse -File extension | ForEach-Object Name)
 Check (-not (Compare-Object ($names | Sort-Object) ($want | Sort-Object))) "ファイル = host・manifest・拡張の $((Get-ChildItem -Recurse -File extension).Count) 個 ($($names.Count) 個)"
 
-$reg = Rows 'SELECT `Root`, `Key`, `Name`, `Value` FROM `Registry`' 4
-Check (@($reg | Where-Object { $_[0] -ne '1' }).Count -eq 0) 'レジストリは全部 HKCU'
-Check (@($reg | Where-Object { $_[1] -eq 'Software\Google\Chrome\NativeMessagingHosts\org.ippoan.alc_cam_host' -and -not $_[2] -and $_[3] -eq '[#HostManifest]' }).Count -eq 1) 'native messaging の登録'
+$reg = @(Rows 'SELECT `Root`, `Key`, `Name`, `Value` FROM `Registry`' 4)
+Check (@($reg | Where-Object { $_.c[0] -ne '1' }).Count -eq 0) 'レジストリは全部 HKCU'
+Check (@($reg | Where-Object { $_.c[1] -eq 'Software\Google\Chrome\NativeMessagingHosts\org.ippoan.alc_cam_host' -and -not $_.c[2] -and $_.c[3] -eq '[#HostManifest]' }).Count -eq 1) 'native messaging の登録'
 
-$comps = Rows 'SELECT `Component`, `Attributes`, `Directory_` FROM `Component`' 3
-Check (@($comps | Where-Object { -not ([int]$_[1] -band 4) }).Count -eq 0) '部品の KeyPath は全部レジストリ'
-Check (@($comps | Where-Object { $_[0] -ne 'Registration' -and -not ([int]$_[1] -band 128) }).Count -eq 0) 'exe と拡張の部品は NeverOverwrite'
-Check ((Rows 'SELECT `Shortcut` FROM `Shortcut`' 1).Count -eq 0) 'ショートカット (広告) なし'
-Check (@(Rows 'SELECT `Action`, `Target` FROM `CustomAction`' 2 | Where-Object { $_[1] -match 'powershell' }).Count -eq 0) 'PowerShell の custom action なし'
+$comps = @(Rows 'SELECT `Component`, `Attributes`, `Directory_` FROM `Component`' 3)
+Check (@($comps | Where-Object { -not ([int]$_.c[1] -band 4) }).Count -eq 0) '部品の KeyPath は全部レジストリ'
+Check (@($comps | Where-Object { $_.c[0] -ne 'Registration' -and -not ([int]$_.c[1] -band 128) }).Count -eq 0) 'exe と拡張の部品は NeverOverwrite'
+Check (@(Rows 'SELECT `Shortcut` FROM `Shortcut`' 1).Count -eq 0) 'ショートカット (広告) なし'
+Check (@(Rows 'SELECT `Action`, `Target` FROM `CustomAction`' 2 | Where-Object { $_.c[1] -match 'powershell' }).Count -eq 0) 'PowerShell の custom action なし'
 [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
 $db = $null
 [GC]::Collect(); [GC]::WaitForPendingFinalizers()
