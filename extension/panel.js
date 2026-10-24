@@ -3,7 +3,7 @@
 //   「停止」(local の enabled) をここで書く → background が storage.onChanged で拾って繋ぎ直す
 //   状態 (session) を background が書く → ここで storage.onChanged を見て描く
 
-import { DEFAULTS, STATUS_KEY, loadSettings } from './lib/settings.js';
+import { DEFAULTS, STATUS_KEY, loadSettings, setEnabled } from './lib/settings.js';
 
 const $ = (id) => document.getElementById(id);
 const toggle = $('toggle');
@@ -47,7 +47,7 @@ function renderToggle(enabled) {
 
 toggle.addEventListener('click', async () => {
   const { enabled } = await loadSettings();
-  await chrome.storage.local.set({ enabled: !enabled });
+  await setEnabled(!enabled);
 });
 
 $('update-check').addEventListener('click', () => chrome.runtime.sendMessage({ type: 'update_check' }));

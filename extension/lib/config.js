@@ -10,15 +10,35 @@
 export const PWA_ORIGIN = 'https://alc.ippoan.org';
 export const MINE_PATH = '/device-data-proxy/api/cam-clips/cameras/mine';
 
+/** 送り主が点呼の PWA か (externally_connectable の上に、origin でも確かめる) */
+export const fromPwa = (sender) => sender?.origin === PWA_ORIGIN;
+
+/** 点呼の画面から送れる操作 ({type:'cam_control', action}) */
+export const CONTROL_ACTIONS = ['stop', 'start', 'update_check', 'refetch'];
+
 /** onMessageExternal で来た値を検める。正しければ {token, exp (ミリ秒)}、違えば null */
 export function parseTokenMessage(msg, sender) {
-  if (sender?.origin !== PWA_ORIGIN || msg?.type !== 'cam_host_token') return null;
+  if (!fromPwa(sender) || msg?.type !== 'cam_host_token') return null;
   const { token, exp } = msg;
   if (typeof token !== 'string' || !/^[\w-]+\.[\w-]+\.[\w-]+$/.test(token) || token.length > 8192) return null;
   if (typeof exp !== 'number' || !Number.isFinite(exp)) return null;
   // JWT の exp (秒) でも Date.now() (ミリ秒) でも受ける
   return { token, exp: exp < 1e12 ? exp * 1000 : exp };
 }
+
+/** 鍵の sub (`alarm:<fp>`。点呼の画面で照合を確かめる表示用で、署名は確かめない)。読めなければ '' */
+export function tokenSub(token) {
+  try {
+    const b64 = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    const sub = JSON.parse(atob(b64)).sub;
+    return typeof sub === 'string' ? sub : '';
+  } catch {
+    return '';
+  }
+}
+
+/** 状態を拡張の外へ出す前に RTSP の URL (資格情報を含みうる) を伏せる */
+export const redactRtsp = (text) => text.replace(/rtsp:\/\/[^\s"]*/g, 'rtsp://…');
 
 /** rtsp の接続先 → URL (資格情報は URL エンコード) */
 export function rtspUrl({ host, port, path, username }, password) {

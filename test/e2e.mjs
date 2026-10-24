@@ -58,8 +58,10 @@ process.env.ALC_CAM_HTTP_PORT = String(CGI_PORT);
 const camEntry = (id) => ({ id, name: `カメラ ${id}`, rtsp: { host: lanIp, port: 8554, path: 'stream2', username: CAM_USER, password: CAM_PASS } });
 const mine = { tokens: [], cameras: [] };
 const signaling = startSignaling({ port: SIG_PORT, v1Sites: ['v1-site'], mine });
-// 鍵の見た目だけ JWT (拡張は形を確かめる)
-const fakeToken = (n) => `eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiZGV2aWNlLWNhbS1ob3N0In0.sig${n}`;
+// 鍵の見た目だけ JWT (拡張は形を確かめる。sub は点呼の画面の照合の表示用に読む)
+const TOKEN_SUB = 'alarm:e2e';
+const fakePayload = Buffer.from(JSON.stringify({ role: 'device-cam-host', sub: TOKEN_SUB })).toString('base64url');
+const fakeToken = (n) => `eyJhbGciOiJIUzI1NiJ9.${fakePayload}.sig${n}`;
 
 // native messaging host の登録 (Linux の Chromium は <user-data-dir>/NativeMessagingHosts も見る)
 const userDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'alc-cam-e2e-'));
@@ -108,6 +110,9 @@ try {
   await pwa.goto('https://alc.ippoan.org/tenko');
   const sendToken = (n) =>
     pwa.evaluate(([id, token]) => chrome.runtime.sendMessage(id, { type: 'cam_host_token', token, exp: Math.floor(Date.now() / 1000) + 900 }), [EXT_ID, fakeToken(n)]);
+  // 点呼の画面の「カメラ配信 (拡張)」と同じ呼び方
+  const pwaSend = (msg) => pwa.evaluate(([id, m]) => chrome.runtime.sendMessage(id, m), [EXT_ID, msg]);
+  const camStatus = async () => (await pwaSend({ type: 'cam_status' })).status;
   // 許されていない origin には chrome.runtime.sendMessage が生えない
   const evil = await ctx.newPage();
   await evil.goto('https://evil.example/');
@@ -137,6 +142,22 @@ try {
   await waitFor(() => mine.calls.includes(fakeToken(3)), 10_000, '/cameras/mine (鍵の更新)');
   await sleep(1500);
   results.refresh = { joins: deviceJoins() - joinsAtRefresh, left: signaling.log.filter((l) => l === 'device left').length - leftAtRefresh };
+
+  // 点呼の画面から: 状態を読む (パネルと同じ中身。鍵の中身・パスワードは入らない)
+  results.extStatus = await camStatus();
+  // 担当カメラの取り直し (今の鍵で /cameras/mine を呼び直す。同じなら繋ぎ直さない)
+  const mineBefore = mine.calls.length;
+  results.extRefetch = await pwaSend({ type: 'cam_control', action: 'refetch' });
+  results.extRefetchCalls = mine.calls.length - mineBefore;
+  // 停止 → 開始
+  const leftBeforeStop = signaling.log.filter((l) => l === 'device left').length;
+  results.extStop = await pwaSend({ type: 'cam_control', action: 'stop' });
+  await waitFor(() => signaling.log.filter((l) => l === 'device left').length > leftBeforeStop, 10_000, '点呼の画面の停止で cam-room から抜ける');
+  results.extStoppedStatus = await camStatus();
+  const joinsBeforeStart = deviceJoins();
+  results.extStart = await pwaSend({ type: 'cam_control', action: 'start' });
+  await waitFor(() => deviceJoins() > joinsBeforeStart, 10_000, '点呼の画面の開始で cam-room に入り直す');
+  results.extUnknown = await pwaSend({ type: 'cam_control', action: 'rm -rf' });
   // パネル (拡張のページ) は開いていない
   results.beforeViewer = { ...camera.stats, hostRunning: hostRunning(), extPages: ctx.pages().filter((p) => p.url().startsWith('chrome-extension://')).length };
 
@@ -282,6 +303,14 @@ try {
   await upd.close();
   await waitFor(() => !hostRunning(), 10_000, '確認のためだけの host が終わる');
   results.afterUpdateCheck = { hostRunning: hostRunning() };
+  // 点呼の画面の「更新確認」も同じ確認 (結果と時刻が状態に出る)
+  const updAt = (await camStatus()).updateAt;
+  results.extUpdate = await pwaSend({ type: 'cam_control', action: 'update_check' });
+  results.extUpdateStatus = await waitFor(async () => {
+    const st = await camStatus();
+    return st.updateAt > updAt && st.updateState !== 'checking' ? st : null;
+  }, 10_000, '点呼の画面の更新確認');
+  await waitFor(() => !hostRunning(), 10_000, '確認のためだけの host が終わる (点呼の画面から)');
 
   // host が拡張のフォルダを入れ替えた後の形: ディスクの manifest.json の版が上がっていれば、確認の答えで読み込み直す
   const manifestPath = path.join(extDir, 'manifest.json');
@@ -339,7 +368,20 @@ console.log(JSON.stringify(results, null, 1));
 const checks = results.error ? {} : {
   // 拠点もカメラも決まらないうちは繋がない
   waitsWithoutConfig: results.noConfig.joins === 0 && results.noConfig.mineCalls === 0,
-  // 鍵は alc.ippoan.org からだけ受ける
+  // 点呼の画面から状態が読め、版・担当カメラ・鍵の sub が出る。鍵の中身・パスワードは出ない
+  extStatus: (() => {
+    const st = results.extStatus;
+    const json = JSON.stringify(st);
+    return st?.version === '0.4.2' && st.enabled === true && st.tokenLive === true && st.tokenSub === TOKEN_SUB &&
+      st.assigned?.id === 'test-site' && st.signal?.[0] === '接続済み' && !json.includes(CAM_PASS) && !json.includes('eyJ') && !json.includes('rtsp://');
+  })(),
+  // 取り直しは /cameras/mine を 1 回呼び、同じカメラなら繋ぎ直さない
+  extRefetch: results.extRefetch?.ok === true && results.extRefetchCalls === 1,
+  extStopStart: results.extStop?.ok === true && results.extStoppedStatus?.enabled === false && results.extStart?.ok === true &&
+    results.extStart.status?.enabled === true,
+  extUnknownRejected: results.extUnknown?.ok === false,
+  extUpdateCheck: results.extUpdate?.ok === true && results.extUpdateStatus?.updateState === 'unsupported' && results.extUpdateStatus.hostVersion === '0.4.2',
+  // 鍵は alc.ippoan.org からだけ受ける (他の origin には chrome.runtime.sendMessage 自体が生えない = 状態も操作も届かない)
   pwaOnly: results.evilHasSendMessage === 'undefined' && results.token1Reply?.ok === true,
   zeroCamerasReason: !!results.zeroCameras,
   // 担当カメラの id の部屋に、受けた鍵を付けて入る
@@ -370,7 +412,7 @@ const checks = results.error ? {} : {
   reconnectsAfterSwStop: results.afterSwRestart.cDelta > 0,
   stoppedByToggle: !!results.stoppedByToggle,
   // 更新の確認は host の版を添えてパネルに出て、確認のためだけの host は残らない
-  updateCheck: results.update?.includes('host v0.4.1') && results.afterUpdateCheck?.hostRunning === false,
+  updateCheck: results.update?.includes('host v0.4.2') && results.afterUpdateCheck?.hostRunning === false,
   // ディスクの拡張が新しくなっていたら読み込み直し、配信に戻る
   reloadsWhenUpdatedOnDisk: results.reloadedVersion === '99.0.0',
   // 読み込み直しの後はパスワード待ち (写しのカメラ id は残る)、鍵が届けば繋ぎ直す
