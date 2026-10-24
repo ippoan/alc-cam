@@ -36,8 +36,8 @@ WebRTC (P2P) で見る側へ届ける。alc-gw (Go の常駐アプリ) を置か
 
 | パス | 中身 |
 |---|---|
-| `host/` | `alc-cam-host` (str0m で WebRTC、暗号は pure Rust)。`hub.rs` が見る人への複製、`update.rs` が host と拡張の自己更新。`install.ps1` は Windows への初回の登録 |
-| `scripts/` | Release に付ける物 (host・拡張の zip・`alc-cam.json`) を作る `pack-release.ps1` |
+| `host/` | `alc-cam-host` (str0m で WebRTC、暗号は pure Rust)。`hub.rs` が見る人への複製、`update.rs` が host と拡張の自己更新 |
+| `scripts/` | Release に付ける物 (host・拡張の zip・`alc-cam.json`・`alc-cam.msi`) を作る `pack-release.ps1`。MSI は `alc-cam.wxs` + `build-msi.ps1`、検査は `check-msi.ps1` |
 | `crates/cam-rtsp/` | RTSP (Digest・TCP interleaved) → H.264 Annex B。I/O を持たない |
 | `extension/` | 拠点側の Chrome 拡張 (MV3)。配信は `background.js` (service worker)、`lib/config.js` が鍵の受け取りと担当カメラの取得、`panel.*` は状態表示。ID は `key` で `icmmpdjddlphkbokdalofdjpkcgfiggd` に固定 |
 | `test/` | 偽カメラ・cam-room のローカル版・見る側のページと、それらを通す `e2e.mjs` |
@@ -54,19 +54,36 @@ WebRTC (P2P) で見る側へ届ける。alc-gw (Go の常駐アプリ) を置か
 
 拠点で Chrome を使う Windows のユーザーで行う。
 
-1. 最新 Release の `alc-cam-windows.zip` を展開し、`install.cmd` をダブルクリックする
-   (= `powershell -ExecutionPolicy Bypass -File install.ps1`)。host を `%LOCALAPPDATA%\alc-cam\alc-cam-host.exe` に置いて
-   `HKCU` に native messaging として登録し、拡張を `%LOCALAPPDATA%\alc-cam\extension` に置く
-2. 以前に別の場所 (zip を展開したフォルダ等) から拡張を読み込んでいた PC は、install.ps1 がその場所を出して促すので、
-   `chrome://extensions` で「alc-cam 拠点中継」を **削除** する (そこは自動で更新されない)
+1. 最新 Release の `alc-cam.msi` をダブルクリックして入れる (Chrome は閉じておく)。host を `%LOCALAPPDATA%\alc-cam\alc-cam-host.exe` に置いて
+   `HKCU` に native messaging として登録し、拡張を `%LOCALAPPDATA%\alc-cam\extension` に置く。最後の画面に次の 2・3 が出る
+2. 以前に別の場所 (zip を展開したフォルダ等) から拡張を読み込んでいた PC は、`chrome://extensions` で「alc-cam 拠点中継」を
+   **削除** する (そこは自動で更新されない)
 3. `chrome://extensions` → 右上の「デベロッパー モード」を ON → 「パッケージ化されていない拡張機能を読み込む」→
-   `%LOCALAPPDATA%\alc-cam\extension` (パスは install.ps1 がクリップボードに入れる)。ID が `icmmpdjddlphkbokdalofdjpkcgfiggd` であること。
+   `%LOCALAPPDATA%\alc-cam\extension`。ID が `icmmpdjddlphkbokdalofdjpkcgfiggd` であること。
    **デベロッパー モードは以後も OFF に戻さない** (OFF のまま拡張が読み込み直すと、Chrome が拡張を無効にする)
 4. 録画の画面でこの拠点のカメラ (RTSP の接続先 = stream2) にこの PC の CoreS3 の鍵を紐づけておき、この Chrome で点呼の画面
    (alc.ippoan.org) を開く。鍵が届くと配信が始まり、サイドパネルの「担当カメラ」にカメラ名が出る (以後は Chrome と点呼の画面を
    開くだけで繋ぐ)。パネルは閉じてよい。止めるときはパネルの「停止」
 
-見る側は alc-app の拠点カメラ画面で同じカメラを開く。外すとき: `uninstall.cmd` (host の登録とフォルダを消す) のあと `chrome://extensions` で削除。
+見る側は alc-app の拠点カメラ画面で同じカメラを開く。外すとき: 「アプリ」の一覧から「alc-cam 拠点中継」をアンインストール (host の登録と `%LOCALAPPDATA%\alc-cam` を丸ごと消す) のあと `chrome://extensions` で削除。
+
+### MSI と自己更新の両立
+
+MSI (`scripts/alc-cam.wxs`、WiX 5.0.2 で perUser) は入れた後のファイルを host の自己更新に任せる。Windows Installer の修復で古い版に戻さないために:
+
+- exe と拡張の部品は `NeverOverwrite`。KeyPath は「その版の MSI で入れた」印の `HKCU\Software\ippoan\alc-cam\Installed` の値
+  (名前に版を含む)。修復 (`msiexec /f`、.msi の右クリックの「修復」) は印があるので入れ直さない = host が書き換えた版のまま。
+  ファイルが KeyPath ではないので、中身が変わっても Windows Installer は壊れたと見なさない
+- 自動修復の入口を作らない: ショートカット・広告 (advertise) なし、「アプリと機能」に修復・変更を出さない (`ARPNOREPAIR`・`ARPNOMODIFY`)。
+  native messaging の登録と manifest の JSON の部品だけは普通の部品 (自己更新は触らないので修復で直ってよい)
+- 新しい版の MSI は `MajorUpgrade` で前の版を丸ごと外してから入れる (印の名前が変わるので NeverOverwrite でも入る)。
+  host が MSI より新しい版に自己更新していても MSI の版に戻るが、次の更新確認で Release の版に上がり直す。
+  古い版の MSI は「新しい版が入っています」で止まる。同じ版の MSI をもう一度入れても何もしない
+- アンインストールは `util:RemoveFolderEx` で `%LOCALAPPDATA%\alc-cam` を丸ごと消す (自己更新の `.old`・`.new-*`・`extension.old-*` も)
+
+CI (`windows` job) の `scripts/check-msi.ps1` が、表 (ファイル・HKCU・perUser・NeverOverwrite・ショートカットなし) を読んだあと
+runner のユーザーに入れ、自己更新の書き換えを真似て `msiexec /fa` しても戻らない・版を 1 つ上げた MSI で上がって残りが消える・
+古い MSI では下がらない・外すと全部消える、を確かめる。
 
 ### 以後の更新 (Release を出すだけ)
 
@@ -84,7 +101,7 @@ WebRTC (P2P) で見る側へ届ける。alc-gw (Go の常駐アプリ) を置か
 
 版を上げるとき: `host/Cargo.toml` と `extension/manifest.json` の `version` を揃えて上げ、merge 後に `v<版>` のタグを手で打つ
 (GITHUB_TOKEN で打ったタグは workflow を起動しない)。タグの CI (`windows` job) が `scripts/pack-release.ps1` で
-`alc-cam-host.exe`・`alc-cam-extension.zip`・`alc-cam.json` を作り、`alc-cam-windows.zip` (初回用) と一緒に Release に付ける。
+`alc-cam-host.exe`・`alc-cam-extension.zip`・`alc-cam.json` と初回用の `alc-cam.msi` を作り、Release に付ける。
 拡張と host は別々の時点で入れ替わることがあるので、メッセージは後方互換に保つ (知らない `type` は双方とも捨てる)。
 
 Chrome のポリシー (`ExtensionSettings` の force_installed + CRX) で配る方式は採らない: Windows の Chrome が Web Store 外の拡張を
@@ -152,7 +169,7 @@ keepalive の自動応答 (完全一致の ping にだけ pong) を写してい�
 
 ## 未確認・未対応
 
-- Windows の実機 (install.ps1 と host.exe、host の exe と拡張のフォルダの入れ替え。Chrome が読み込んでいるフォルダを rename できるか)。
+- Windows の実機 (alc-cam.msi の画面と Chrome を開いたままの上書き、host.exe、host の exe と拡張のフォルダの入れ替え。Chrome が読み込んでいるフォルダを rename できるか)。
   入れ替えの手順は `host/src/update.rs` の単体テスト、拡張の読み込み直しは e2e、GitHub の redirect の辿り方は
   `cargo test -p alc-cam-host -- --ignored real_github` で確かめたビルドは CI の windows-latest で行う (この repo の Linux 環境に MinGW が無い)
 - 本物の C212 と、拠点の外 (NAT 越し) からの視聴。TURN は無いので、対称型 NAT 同士では繋がらない (規約 v1 と同じ)

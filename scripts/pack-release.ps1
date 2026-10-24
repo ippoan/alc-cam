@@ -3,6 +3,7 @@
 #   alc-cam-host.exe        host
 #   alc-cam-extension.zip   拡張 (zip の直下に manifest.json)。host が %LOCALAPPDATA%\alc-cam\extension に展開する
 #   alc-cam.json            {"version","host_sha256","extension_sha256"}
+#   alc-cam.msi             初回に拠点 PC へ入れる物 (scripts/build-msi.ps1。以後は host が上の 3 つで自分を更新する)
 #
 #   pwsh scripts/pack-release.ps1 -Version 0.3.1
 # extension/manifest.json と host/Cargo.toml の版が -Version と揃っていなければ止まる。
@@ -37,5 +38,6 @@ try {
 $sha = { param($p) (Get-FileHash -Algorithm SHA256 -Path $p).Hash.ToLower() }
 $json = [ordered]@{ version = $Version; host_sha256 = (& $sha $exe); extension_sha256 = (& $sha $zip) } | ConvertTo-Json -Compress
 [IO.File]::WriteAllText((Join-Path $Out 'alc-cam.json'), $json, $utf8)
+& (Join-Path $PSScriptRoot 'build-msi.ps1') -Version $Version -Exe $exe -Out (Join-Path $Out 'alc-cam.msi')
 
 Get-ChildItem $Out | Format-Table Name, Length

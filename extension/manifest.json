@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "alc-cam 拠点中継",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Chrome が動いている間ずっと、拠点のカメラ (RTSP) を WebRTC で見る側へ P2P で届ける (見る人が来たときだけカメラに繋ぐ)。中身は native messaging の alc-cam-host (Rust)",
   "minimum_chrome_version": "116",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA8qqX+Ztoq+XnRISxdzcXlxUm1dtIQ+g3t8n8BLjijNtF5wFCFNJMoXEN+QCoBmQMIIoX43TUXdmk75Le6Ae2DMsHCHw216YtFi5p3x4DacrbNuRkR796xU84grangdmaBNbV7iCDbjUApJrpz4kTTQld0lJU2Yb61yTTp+sMSmqcQm+UgkKjKtqgdKt9r88vt/XAi1cHZDdSwgxLtwwkkv1o8ObBv3nqOiRPYoX7R1FR7uf2bwqhZGQ+UFbK4EeA8cKMQru3u8RolOPKrhkrtKSkaFC860WzQr8OWl3f9KLjdceN4PUqzqUH+F1c8rdRvsJC97wrU7zzaP0uzSu9jwIDAQAB",

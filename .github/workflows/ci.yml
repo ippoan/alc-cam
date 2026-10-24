@@ -82,24 +82,28 @@ jobs:
           if ($bad) { exit 1 }
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p alc-cam-host
-      # Release に付ける host・拡張の zip・alc-cam.json (scripts/pack-release.ps1)。PR / main でも作って手順を確かめる
-      - name: 自己更新用の host・拡張 zip・版情報
+      # MSI は WiX 5.0.2 に固定 (v6 以降は OSMF の EULA の受諾が要り、無いと WIX7015 で止まる)
+      - name: WiX 5.0.2
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          "$env:USERPROFILE\.dotnet\tools" >> $env:GITHUB_PATH
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
+      # Release に付ける host・拡張の zip・alc-cam.json・alc-cam.msi (scripts/pack-release.ps1)。PR / main でも作って手順を確かめる
+      - name: 自己更新用の host・拡張 zip・版情報と初回用の MSI
         shell: pwsh
         run: |
           $ver = if ('${{ github.ref }}'.StartsWith('refs/tags/v')) { '${{ github.ref_name }}'.TrimStart('v') } else { (Get-Content -Raw extension/manifest.json | ConvertFrom-Json).version }
           ./scripts/pack-release.ps1 -Version $ver
-      - name: パッケージ (初回の手入れ用。host・install スクリプト・拡張)
+      # 中身の表 (ファイル・HKCU・perUser・NeverOverwrite) と、runner のユーザーに入れて 自己更新の真似 → 修復 → 上げ → 下げ拒否 → 外す
+      - name: MSI の検査
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist/alc-cam | Out-Null
-          Copy-Item target/release/alc-cam-host.exe, host/install.ps1, host/install.cmd, host/uninstall.cmd dist/alc-cam/
-          Copy-Item -Recurse extension dist/alc-cam/extension
-          Compress-Archive -Path dist/alc-cam/* -DestinationPath dist/alc-cam-windows.zip
+        run: ./scripts/check-msi.ps1 -Msi dist/alc-cam.msi -Exe dist/alc-cam-host.exe -Version (Get-Content -Raw extension/manifest.json | ConvertFrom-Json).version
       - uses: actions/upload-artifact@v4
         with:
           name: alc-cam-windows
           path: |
-            dist/alc-cam-windows.zip
+            dist/alc-cam.msi
             dist/alc-cam-extension.zip
             dist/alc-cam-host.exe
             dist/alc-cam.json
@@ -108,7 +112,7 @@ jobs:
       - if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create ${{ github.ref_name }} dist/alc-cam-windows.zip dist/alc-cam-extension.zip dist/alc-cam-host.exe dist/alc-cam.json --generate-notes
+        run: gh release create ${{ github.ref_name }} dist/alc-cam.msi dist/alc-cam-extension.zip dist/alc-cam-host.exe dist/alc-cam.json --generate-notes
 
   # green の PR を merge する (ippoan/ci-workflows の reusable。merge は GitHub App の token で行う)。
   # デプロイはここではしない (ingest は merge 後に deploy.yml が出す)。windows も PR で走るので needs に入れる
