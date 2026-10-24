@@ -72,6 +72,12 @@ binding = "CAM_TS_NS320W_55"
 service_id = "01a166ef-0929-7330-af52-3da25f41c42e"
 remote = true
 
+# 釧路 (拠点 PC の cloudflared の Tunnel `kushiro` 経由)
+[[vpc_services]]
+binding = "CAM_KUSHIRO"
+service_id = "01a16d1a-9531-7f61-b15b-25821ab5b512"
+remote = true
+
 # ローカル (`wrangler dev --env local`) 専用。deploy しない。
 # Hyperdrive も VPC Service も持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL (.dev.vars) の段で繋ぐ。
 # R2 は手元の模擬。カメラには届かないので切り出しの口は失敗し、vpc_binding を書く登録は 400 になる (台帳の口の確認用)
