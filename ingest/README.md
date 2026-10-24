@@ -13,10 +13,12 @@ auth-worker (/api/cam-clips/) ─Service Binding─▶ alc-cam-sd-ingest ─Work
 口 (中身は `ingest/api`。宛先・資格情報は応答にもログにも出さない。パスワードは返さない):
 
 ```
-GET   /api/cam-clips/cameras                 → {"can_edit_destination": bool, "cameras": [{id, name, vpc_binding, rec_username, has_password, recording, device_ids, rec_scanned_until}]}
+GET   /api/cam-clips/cameras                 → {"can_edit_destination": bool, "cameras": [{id, name, vpc_binding, rec_username, has_password, recording, lan_ip, rtsp_port, rtsp_path, device_ids, rec_scanned_until}]}
                                                運行管理者席の鍵には → {"cameras": [{id, name, device_ids}]} (録画の設定は返さない)
-POST  /api/cam-clips/cameras                 {name, vpc_binding?, rec_username?, rec_password?, device_ids?} → 201 (active = false で作る)
-PATCH /api/cam-clips/cameras/{id}            同じ項目 (省略 = 変えない、vpc_binding: null = 取り込みをやめる、rec_password: "" = 変えない)
+POST  /api/cam-clips/cameras                 {name, vpc_binding?, rec_username?, rec_password?, lan_ip?, rtsp_port?, rtsp_path?, device_ids?} → 201 (active = false で作る)
+PATCH /api/cam-clips/cameras/{id}            同じ項目 (省略 = 変えない、vpc_binding: null = 取り込みをやめる、rec_password: "" = 変えない、
+                                               lan_ip / rtsp_path: null か "" = 消す、rtsp_port: null = 554 に戻す)
+GET   /api/cam-clips/cameras/mine            拠点 PC の配信の鍵だけ → {"cameras": [{id, name, rtsp: {host, port, path, username, password} | null}]}
 GET   /api/cam-clips/device-candidates?days=30   直近 days 日 (1〜90) にイベントを出した端末と kind ごとの件数 (行ごとに is_dev: 開発端末の行も軸ごとに読んで返す)
 POST  /api/cam-clips/clips                   {"camera_id": "...", "from": "2026-10-23T12:58:00+09:00", "to": "2026-10-23T12:59:30+09:00"}
 POST  /api/cam-clips/auto-run                 {} か {"camera_id": "..."} → 200 {"cameras": [...]} (cron と同じ自動切り出しを呼び手のテナントだけで今すぐ回す。camera_id で 1 台に絞れる。dev token では 403)
@@ -27,6 +29,19 @@ GET   /api/cam-clips/events?camera_id=<uuid>&date=2026-10-23   (JST の 1 日)
 → 200 [{"source_table", "source_id", "kind", "occurred_at", "device_id", "is_dev", "clip": {"clip_id", "key", "status", "error"} | null}]
 ```
 
+- RTSP の接続先 (拠点 PC の配信が繋ぐ先。migration 188): `lan_ip` はプライベートの IPv4 (10/8・172.16/12・192.168/16) だけ、
+  `rtsp_port` は 1〜65535 (既定 554)、`rtsp_path` は先頭の `/` を落として保存 (英数と `/ _ - . ? = &`、200 文字まで、`..` 不可)。
+  ユーザー名・パスワードは録画用の `rec_username` / `rec_password` を使い回す (列を増やさない)。一覧にパスワードは出ない
+- `GET /cameras/mine` は、鍵の端末 (`X-Device-Id`) を `cam_camera_devices` で結び付けたカメラを名前の順に返す。`rtsp` は
+  `lan_ip` と `rtsp_path` が両方在るときだけで、無ければ null。`password` は `SSO_ENCRYPTION_KEY` で復号した平文 (未設定なら null)。
+  応答にパスワードの平文が出るのはこの口だけ。例 (値は作り物):
+
+  ```json
+  {"cameras": [
+    {"id": "6f1c…", "name": "入口", "rtsp": {"host": "192.168.10.20", "port": 554, "path": "stream1", "username": "viewer", "password": "example-pass"}},
+    {"id": "9a0e…", "name": "倉庫", "rtsp": null}
+  ]}
+  ```
 - `POST /clips` の応答の `truncated` は、要求より短い範囲しか取れなかった (`actual_from` > `from` か `actual_to` < `to`) とき true
 
 ### 自動の切り出し (cron、1 時間ごと)
@@ -35,16 +50,17 @@ GET   /api/cam-clips/events?camera_id=<uuid>&date=2026-10-23   (JST の 1 日)
 と `ingest/src/auto.rs` (カメラと R2)。
 
 - テナント (`list_cam_recording_tenant_ids()`) → `rec_ip IS NOT NULL` のカメラの順に巡る
-- 範囲は `[rec_scanned_until (NULL なら 2 時間前), now)`。結び付けた端末 (`cam_camera_devices`) の `hub_measurements`
+- 範囲は `[now - 24 時間, now)` (`rec_scanned_until` は使わない。端末の回線断でキューに溜まって遅れて届いた記録も拾うため)。結び付けた端末 (`cam_camera_devices`) の `hub_measurements`
   (alcohol / blood_pressure / timecard / license、時刻は `COALESCE(recorded_at, created_at)`) と `vein_enroll_events` を、
-  本番の行と開発端末の行 (`app.device_dev='1'` の transaction) の両方から拾う。`cam_clip_events` に在るものは除く
+  本番の行と開発端末の行 (`app.device_dev='1'` の transaction) の両方から拾う。`cam_clip_events` に在るものは除く (重複はこれで防ぐ)。
+  24 時間を超えて届かなかった記録、24 時間を超えて次の回へ回され続けたまとまりは拾わない (SD の上書きと 1 回の一覧の量の上限として受け入れる)
 - 各イベントの前後 10 秒。重なる・接する窓は 1 本にまとめる
 - 切ってよいのは、まとまりの終わりが SD の一覧の「最後の閉じたファイルの終わり」(= 一覧で次のファイル、書き込み途中の
   `_!` を含む、の開始。後ろに何も無ければその開始) 以内のときだけ。越えたまとまりと以降、カメラあたり
-  `AUTO_CLIP_MAX_GROUPS` (40) を超えた分は次の回へ回し、`rec_scanned_until` をその頭 (最初のイベント - 10 秒) にする
+  `AUTO_CLIP_MAX_GROUPS` (40) を超えた分は次の回へ回し (次の回も同じ 24 時間から見直す)、画面の「走査済み」(`rec_scanned_until`) をその頭 (最初のイベント - 10 秒) にする
 - 同じ SD ファイルにかかるまとまりは R2 の元ファイルを使い回す (1 回の中で取り寄せは 1 ファイル 1 回)
 - R2 → `cam_clips` (ready / failed) → `cam_clip_events` の順に書く。失敗しても再試行しない
-- SD の一覧が取れなかった回は何も書かず、`rec_scanned_until` も進めない
+- SD の一覧が取れなかった回は何も書かず、`rec_scanned_until` (表示用) も進めない
 
 - 時刻は ISO 8601。時差が無ければ JST。1 回 120 分まで (`MAX_CLIP_SECS`)。同じ時間帯は作り直さず 200 で返す。
   結果 (ready / failed) は `cam_clips` に残す
@@ -57,10 +73,12 @@ GET   /api/cam-clips/events?camera_id=<uuid>&date=2026-10-23   (JST の 1 日)
   `alc_api.cameras` の `rec_*` 列に持つ (binding 名は `rec_ip` 列に入る。列名は IP のままで migration はしていない)。
   カメラの IP は Cloudflare の VPC Service の側に在り、repo にも DB にも無い
 - 外から直接は届かない (workers_dev / route なし。`ingest/scripts/check-exposure.sh` が CI で検査)。auth-worker の振り分け表
-  `ALC_BINDING_ROUTES` から届き、JWT の検証は auth-worker が済ませる。Worker が受ける呼び手は 2 つで、それ以外は 403:
+  `ALC_BINDING_ROUTES` から届き、JWT の検証は auth-worker が済ませる。Worker が受ける呼び手は 3 つで、それ以外は 403:
   - 管理者のログイン (画面用の proxy、`X-User-Role: admin`) — 全部の口
   - 運行管理者席の鍵 (端末用の proxy、`X-Device-Role: device-tenko-manager`) — 遠隔点呼の画面が乗務員の端末からカメラを
     引くための `GET /cameras` だけ。他の口は 403。auth-worker 側でも席の許可表 (`TENKO_MANAGER_ROUTES`) がこの GET 1 本だけを通す
+  - 拠点 PC の配信の鍵 (端末用の proxy、`X-Device-Role: device-cam-host`。CoreS3 署名の usage `cam-host`) — `GET /cameras/mine`
+    だけ。他の口は 403。端末は `X-Device-Id` (鍵の JWT の sub、`alarm:<fingerprint>`) で、無ければ 401・200 文字超は 400
 
   `X-User-Role` と `X-Device-Role` が両方あるときも 403 (auth-worker はどちらか片方しか付けない)。テナントはどちらも `X-Tenant-ID`
   (席の鍵は鍵を登録したテナント) で決まり、読めるのはそのテナントの行だけ。`X-Tenant-ID` が無ければ 401・UUID でなければ 400。
