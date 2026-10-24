@@ -19,7 +19,7 @@ function Rows([string]$sql, [int]$cols) {
     try { $v = Call $db 'OpenView' @($sql) } catch { return @() }  # 表が無い
     [void](Call $v 'Execute' $null)
     $out = @()
-    while ($r = Call $v 'Fetch' $null) { $out += , @(1..$cols | ForEach-Object { Prop $r 'StringData' @($_) }) }
+    while ($r = Call $v 'Fetch' $null) { $out += , @(1..$cols | ForEach-Object { Prop $r 'StringData' @([int]$_) }) }
     [void](Call $v 'Close' $null)
     return , $out
 }
