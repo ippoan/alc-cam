@@ -9,6 +9,8 @@
 //! - `GET /cameras`・`POST /cameras`・`PATCH /cameras/{id}` — カメラの台帳 (alc_api.cameras)。運行管理者席の鍵は `GET /cameras` だけ
 //!   (応答は `id`・`name`・`device_ids`)。宛先 (`vpc_binding`、
 //!   VPC Service の binding 名。DB の列は `rec_ip`) を書けるのは `X-User-Developer: 1` (開発者の Google ログイン) のときだけ
+//! - `GET /cameras/mine` — 拠点 PC の配信の鍵 (`X-Device-Role: device-cam-host`) だけ。鍵の端末 (`X-Device-Id`) が映すカメラの
+//!   RTSP の接続先を、パスワードを復号して返す (鍵は Secrets Store の `SSO_ENCRYPTION_KEY`)
 //! - `GET /device-candidates?days=30` — 映している端末を選ぶための、直近のイベントの端末の一覧
 //! - `POST /clips` に `{"camera_id": "...", "from": "...", "to": "..."}` (ISO 8601。時差が無ければ JST)
 //! - `GET /clips/<tenant>/<camera_id>/<開始>_<終了>.mp4` で取り出す (Range 対応 = シークできる)
@@ -18,9 +20,10 @@
 //!
 //! 外から直接届く口は持たない (workers_dev / route なし)。auth-worker の振り分け表 (`ALC_BINDING_ROUTES`)
 //! から Service Binding で届き、JWT の検証は auth-worker が済ませて `X-Tenant-ID` と、画面用の proxy なら
-//! `X-User-Role` / `X-User-Developer`、端末用の proxy (運行管理者席の鍵) なら `X-Device-Role` を付け直す (alc 系の分割 Worker と同じ)。
+//! `X-User-Role` / `X-User-Developer`、端末用の proxy (運行管理者席・拠点 PC の配信の鍵) なら `X-Device-Role` (と `X-Device-Id`) を付け直す (alc 系の分割 Worker と同じ)。
 //!
-//! カメラの資格情報は応答にもログにも出さない (宛先の IP は VPC Service の側に在り、Worker は持たない)。
+//! カメラの資格情報は応答にもログにも出さない (宛先の IP は VPC Service の側に在り、Worker は持たない)。例外は拠点 PC の
+//! 配信の鍵への `GET /cameras/mine` だけで、担当カメラの RTSP のパスワードを復号して返す。
 
 // worker 本体は wasm32 専用。native の `cargo test` / `clippy` (workspace) では空の crate にして、api/ だけを検査させる
 #![cfg(target_arch = "wasm32")]

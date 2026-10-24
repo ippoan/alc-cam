@@ -115,6 +115,14 @@ async fn migrate(su: &Client) {
             .ends_with("_cam_recording.sql")),
         "取り出した migrations に 187 (cam_recording) が無い (scripts/ALC_MIGRATIONS_REV が古い)"
     );
+    assert!(
+        files.iter().any(|f| f
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("_cameras_rtsp.sql")),
+        "取り出した migrations に 188 (cameras_rtsp) が無い (scripts/ALC_MIGRATIONS_REV が古い)"
+    );
     for file in files {
         let name = file.file_name().unwrap().to_owned();
         if let Err(e) = su
@@ -176,6 +184,7 @@ fn caller(tenant: Uuid, developer: bool) -> Caller {
         tenant,
         developer,
         role: Role::Admin,
+        device_id: None,
     }
 }
 
@@ -185,6 +194,17 @@ fn tenko_manager(tenant: Uuid) -> Caller {
         tenant,
         developer: false,
         role: Role::TenkoManager,
+        device_id: None,
+    }
+}
+
+/// 拠点 PC の配信の鍵 (auth-worker の端末用の proxy から届く呼び手。`X-Device-Id` は鍵の JWT の sub)
+fn cam_host(tenant: Uuid, device: &str) -> Caller {
+    Caller {
+        tenant,
+        developer: false,
+        role: Role::CamHost,
+        device_id: Some(device.to_owned()),
     }
 }
 
@@ -462,6 +482,111 @@ async fn tenko_manager_lists_own_tenant_cameras_without_recording_settings() {
     assert_eq!(admin_list["cameras"].as_array().unwrap().len(), 1);
     assert_eq!(admin_list["cameras"][0]["name"], "A の入口");
     assert_eq!(admin_list["cameras"][0]["has_password"], true);
+}
+
+#[tokio::test]
+async fn rtsp_settings_are_edited_and_listed_without_password() {
+    let t = tenant().await;
+    let mut pg = rt().await;
+    let a = caller(t, false);
+
+    // backend の形の INSERT (新しい列を書かない) は rtsp_port = 554・他は NULL
+    admin()
+        .await
+        .execute("INSERT INTO alc_api.cameras (tenant_id, name, ip) VALUES ($1, '既存の ONVIF', '192.168.9.9')", &[&t])
+        .await
+        .unwrap();
+    let (s, cam) = call(&mut pg, &a, "POST", "/cameras", "", json!({"name": "入口", "lan_ip": "192.168.10.20", "rtsp_path": "/stream1", "rec_username": "viewer", "rec_password": "pw-rtsp"})).await;
+    assert_eq!(s, 201, "{cam}");
+    assert_eq!((&cam["lan_ip"], &cam["rtsp_port"], &cam["rtsp_path"]), (&json!("192.168.10.20"), &json!(554), &json!("stream1")));
+    let id = cam["id"].as_str().unwrap().to_owned();
+
+    let (_, list) = call(&mut pg, &a, "GET", "/cameras", "", Value::Null).await;
+    let cams = list["cameras"].as_array().unwrap();
+    let onvif = cams.iter().find(|c| c["name"] == "既存の ONVIF").unwrap();
+    assert_eq!((&onvif["lan_ip"], &onvif["rtsp_port"], &onvif["rtsp_path"]), (&Value::Null, &json!(554), &Value::Null));
+    // 一覧にパスワード (平文・暗号文) は出ない
+    let text = list.to_string();
+    assert!(!text.contains("pw-rtsp"));
+    for c in cams {
+        assert!(c.get("rec_password").is_none() && c.get("rec_password_encrypted").is_none() && c.get("rtsp").is_none(), "{c}");
+    }
+
+    // PATCH: 省略は変えない・値は変える・port の null は既定 (554) に戻す・lan_ip の null は消す
+    let path = format!("/cameras/{id}");
+    let (s, p) = call(&mut pg, &a, "PATCH", &path, "", json!({"rtsp_port": 8554, "rtsp_path": "live/ch00_0"})).await;
+    assert_eq!(s, 200, "{p}");
+    assert_eq!((&p["lan_ip"], &p["rtsp_port"], &p["rtsp_path"]), (&json!("192.168.10.20"), &json!(8554), &json!("live/ch00_0")));
+    let (_, p) = call(&mut pg, &a, "PATCH", &path, "", json!({"rtsp_port": null, "lan_ip": null})).await;
+    assert_eq!((&p["lan_ip"], &p["rtsp_port"], &p["rtsp_path"]), (&Value::Null, &json!(554), &json!("live/ch00_0")));
+    // 検査で落ちたら何も変わらない
+    let (s, _) = call(&mut pg, &a, "PATCH", &path, "", json!({"lan_ip": "203.0.113.5", "rtsp_path": "x"})).await;
+    assert_eq!(s, 400);
+    let (_, list) = call(&mut pg, &a, "GET", "/cameras", "", Value::Null).await;
+    let now = list["cameras"].as_array().unwrap().iter().find(|c| c["id"] == json!(id)).unwrap().clone();
+    assert_eq!((&now["lan_ip"], &now["rtsp_path"]), (&Value::Null, &json!("live/ch00_0")));
+    // DB の CHECK (API を通らない書き込みも 1〜65535)
+    let e = admin()
+        .await
+        .execute("UPDATE alc_api.cameras SET rtsp_port = 0 WHERE tenant_id = $1", &[&t])
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION));
+}
+
+#[tokio::test]
+async fn cam_host_gets_only_its_linked_cameras_with_decrypted_password() {
+    let a = tenant().await;
+    let b = tenant().await;
+    let mut pg = rt().await;
+    let device = format!("alarm:{}", Uuid::new_v4().simple());
+    let other_device = format!("alarm:{}", Uuid::new_v4().simple());
+    let admin_a = caller(a, false);
+
+    // 1. 担当で RTSP 付き (資格情報も) 2. 担当だが RTSP の設定なし 3. パスワード無し 4. 別の端末の担当 5. 別テナントで同じ端末 id
+    let (s, full) = call(&mut pg, &admin_a, "POST", "/cameras", "", json!({"name": "A 入口", "lan_ip": "192.168.10.20", "rtsp_port": 8554, "rtsp_path": "stream1", "rec_username": "viewer", "rec_password": "pw-host", "device_ids": [device, "dev-x"]})).await;
+    assert_eq!(s, 201, "{full}");
+    let (s, bare) = call(&mut pg, &admin_a, "POST", "/cameras", "", json!({"name": "A 倉庫", "rec_username": "viewer", "rec_password": "pw-2", "device_ids": [device]})).await;
+    assert_eq!(s, 201, "{bare}");
+    let (s, nopass) = call(&mut pg, &admin_a, "POST", "/cameras", "", json!({"name": "A 事務所", "lan_ip": "10.1.2.3", "rtsp_path": "h264", "device_ids": [device]})).await;
+    assert_eq!(s, 201, "{nopass}");
+    let (s, _) = call(&mut pg, &admin_a, "POST", "/cameras", "", json!({"name": "A 別の端末", "lan_ip": "192.168.10.30", "rtsp_path": "stream1", "rec_password": "pw-other", "device_ids": [other_device]})).await;
+    assert_eq!(s, 201);
+    let (s, _) = call(&mut pg, &caller(b, false), "POST", "/cameras", "", json!({"name": "B 入口", "lan_ip": "192.168.10.40", "rtsp_path": "stream1", "rec_password": "pw-b", "device_ids": [device]})).await;
+    assert_eq!(s, 201);
+
+    // 並びは名前の順 (DB の照合順)
+    let (s, mine) = call(&mut pg, &cam_host(a, &device), "GET", "/cameras/mine", "", Value::Null).await;
+    assert_eq!(s, 200, "{mine}");
+    assert_eq!(
+        mine,
+        json!({"cameras": [
+            {"id": nopass["id"], "name": "A 事務所", "rtsp": {"host": "10.1.2.3", "port": 554, "path": "h264", "username": null, "password": null}},
+            {"id": bare["id"], "name": "A 倉庫", "rtsp": null},
+            {"id": full["id"], "name": "A 入口", "rtsp": {"host": "192.168.10.20", "port": 8554, "path": "stream1", "username": "viewer", "password": "pw-host"}},
+        ]})
+    );
+    // 担当の無い端末・別テナントの鍵は自分の分だけ
+    let (_, none) = call(&mut pg, &cam_host(a, "alarm:unlinked"), "GET", "/cameras/mine", "", Value::Null).await;
+    assert_eq!(none, json!({"cameras": []}));
+    let (_, in_b) = call(&mut pg, &cam_host(b, &device), "GET", "/cameras/mine", "", Value::Null).await;
+    assert_eq!(in_b["cameras"].as_array().unwrap().len(), 1);
+    assert_eq!(in_b["cameras"][0]["name"], "B 入口");
+    assert_eq!(in_b["cameras"][0]["rtsp"]["password"], "pw-b");
+
+    // 鍵は他の口を使えない (書き込みも起きない)
+    let (s, _) = call(&mut pg, &cam_host(a, &device), "GET", "/cameras", "", Value::Null).await;
+    assert_eq!(s, 403);
+    let (s, _) = call(&mut pg, &cam_host(a, &device), "PATCH", &format!("/cameras/{}", full["id"].as_str().unwrap()), "", json!({"lan_ip": "192.168.99.99"})).await;
+    assert_eq!(s, 403);
+    let (_, again) = call(&mut pg, &cam_host(a, &device), "GET", "/cameras/mine", "", Value::Null).await;
+    assert_eq!(again, mine);
+
+    // 鍵が違えば 500 (平文も暗号文も応答に出ない)
+    let op = parse("GET", "/cameras/mine", "", "", &cam_host(a, &device), 0).unwrap();
+    let e = execute(op, &cam_host(a, &device), &mut pg, Some("wrong-key")).await.unwrap_err();
+    assert_eq!(e.status, 500);
+    assert!(!e.body().to_string().contains("pw-host"));
 }
 
 #[tokio::test]

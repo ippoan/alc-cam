@@ -13,10 +13,12 @@ auth-worker (/api/cam-clips/) ─Service Binding─▶ alc-cam-sd-ingest ─Work
 口 (中身は `ingest/api`。宛先・資格情報は応答にもログにも出さない。パスワードは返さない):
 
 ```
-GET   /api/cam-clips/cameras                 → {"can_edit_destination": bool, "cameras": [{id, name, vpc_binding, rec_username, has_password, recording, device_ids, rec_scanned_until}]}
+GET   /api/cam-clips/cameras                 → {"can_edit_destination": bool, "cameras": [{id, name, vpc_binding, rec_username, has_password, recording, lan_ip, rtsp_port, rtsp_path, device_ids, rec_scanned_until}]}
                                                運行管理者席の鍵には → {"cameras": [{id, name, device_ids}]} (録画の設定は返さない)
-POST  /api/cam-clips/cameras                 {name, vpc_binding?, rec_username?, rec_password?, device_ids?} → 201 (active = false で作る)
-PATCH /api/cam-clips/cameras/{id}            同じ項目 (省略 = 変えない、vpc_binding: null = 取り込みをやめる、rec_password: "" = 変えない)
+POST  /api/cam-clips/cameras                 {name, vpc_binding?, rec_username?, rec_password?, lan_ip?, rtsp_port?, rtsp_path?, device_ids?} → 201 (active = false で作る)
+PATCH /api/cam-clips/cameras/{id}            同じ項目 (省略 = 変えない、vpc_binding: null = 取り込みをやめる、rec_password: "" = 変えない、
+                                               lan_ip / rtsp_path: null か "" = 消す、rtsp_port: null = 554 に戻す)
+GET   /api/cam-clips/cameras/mine            拠点 PC の配信の鍵だけ → {"cameras": [{id, name, rtsp: {host, port, path, username, password} | null}]}
 GET   /api/cam-clips/device-candidates?days=30   直近 days 日 (1〜90) にイベントを出した端末と kind ごとの件数 (行ごとに is_dev: 開発端末の行も軸ごとに読んで返す)
 POST  /api/cam-clips/clips                   {"camera_id": "...", "from": "2026-10-23T12:58:00+09:00", "to": "2026-10-23T12:59:30+09:00"}
 POST  /api/cam-clips/auto-run                 {} か {"camera_id": "..."} → 200 {"cameras": [...]} (cron と同じ自動切り出しを呼び手のテナントだけで今すぐ回す。camera_id で 1 台に絞れる。dev token では 403)
@@ -27,6 +29,19 @@ GET   /api/cam-clips/events?camera_id=<uuid>&date=2026-10-23   (JST の 1 日)
 → 200 [{"source_table", "source_id", "kind", "occurred_at", "device_id", "is_dev", "clip": {"clip_id", "key", "status", "error"} | null}]
 ```
 
+- RTSP の接続先 (拠点 PC の配信が繋ぐ先。migration 188): `lan_ip` はプライベートの IPv4 (10/8・172.16/12・192.168/16) だけ、
+  `rtsp_port` は 1〜65535 (既定 554)、`rtsp_path` は先頭の `/` を落として保存 (英数と `/ _ - . ? = &`、200 文字まで、`..` 不可)。
+  ユーザー名・パスワードは録画用の `rec_username` / `rec_password` を使い回す (列を増やさない)。一覧にパスワードは出ない
+- `GET /cameras/mine` は、鍵の端末 (`X-Device-Id`) を `cam_camera_devices` で結び付けたカメラを名前の順に返す。`rtsp` は
+  `lan_ip` と `rtsp_path` が両方在るときだけで、無ければ null。`password` は `SSO_ENCRYPTION_KEY` で復号した平文 (未設定なら null)。
+  応答にパスワードの平文が出るのはこの口だけ。例 (値は作り物):
+
+  ```json
+  {"cameras": [
+    {"id": "6f1c…", "name": "入口", "rtsp": {"host": "192.168.10.20", "port": 554, "path": "stream1", "username": "viewer", "password": "example-pass"}},
+    {"id": "9a0e…", "name": "倉庫", "rtsp": null}
+  ]}
+  ```
 - `POST /clips` の応答の `truncated` は、要求より短い範囲しか取れなかった (`actual_from` > `from` か `actual_to` < `to`) とき true
 
 ### 自動の切り出し (cron、1 時間ごと)
@@ -58,10 +73,12 @@ GET   /api/cam-clips/events?camera_id=<uuid>&date=2026-10-23   (JST の 1 日)
   `alc_api.cameras` の `rec_*` 列に持つ (binding 名は `rec_ip` 列に入る。列名は IP のままで migration はしていない)。
   カメラの IP は Cloudflare の VPC Service の側に在り、repo にも DB にも無い
 - 外から直接は届かない (workers_dev / route なし。`ingest/scripts/check-exposure.sh` が CI で検査)。auth-worker の振り分け表
-  `ALC_BINDING_ROUTES` から届き、JWT の検証は auth-worker が済ませる。Worker が受ける呼び手は 2 つで、それ以外は 403:
+  `ALC_BINDING_ROUTES` から届き、JWT の検証は auth-worker が済ませる。Worker が受ける呼び手は 3 つで、それ以外は 403:
   - 管理者のログイン (画面用の proxy、`X-User-Role: admin`) — 全部の口
   - 運行管理者席の鍵 (端末用の proxy、`X-Device-Role: device-tenko-manager`) — 遠隔点呼の画面が乗務員の端末からカメラを
     引くための `GET /cameras` だけ。他の口は 403。auth-worker 側でも席の許可表 (`TENKO_MANAGER_ROUTES`) がこの GET 1 本だけを通す
+  - 拠点 PC の配信の鍵 (端末用の proxy、`X-Device-Role: device-cam-host`。CoreS3 署名の usage `cam-host`) — `GET /cameras/mine`
+    だけ。他の口は 403。端末は `X-Device-Id` (鍵の JWT の sub、`alarm:<fingerprint>`) で、無ければ 401・200 文字超は 400
 
   `X-User-Role` と `X-Device-Role` が両方あるときも 403 (auth-worker はどちらか片方しか付けない)。テナントはどちらも `X-Tenant-ID`
   (席の鍵は鍵を登録したテナント) で決まり、読めるのはそのテナントの行だけ。`X-Tenant-ID` が無ければ 401・UUID でなければ 400。
