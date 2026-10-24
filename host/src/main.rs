@@ -12,6 +12,9 @@
 //! 見る側の「押して話す」は同じデータチャネルの `talk` で届き (`cam_audio::Floor` が 1 人に絞る)、
 //! その人の声を `talk::Talk` がカメラのスピーカー (`audio/transmit.cgi`) へ送る。
 //!
+//! 自己更新は拡張の update_check のほか、見る側からも同じデータチャネルの `update` で頼める (`remote`)。
+//! 経過・結果は拡張と見る人全員へ返す。
+//!
 //! 見る人が来るたび (start) その人への WebRTC の offer を返す。カメラの RTSP は最初の 1 人で開き、
 //! 最後の 1 人が離れたら TEARDOWN する (カメラにつき 1 本)。映像は `hub` が見る人ごとに複製して P2P で送る。
 
@@ -20,6 +23,7 @@ mod hub;
 mod native;
 mod peer;
 mod ptz;
+mod remote;
 mod stun;
 mod talk;
 mod update;
@@ -74,9 +78,12 @@ fn main() {
     out(Out::Ready { version: VERSION });
 
     // 前回の自己更新で脇へ退けた古い exe を消す
-    if let Ok(exe) = std::env::current_exe() {
-        update::cleanup(&exe);
+    let exe = std::env::current_exe().ok();
+    if let Some(exe) = &exe {
+        update::cleanup(exe);
     }
+    // 見る側へ出す版 (拡張はディスクの manifest.json。自己更新で変わったら読み直す)
+    let mut update_caps = remote::caps(VERSION, exe.as_deref().and_then(update::extension_version).as_deref());
     let (upd_tx, upd_rx) = mpsc::channel::<Out>();
     let mut updating = false;
     // 拡張の入れ替えは見る人が居ない時だけ (再読み込みで配信が切れる)。更新のスレッドが見る
@@ -115,7 +122,7 @@ fn main() {
                 Some(_) if !hub.contains(&viewer_id) && hub.len() >= MAX_VIEWERS => {
                     out(Out::Log { message: format!("見る人が上限 ({MAX_VIEWERS}) なので {viewer_id} は断ります") })
                 }
-                Some((rtsp_url, stun)) => match Viewer::new(&viewer_id, rtsp_url, stun) {
+                Some((rtsp_url, stun)) => match Viewer::new(&viewer_id, rtsp_url, stun, update_caps.clone()) {
                     Ok((v, sdp)) => {
                         // 同じ viewer_id の入り直しなら前の分は畳まれる
                         let _ = hub.insert(&viewer_id, v);
@@ -154,8 +161,17 @@ fn main() {
         }
 
         while let Ok(m) = upd_rx.try_recv() {
-            if !matches!(m, Out::Update { state: "checking", .. }) {
-                updating = false;
+            if let Out::Update { state, current, latest, message, .. } = &m {
+                if *state != "checking" {
+                    updating = false;
+                    update_caps = remote::caps(VERSION, exe.as_deref().and_then(update::extension_version).as_deref());
+                }
+                let text = remote::state(state, current, latest.as_deref(), message);
+                for viewer_id in hub.ids() {
+                    if let Some(v) = hub.get_mut(&viewer_id) {
+                        v.send_ptz(&text);
+                    }
+                }
             }
             out(m);
         }
@@ -218,6 +234,7 @@ fn main() {
         // 首振り: 見る側の命令 → 交通整理 → カメラへ 1 本ずつ → 結果を命令した人へ
         let now = Instant::now();
         let mut replies = Vec::new();
+        let mut remote_check = false;
         for viewer_id in hub.ids() {
             let Some(v) = hub.get_mut(&viewer_id) else { continue };
             // 話している人の声だけをカメラへ。他の人の声は捨てる
@@ -226,6 +243,10 @@ fn main() {
                 mic.into_iter().for_each(|p| t.send(p));
             }
             for text in v.take_ptz() {
+                if remote::is_check(&text) {
+                    remote_check = true;
+                    continue;
+                }
                 match talk::parse(&text) {
                     Some(talk::Action::Start) => changes.extend(floor.start(&viewer_id, now)),
                     Some(talk::Action::Stop) => changes.extend(floor.stop(&viewer_id)),
@@ -251,6 +272,13 @@ fn main() {
             if let Some(v) = hub.get_mut(&r.to) {
                 v.send_ptz(&ptz::reply(r.action, r.ok, r.unsupported, &r.message));
             }
+        }
+
+        // 見る側からの更新の確認 (拡張の update_check と同じ。確認中なら重ねない)
+        if remote_check && !updating {
+            updating = true;
+            out(Out::Log { message: "見る側から更新の確認を頼まれました".into() });
+            start_update(upd_tx.clone(), watching.clone());
         }
 
         // 通話: カメラ側の結果を話そうとした人へ。繋がらなければその人を外す
@@ -309,7 +337,7 @@ fn main() {
 }
 
 fn update_msg(state: &'static str, latest: Option<String>, message: String) -> Out {
-    Out::Update { state, current: VERSION, latest, message }
+    Out::Update { state, current: VERSION, latest, message, extension_deferred: false }
 }
 
 /// 自己更新は別スレッドで (落とす間も映像を止めない)。結果は `tx` へ。入れ替えは Windows だけ
@@ -327,7 +355,8 @@ fn start_update(tx: mpsc::Sender<Out>, watching: Arc<AtomicUsize>) {
         let _ = tx.send(match res {
             Ok(o) => {
                 let (state, message) = update::summarize(&o);
-                update_msg(state, Some(o.latest), message)
+                let extension_deferred = o.extension == update::Part::Deferred;
+                Out::Update { state, current: VERSION, latest: Some(o.latest), message, extension_deferred }
             }
             Err(e) => update_msg("failed", None, e),
         });
