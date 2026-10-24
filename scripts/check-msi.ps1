@@ -42,6 +42,19 @@ Check (@($comps | Where-Object { -not ([int]$_.c[1] -band 4) }).Count -eq 0) '�
 Check (@($comps | Where-Object { $_.c[0] -ne 'Registration' -and -not ([int]$_.c[1] -band 128) }).Count -eq 0) 'exe と拡張の部品は NeverOverwrite'
 Check (@(Rows 'SELECT `Shortcut` FROM `Shortcut`' 1).Count -eq 0) 'ショートカット (広告) なし'
 Check (@(Rows 'SELECT `Action`, `Target` FROM `CustomAction`' 2 | Where-Object { $_.c[1] -match 'powershell' }).Count -eq 0) 'PowerShell の custom action なし'
+
+# 完了画面 (AlcCamExitDlg): 拡張のフォルダをコピーできる欄・[完了] でフォルダを開く (既定 ON)。WiX 標準の ExitDialog は使わない
+$ui = @(Rows 'SELECT `Action`, `Condition`, `Sequence` FROM `InstallUISequence`' 3)
+Check (@($ui | Where-Object { $_.c[2] -eq '-1' }).c[0] -eq 'AlcCamExitDlg') '入れ終わりに出るのは AlcCamExitDlg'
+$ctl = @(Rows 'SELECT `Dialog_`, `Control`, `Type`, `Property` FROM `Control`' 4 | Where-Object { $_.c[0] -eq 'AlcCamExitDlg' })
+Check (@($ctl | Where-Object { $_.c[1] -eq 'ExtDir' -and $_.c[2] -eq 'Edit' -and $_.c[3] -eq 'ALCCAM_EXTDIR' }).Count -eq 1) '完了画面に拡張のフォルダの欄 (Edit)'
+Check (@($ctl | Where-Object { $_.c[1] -eq 'OpenFolder' -and $_.c[2] -eq 'CheckBox' -and $_.c[3] -eq 'ALCCAM_OPENFOLDER' }).Count -eq 1 -and $props['ALCCAM_OPENFOLDER'] -eq '1') '「フォルダを開く」のチェック (既定 ON)'
+$ca = @(Rows 'SELECT `Action`, `Type`, `Source`, `Target` FROM `CustomAction`' 4)
+Check (@($ca | Where-Object { $_.c[2] -eq 'ALCCAM_EXTDIR' -and $_.c[3] -eq '[INSTALLFOLDER]extension' }).Count -eq 1 -and
+    @($ui | Where-Object { $_.c[0] -eq 'SetALCCAM_EXTDIR' }).Count -eq 1) '欄の中身 = [INSTALLFOLDER]extension (UI の流れで入れる)'
+Check (@($ca | Where-Object { $_.c[0] -eq 'OpenExtFolder' -and $_.c[3] -eq 'WixShellExec' }).Count -eq 1 -and $props['WixShellExecTarget'] -eq '[INSTALLFOLDER]extension') 'フォルダを開くのは util の WixShellExec'
+$ev = @(Rows 'SELECT `Dialog_`, `Control_`, `Event`, `Argument`, `Condition` FROM `ControlEvent`' 5 | Where-Object { $_.c[0] -eq 'AlcCamExitDlg' -and $_.c[1] -eq 'Finish' })
+Check (@($ev | Where-Object { $_.c[2] -eq 'DoAction' -and $_.c[3] -eq 'OpenExtFolder' -and $_.c[4] -eq 'ALCCAM_OPENFOLDER = 1' }).Count -eq 1) '[完了] でチェックが ON ならフォルダを開く'
 [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
 $db = $null
 [GC]::Collect(); [GC]::WaitForPendingFinalizers()

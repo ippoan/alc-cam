@@ -61,11 +61,12 @@ WebRTC (P2P) で見る側へ届ける。alc-gw (Go の常駐アプリ) を置か
 拠点で Chrome を使う Windows のユーザーで行う。
 
 1. 最新 Release の `alc-cam.msi` をダブルクリックして入れる (Chrome は閉じておく)。host を `%LOCALAPPDATA%\alc-cam\alc-cam-host.exe` に置いて
-   `HKCU` に native messaging として登録し、拡張を `%LOCALAPPDATA%\alc-cam\extension` に置く。最後の画面に次の 2・3 が出る
+   `HKCU` に native messaging として登録し、拡張を `%LOCALAPPDATA%\alc-cam\extension` に置く。最後の画面に次の 2・3 の手順と
+   拡張のフォルダの実際のパス (欄から選んでコピーできる) が出て、「フォルダを開く」(既定 ON) のまま [完了] を押すとそのフォルダが開く
 2. 以前に別の場所 (zip を展開したフォルダ等) から拡張を読み込んでいた PC は、`chrome://extensions` で「alc-cam 拠点中継」を
    **削除** する (そこは自動で更新されない)
-3. `chrome://extensions` → 右上の「デベロッパー モード」を ON → 「パッケージ化されていない拡張機能を読み込む」→
-   `%LOCALAPPDATA%\alc-cam\extension`。ID が `icmmpdjddlphkbokdalofdjpkcgfiggd` であること。
+3. `chrome://extensions` → 右上の「デベロッパー モード」を ON → 開いたフォルダ (`extension`) を `chrome://extensions` の画面へ
+   ドラッグ&ドロップ (または「パッケージ化されていない拡張機能を読み込む」で最後の画面のパスを貼る)。ID が `icmmpdjddlphkbokdalofdjpkcgfiggd` であること。
    **デベロッパー モードは以後も OFF に戻さない** (OFF のまま拡張が読み込み直すと、Chrome が拡張を無効にする)
 4. 録画の画面でこの拠点のカメラ (RTSP の接続先 = stream2) にこの PC の CoreS3 の鍵を紐づけておき、この Chrome で点呼の画面
    (alc.ippoan.org) を開く。鍵が届くと配信が始まり、サイドパネルの「担当カメラ」にカメラ名が出る (以後は Chrome と点呼の画面を
