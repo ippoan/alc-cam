@@ -278,7 +278,7 @@ function checkHostUpdate() {
   const legacy = setTimeout(() => {
     if (heard) return;
     clearTimeout(timer);
-    report({ update: ['この host は自己更新に対応していません (install.ps1 で入れ直してください)', 'warn'] });
+    report({ update: ['この host は自己更新に対応していません (alc-cam.msi で入れ直してください)', 'warn'] });
     port.disconnect();
   }, UPDATE_LEGACY_MS);
   port.onMessage.addListener((msg) => {
