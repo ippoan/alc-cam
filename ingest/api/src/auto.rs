@@ -29,7 +29,7 @@ pub const DEFAULT_MAX_GROUPS: usize = 40;
 /// `rec_scanned_until` が NULL (初回) のとき、どこから見るか
 pub const FIRST_LOOKBACK_MS: i64 = 2 * 3_600_000;
 /// SD の一覧を、最初のまとまりの頭よりどれだけ前から見るか (頭にかかるファイルはそれより前に始まる。
-/// サブストリームの 1 本は長いので 1 時間のフォルダを 1 つ余分に見る)
+/// サブストリームの 1 本は長いので 1 時間のフォルダを 1 つ余分に見る)。手動の切り出しも同じ値を使う
 pub const LIST_LEAD_MS: i64 = 3_600_000;
 
 /// 拾うイベント (`cam_clip_events` の 1 行になる)

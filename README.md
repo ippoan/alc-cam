@@ -105,19 +105,13 @@ GET  /api/cam-clips/clips/TS-NS320W-55/20261023T125800_20261023T125930.mp4   (Ra
 - 手順: 重なる元ファイルを SD の一覧 (`camera-cgi/admin/sdcard.cgi`) で探し、R2 に無ければカメラから
   (`/action/stream?subject=recdownload`、パスに `/mnt/mmc`) 丸ごと取って置く → R2 の範囲読み出しで末尾の
   moov を読む → `crates/cam-mp4` で切ってつなぐ計画を立て → 16MiB ずつ R2 のマルチパートに写す
-- 資格情報は Worker の secret `CAM_AUTH` (`user:pass`)。repo には無い
+- カメラの宛先 (VPC Service の binding 名)・ユーザー名・パスワード (暗号化) は DB `alc_api.cameras` の `rec_*` 列に持ち、
+  暗号の鍵は Secrets Store に置く。repo には無い
 - 外から直接は届かない (workers_dev / route なし)。auth-worker の振り分け表 `ALC_BINDING_ROUTES` から届き、
   JWT の検証は auth-worker が済ませる。Worker は付け直された `X-User-Role` が `admin` か、`X-Tenant-ID` が
   `CAM_TENANT_ID` (カメラの持ち主。空なら確かめない) と同じかだけを見て、外れたら 403
 
-確認 (VPC は実物のカメラ、R2 は手元の模擬):
-
-```bash
-cd ingest
-printf 'CAM_AUTH="user:pass"\n' > .dev.vars   # 終わったら消す
-npx wrangler@4.152.0 dev
-curl -X POST localhost:8787/api/cam-clips/clips -H 'X-User-Role: admin' -d '{"from":"2026-10-23T12:58:00","to":"2026-10-23T12:59:30"}'
-```
+手元での確認は `ingest/README.md` の `wrangler dev --env local` の節を見る。
 
 wrangler 4.58 では手元の dev から VPC に繋がらない (preview セッションの作成が 400)。
 手元の dev から本物の R2 (`remote = true`) へ 100MB を流すと途中で切れるので、R2 は手元の模擬で確かめる。
