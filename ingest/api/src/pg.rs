@@ -3,6 +3,8 @@
 //!
 //! 時刻は UNIX ミリ秒 (`int8`) で出し入れし、表示は呼び手が `cam_sd::jst_iso` で JST にする。
 
+use std::collections::{BTreeSet, HashMap};
+
 use alc_worker_db::{PgClient, TxOutput};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
@@ -37,7 +39,10 @@ pub struct CameraRow {
     pub vpc_binding: Option<String>,
     pub rec_username: Option<String>,
     pub has_password: bool,
+    /// 結び付けた端末。hub の ID は結び付いた機体の鍵の ID に畳んである ([`fold_device_ids`])
     pub device_ids: Vec<String>,
+    /// `device_ids` のうち、結び付きの無い hub の ID (= `alarm:` で始まらない ID)。機体の鍵への置き換え待ち
+    pub pending_device_ids: Vec<String>,
     /// 配信担当の端末 (先頭 = 1 位)。空なら `device_ids` の全員が 1 位 ([`my_cameras`])
     pub stream_device_ids: Vec<String>,
     pub rec_scanned_until_ms: Option<i64>,
@@ -167,6 +172,7 @@ fn camera_row(r: &Row) -> CameraRow {
         rec_username: r.get(3),
         has_password: r.get(4),
         device_ids: r.get(5),
+        pending_device_ids: Vec::new(),
         rec_scanned_until_ms: r.get(6),
         lan_ip: r.get(7),
         rtsp_port: r.get(8),
@@ -193,15 +199,18 @@ pub async fn list_cameras(
     tenant: Uuid,
     id: Option<Uuid>,
 ) -> Result<Vec<CameraRow>, Error> {
-    pg.tenant_tx(tenant, move |tx| {
-        Box::pin(async move {
-            let rows = tx
-                .query_typed(SELECT_CAMERAS, &[(&tenant, Type::UUID), (&id, Type::UUID)])
-                .await?;
-            Ok(rows.iter().map(camera_row).collect())
+    let mut rows: Vec<CameraRow> = pg
+        .tenant_tx(tenant, move |tx| {
+            Box::pin(async move {
+                let rows = tx
+                    .query_typed(SELECT_CAMERAS, &[(&tenant, Type::UUID), (&id, Type::UUID)])
+                    .await?;
+                Ok(rows.iter().map(camera_row).collect())
+            })
         })
-    })
-    .await
+        .await?;
+    fold_cameras(pg, tenant, &mut rows).await?;
+    Ok(rows)
 }
 
 /// 作る (`active = false`: ONVIF の死活監視の対象にしない)。結び付ける端末も同じ transaction で入れる
@@ -210,7 +219,7 @@ pub async fn create_camera(
     tenant: Uuid,
     c: NewCamera,
 ) -> Result<CameraRow, Error> {
-    pg.tenant_tx(tenant, move |tx| {
+    let mut row = pg.tenant_tx(tenant, move |tx| {
         Box::pin(async move {
             let row = tx
                 .query_typed_one(
@@ -239,7 +248,9 @@ pub async fn create_camera(
             Ok(camera_row(&row))
         })
     })
-    .await
+    .await?;
+    fold_cameras(pg, tenant, std::slice::from_mut(&mut row)).await?;
+    Ok(row)
 }
 
 /// 変える。宛先を今と違う値にする (null 化を含む) のは `developer` のときだけ ([`UpdateOutcome::Forbidden`])
@@ -250,7 +261,7 @@ pub async fn update_camera(
     p: PatchCamera,
     developer: bool,
 ) -> Result<UpdateOutcome, Error> {
-    pg.tenant_tx(tenant, move |tx| {
+    let outcome = pg.tenant_tx(tenant, move |tx| {
         Box::pin(async move {
             let Some(current) = tx
                 .query_typed_opt("SELECT rec_ip FROM alc_api.cameras WHERE tenant_id = $1 AND id = $2 FOR UPDATE", &[(&tenant, Type::UUID), (&id, Type::UUID)])
@@ -317,7 +328,14 @@ pub async fn update_camera(
             Ok(UpdateOutcome::Updated(Box::new(camera_row(&row))))
         })
     })
-    .await
+    .await?;
+    Ok(match outcome {
+        UpdateOutcome::Updated(mut row) => {
+            fold_cameras(pg, tenant, std::slice::from_mut(&mut *row)).await?;
+            UpdateOutcome::Updated(row)
+        }
+        other => other,
+    })
 }
 
 /// 端末 (`device`) が配信を受け持つカメラ (順位 → 名前の順)。RTSP の列が未設定の行も返す (呼び手が rtsp: null にする)。
@@ -362,36 +380,70 @@ pub async fn my_cameras(pg: &mut PgClient, tenant: Uuid, device: String) -> Resu
     .await
 }
 
-const SELECT_CANDIDATES: &str = "\
-WITH ev AS (
-    SELECT device_id, kind, COALESCE(recorded_at, created_at) AS at
+// ---- 鍵 ⇔ hub の結び付き (hub_measurements.via_device_id) ----
+
+/// 結び付き (hub の ID → 機体の鍵の ID) の元。1 つの hub の ID に鍵が複数結び付いた (鍵の作り直し) ら最後に見えた方。
+/// `$1` テナント。hub_measurements の RLS は is_dev 軸付きなので、見える行 = 今の transaction の軸の行だけ
+macro_rules! link_select {
+    () => {
+        "SELECT DISTINCT ON (via_device_id) via_device_id AS hub_id, device_id AS key_id
       FROM alc_api.hub_measurements
-     WHERE tenant_id = $1 AND device_id IS NOT NULL
-       AND kind IN ('alcohol', 'blood_pressure', 'timecard', 'license')
-       AND COALESCE(recorded_at, created_at) >= now() - make_interval(days => $2)
-    UNION ALL
-    SELECT registered_device_id, 'vein_enroll', created_at
-      FROM alc_api.vein_enroll_events
-     WHERE tenant_id = $1 AND registered_device_id IS NOT NULL
-       AND created_at >= now() - make_interval(days => $2)
-)
-SELECT device_id,
-       count(*) FILTER (WHERE kind = 'alcohol'),
-       count(*) FILTER (WHERE kind = 'blood_pressure'),
-       count(*) FILTER (WHERE kind = 'timecard'),
-       count(*) FILTER (WHERE kind = 'license'),
-       count(*) FILTER (WHERE kind = 'vein_enroll'),
-       (extract(epoch FROM max(at)) * 1000)::int8
-  FROM ev
- GROUP BY device_id
- ORDER BY max(at) DESC, device_id";
+     WHERE tenant_id = $1 AND via_device_id IS NOT NULL
+     ORDER BY via_device_id, created_at DESC, id"
+    };
+}
+
+/// 軸ごとの結び付きを合わせた対応表 (hub の ID → 鍵の ID)。本番の軸と開発端末の軸を別の transaction で引き、
+/// 同じ hub の ID が両方に在れば本番の軸を採る
+pub async fn device_links(pg: &mut PgClient, tenant: Uuid) -> Result<HashMap<String, String>, Error> {
+    let mut links = HashMap::new();
+    for is_dev in [false, true] {
+        let rows: Vec<(String, String)> = pg
+            .tenant_tx(tenant, move |tx| {
+                Box::pin(async move {
+                    if is_dev {
+                        tx.query_typed(SET_DEVICE_DEV, &[]).await?;
+                    }
+                    let rows = tx.query_typed(link_select!(), &[(&tenant, Type::UUID)]).await?;
+                    Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+                })
+            })
+            .await?;
+        for (hub, key) in rows {
+            links.entry(hub).or_insert(key);
+        }
+    }
+    Ok(links)
+}
+
+/// 結び付けた端末を機体の鍵の ID に畳む。(畳んだ ID (重複なし・並び替え済み), そのうち結び付きの無い hub の ID)。
+/// 結び付きの無い ID はそのまま残り、`alarm:` で始まらないものが 2 つ目 (機体の鍵への置き換え待ち) に入る
+pub fn fold_device_ids(ids: &[String], links: &HashMap<String, String>) -> (Vec<String>, Vec<String>) {
+    let folded: BTreeSet<String> = ids.iter().map(|id| links.get(id).unwrap_or(id).clone()).collect();
+    let pending = folded.iter().filter(|id| !id.starts_with("alarm:")).cloned().collect();
+    (folded.into_iter().collect(), pending)
+}
+
+/// カメラの `device_ids` を畳む (結び付いた端末が 1 つも無ければ結び付きを引かない)
+async fn fold_cameras(pg: &mut PgClient, tenant: Uuid, rows: &mut [CameraRow]) -> Result<(), Error> {
+    if rows.iter().all(|r| r.device_ids.is_empty()) {
+        return Ok(());
+    }
+    let links = device_links(pg, tenant).await?;
+    for r in rows {
+        (r.device_ids, r.pending_device_ids) = fold_device_ids(&r.device_ids, &links);
+    }
+    Ok(())
+}
 
 /// 直近 `days` 日にイベントを出した端末と、その種類ごとの件数 (新しい順)。
 /// hub_measurements (alcohol / blood_pressure / timecard / license、時刻は COALESCE(recorded_at, created_at)) と
-/// vein_enroll_events (registered_device_id) を合わせる。
+/// vein_enroll_events (registered_device_id)・measurements (alcohol / blood_pressure) を合わせる ([`events_cte!`])。
+/// 端末は結び付きで機体の鍵の ID に畳み、`alarm:` で始まる ID (機体の鍵) の行だけを返す
+/// (結び付きの無い hub の ID・`browser`・自己ペアの乱数 ID は出さない)。
 /// 両表の RLS は is_dev 軸付きなので、同じ集計を軸ごとに 2 回流す: 本番の行 (`app.device_dev` 未設定) と、
 /// 別の transaction で `set_config('app.device_dev', '1', true)` (transaction 単位) を立てた開発端末の行 (`is_dev = true`)。
-/// device_id では結合しない (両方に出れば 2 行)。並びは last_at の新しい順
+/// 結び付きも軸ごとに引く (軸を跨いで畳まない)。並びは last_at の新しい順
 pub async fn device_candidates(
     pg: &mut PgClient,
     tenant: Uuid,
@@ -539,34 +591,107 @@ pub async fn recording_cameras(pg: &mut PgClient, tenant: Uuid) -> Result<Vec<Re
     .await
 }
 
-/// イベントの元 (hub_measurements の 4 種と指静脈の登録)。`$1` テナント、`$3`/`$4` は UNIX ms の `[from, to)`。
-/// 時刻の比較は ms を interval で足す (浮動小数の to_timestamp で境目がずれないように)
+/// イベントの元 (hub_measurements の 4 種・指静脈の登録・measurements のアルコールと血圧)。`$1` テナント。
+/// 引数は期間の `[lo, hi)` (timestamptz の式。切り出しは UNIX ms の `$3`/`$4`、候補は直近 `$2` 日)。
+/// 時刻の比較は ms を interval で足す (浮動小数の to_timestamp で境目がずれないように)。
+/// `device_id` は結び付き (`link`: hub の ID → 機体の鍵の ID) で畳んだ値 — hub の ID の行は鍵の ID で出る。
+/// measurements は `device_id IS NOT NULL` の行だけ (`measurements` = status completed のアルコール、時刻 measured_at /
+/// `measurements_bp` = systolic と medical_measured_at のある血圧)。同じ (畳んだ) 端末・同じ kind の hub_measurements が
+/// ±60 秒に在れば measurements 側は出さない (CoreS3 の PC で同じ測定が 2 回出るため)
 macro_rules! events_cte {
-    () => {
-        "WITH ev AS (
-    SELECT 'hub_measurements'::text AS source_table, h.id, h.kind, COALESCE(h.recorded_at, h.created_at) AS at, h.device_id
+    ($lo:literal, $hi:literal) => {
+        concat!(
+            "WITH link AS (",
+            link_select!(),
+            "),
+ev AS (
+    SELECT 'hub_measurements'::text AS source_table, h.id, h.kind, COALESCE(h.recorded_at, h.created_at) AS at,
+           COALESCE(l.key_id, h.device_id) AS device_id
       FROM alc_api.hub_measurements h
+      LEFT JOIN link l ON l.hub_id = h.device_id
      WHERE h.tenant_id = $1
        AND h.kind IN ('alcohol', 'blood_pressure', 'timecard', 'license')
-       AND COALESCE(h.recorded_at, h.created_at) >= 'epoch'::timestamptz + $3::int8 * interval '1 millisecond'
-       AND COALESCE(h.recorded_at, h.created_at) < 'epoch'::timestamptz + $4::int8 * interval '1 millisecond'
+       AND COALESCE(h.recorded_at, h.created_at) >= ", $lo, "
+       AND COALESCE(h.recorded_at, h.created_at) < ", $hi, "
     UNION ALL
-    SELECT 'vein_enroll_events', v.id, 'vein_enroll', v.created_at, v.registered_device_id
+    SELECT 'vein_enroll_events', v.id, 'vein_enroll', v.created_at, COALESCE(l.key_id, v.registered_device_id)
       FROM alc_api.vein_enroll_events v
+      LEFT JOIN link l ON l.hub_id = v.registered_device_id
      WHERE v.tenant_id = $1 AND v.registered_device_id IS NOT NULL
-       AND v.created_at >= 'epoch'::timestamptz + $3::int8 * interval '1 millisecond'
-       AND v.created_at < 'epoch'::timestamptz + $4::int8 * interval '1 millisecond'
+       AND v.created_at >= ", $lo, "
+       AND v.created_at < ", $hi, "
+    UNION ALL
+    SELECT 'measurements', m.id, 'alcohol', m.measured_at, COALESCE(l.key_id, m.device_id)
+      FROM alc_api.measurements m
+      LEFT JOIN link l ON l.hub_id = m.device_id
+     WHERE m.tenant_id = $1 AND m.status = 'completed' AND m.device_id IS NOT NULL
+       AND m.measured_at >= ", $lo, "
+       AND m.measured_at < ", $hi, "
+       AND ", dedupe!("alcohol", "m.measured_at"), "
+    UNION ALL
+    SELECT 'measurements_bp', m.id, 'blood_pressure', m.medical_measured_at, COALESCE(l.key_id, m.device_id)
+      FROM alc_api.measurements m
+      LEFT JOIN link l ON l.hub_id = m.device_id
+     WHERE m.tenant_id = $1 AND m.systolic IS NOT NULL AND m.medical_measured_at IS NOT NULL AND m.device_id IS NOT NULL
+       AND m.medical_measured_at >= ", $lo, "
+       AND m.medical_measured_at < ", $hi, "
+       AND ", dedupe!("blood_pressure", "m.medical_measured_at"), "
 )
 "
+        )
     };
 }
 
+/// measurements のイベントを落とす条件 (events_cte! の中で使う。`m` = measurements、`l` = 結び付き)。
+/// 同じ (畳んだ) 端末・同じ kind の hub_measurements が時刻 `$at` の ±60 秒に無いこと
+macro_rules! dedupe {
+    ($kind:literal, $at:literal) => {
+        concat!(
+            "NOT EXISTS (SELECT 1 FROM alc_api.hub_measurements d LEFT JOIN link dl ON dl.hub_id = d.device_id
+                    WHERE d.tenant_id = $1 AND d.kind = '", $kind, "'
+                      AND COALESCE(dl.key_id, d.device_id) = COALESCE(l.key_id, m.device_id)
+                      AND COALESCE(d.recorded_at, d.created_at) BETWEEN ", $at, " - interval '60 seconds' AND ", $at, " + interval '60 seconds')"
+        )
+    };
+}
+
+/// 結び付けたカメラの端末 (畳んだ ID)。カメラに hub の ID が結び付いていれば鍵の ID に、鍵の ID なら鍵のまま。
+/// ev も畳んであるので、hub と鍵のどちらで結び付けていても両方の記録に当たる。`$1` テナント・`$2` カメラ
+macro_rules! camera_devices {
+    () => {
+        "(SELECT COALESCE(cl.key_id, cd.device_id) FROM alc_api.cam_camera_devices cd
+           LEFT JOIN link cl ON cl.hub_id = cd.device_id
+          WHERE cd.tenant_id = $1 AND cd.camera_id = $2)"
+    };
+}
+
+/// 候補の集計。イベントは [`events_cte!`] (直近 `days` 日)。畳んだ後で `alarm:` で始まる ID (機体の鍵) だけ
+const SELECT_CANDIDATES: &str = concat!(
+    events_cte!("now() - make_interval(days => $2)", "'infinity'::timestamptz"),
+    "SELECT ev.device_id,
+       count(*) FILTER (WHERE ev.kind = 'alcohol'),
+       count(*) FILTER (WHERE ev.kind = 'blood_pressure'),
+       count(*) FILTER (WHERE ev.kind = 'timecard'),
+       count(*) FILTER (WHERE ev.kind = 'license'),
+       count(*) FILTER (WHERE ev.kind = 'vein_enroll'),
+       (extract(epoch FROM max(ev.at)) * 1000)::int8
+  FROM ev
+ WHERE ev.device_id LIKE 'alarm:%'
+ GROUP BY ev.device_id
+ ORDER BY max(ev.at) DESC, ev.device_id"
+);
+
 /// 結び付けた端末の、まだそのカメラで切っていないイベント
 const SELECT_AUTO_EVENTS: &str = concat!(
-    events_cte!(),
+    events_cte!(
+        "'epoch'::timestamptz + $3::int8 * interval '1 millisecond'",
+        "'epoch'::timestamptz + $4::int8 * interval '1 millisecond'"
+    ),
     "SELECT ev.source_table, ev.id, ev.kind, (extract(epoch FROM ev.at) * 1000)::int8, ev.device_id
   FROM ev
- WHERE ev.device_id IN (SELECT d.device_id FROM alc_api.cam_camera_devices d WHERE d.tenant_id = $1 AND d.camera_id = $2)
+ WHERE ev.device_id IN ",
+    camera_devices!(),
+    "
    AND NOT EXISTS (SELECT 1 FROM alc_api.cam_clip_events e
                     WHERE e.tenant_id = $1 AND e.camera_id = $2 AND e.source_table = ev.source_table AND e.source_id = ev.id)
  ORDER BY ev.at, ev.source_table, ev.id"
@@ -574,14 +699,19 @@ const SELECT_AUTO_EVENTS: &str = concat!(
 
 /// その日の口: 結び付けた端末のイベント (と、結び付けを外した後も切り出し済みのイベント) と、切り出し済みならその clip
 const SELECT_DAY_EVENTS: &str = concat!(
-    events_cte!(),
+    events_cte!(
+        "'epoch'::timestamptz + $3::int8 * interval '1 millisecond'",
+        "'epoch'::timestamptz + $4::int8 * interval '1 millisecond'"
+    ),
     "SELECT ev.source_table, ev.id, ev.kind, (extract(epoch FROM ev.at) * 1000)::int8, ev.device_id,
        c.id, c.r2_key, c.status, c.error
   FROM ev
   LEFT JOIN alc_api.cam_clip_events e
          ON e.tenant_id = $1 AND e.camera_id = $2 AND e.source_table = ev.source_table AND e.source_id = ev.id
   LEFT JOIN alc_api.cam_clips c ON c.tenant_id = e.tenant_id AND c.id = e.clip_id
- WHERE ev.device_id IN (SELECT d.device_id FROM alc_api.cam_camera_devices d WHERE d.tenant_id = $1 AND d.camera_id = $2)
+ WHERE ev.device_id IN ",
+    camera_devices!(),
+    "
     OR e.clip_id IS NOT NULL
  ORDER BY ev.at, ev.source_table, ev.id"
 );

@@ -13,14 +13,17 @@ auth-worker (/api/cam-clips/) ─Service Binding─▶ alc-cam-sd-ingest ─Work
 口 (中身は `ingest/api`。宛先・資格情報は応答にもログにも出さない。パスワードは返さない):
 
 ```
-GET   /api/cam-clips/cameras                 → {"can_edit_destination": bool, "cameras": [{id, name, vpc_binding, rec_username, has_password, recording, lan_ip, rtsp_port, rtsp_path, device_ids, stream_device_ids, rec_scanned_until}]}
+GET   /api/cam-clips/cameras                 → {"can_edit_destination": bool, "cameras": [{id, name, vpc_binding, rec_username, has_password, recording, lan_ip, rtsp_port, rtsp_path, device_ids, pending_device_ids, stream_device_ids, rec_scanned_until}]}
                                                運行管理者席の鍵には → {"cameras": [{id, name, device_ids}]} (録画の設定は返さない)
+                                               device_ids は結び付きで機体の鍵の ID (alarm:…) に畳んで返す (hub の ID → 結び付いた鍵、重複なし)。
+                                               結び付きの無い hub の ID はそのまま返し pending_device_ids にも入れる (保存は送った ID のまま)
 POST  /api/cam-clips/cameras                 {name, vpc_binding?, rec_username?, rec_password?, lan_ip?, rtsp_port?, rtsp_path?, device_ids?, stream_device_ids?} → 201 (active = false で作る)
 PATCH /api/cam-clips/cameras/{id}            同じ項目 (省略 = 変えない、vpc_binding: null = 取り込みをやめる、rec_password: "" = 変えない、
                                                lan_ip / rtsp_path: null か "" = 消す、rtsp_port: null = 554 に戻す、
                                                device_ids / stream_device_ids: 送ると全差し替え)
 GET   /api/cam-clips/cameras/mine            拠点 PC の配信の鍵だけ → {"cameras": [{id, name, rank, rtsp: {host, port, path, username, password} | null}]}
-GET   /api/cam-clips/device-candidates?days=30   直近 days 日 (1〜90) にイベントを出した端末と kind ごとの件数 (行ごとに is_dev: 開発端末の行も軸ごとに読んで返す)
+GET   /api/cam-clips/device-candidates?days=30   直近 days 日 (1〜90) にイベントを出した端末と kind ごとの件数 (行ごとに is_dev: 開発端末の行も軸ごとに読んで返す)。
+                                               hub の ID は結び付き (hub_measurements.via_device_id) で鍵の ID に畳み、alarm: の行だけ返す。measurements の測定も数える
 POST  /api/cam-clips/clips                   {"camera_id": "...", "from": "2026-10-23T12:58:00+09:00", "to": "2026-10-23T12:59:30+09:00"}
 POST  /api/cam-clips/auto-run                 {} か {"camera_id": "..."} → 200 {"cameras": [...]} (cron と同じ自動切り出しを呼び手のテナントだけで今すぐ回す。camera_id で 1 台に絞れる。dev token では 403)
 → 201 {"clip_id": …, "key": "clips/<tenant>/<camera_id>/20261023T125800_20261023T125930.mp4", "size": …,

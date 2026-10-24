@@ -60,7 +60,7 @@ fn migrations_dir() -> std::path::PathBuf {
     dir
 }
 
-/// 準備をプロセスの中で 1 回だけ流す。189 の表が在れば (前に流した) 何もしない
+/// 準備をプロセスの中で 1 回だけ流す。190 の列 (hub_measurements.via_device_id) が在れば (前に流した) 何もしない
 async fn prepare() {
     static PREPARED: OnceCell<()> = OnceCell::const_new();
     PREPARED
@@ -71,7 +71,7 @@ async fn prepare() {
                 .unwrap();
             let done: bool = su
                 .query_one(
-                    "SELECT to_regclass('alc_api.cam_stream_devices') IS NOT NULL",
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'alc_api' AND table_name = 'hub_measurements' AND column_name = 'via_device_id')",
                     &[],
                 )
                 .await
@@ -130,6 +130,14 @@ async fn migrate(su: &Client) {
             .to_string_lossy()
             .ends_with("_cam_stream_devices.sql")),
         "取り出した migrations に 189 (cam_stream_devices) が無い (scripts/ALC_MIGRATIONS_REV が古い)"
+    );
+    assert!(
+        files.iter().any(|f| f
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("_device_key_id_columns.sql")),
+        "取り出した migrations に 190 (device_key_id_columns) が無い (scripts/ALC_MIGRATIONS_REV が古い)"
     );
     for file in files {
         let name = file.file_name().unwrap().to_owned();
@@ -829,14 +837,14 @@ async fn device_candidates_are_counted() {
     let su = admin().await;
     // hub_measurements: kind ごと・古い行・対象外の kind・他テナント・recorded_at が NULL の行
     let rows: [(Uuid, &str, &str, &str); 8] = [
-        (t, "dev-1", "alcohol", "now() - interval '1 day'"),
-        (t, "dev-1", "alcohol", "now() - interval '2 days'"),
-        (t, "dev-1", "blood_pressure", "now() - interval '3 days'"),
-        (t, "dev-1", "temperature", "now() - interval '1 day'"),
-        (t, "dev-2", "timecard", "now() - interval '5 hours'"),
-        (t, "dev-2", "license", "now() - interval '40 days'"),
-        (t, "dev-3", "alcohol", "now() - interval '45 days'"),
-        (other, "dev-1", "alcohol", "now() - interval '1 day'"),
+        (t, "alarm:d1", "alcohol", "now() - interval '1 day'"),
+        (t, "alarm:d1", "alcohol", "now() - interval '2 days'"),
+        (t, "alarm:d1", "blood_pressure", "now() - interval '3 days'"),
+        (t, "alarm:d1", "temperature", "now() - interval '1 day'"),
+        (t, "alarm:d2", "timecard", "now() - interval '5 hours'"),
+        (t, "alarm:d2", "license", "now() - interval '40 days'"),
+        (t, "alarm:d3", "alcohol", "now() - interval '45 days'"),
+        (other, "alarm:d1", "alcohol", "now() - interval '1 day'"),
     ];
     for (i, (tenant, device, kind, at)) in rows.iter().enumerate() {
         su.execute(
@@ -847,10 +855,10 @@ async fn device_candidates_are_counted() {
         .unwrap();
     }
     // recorded_at が NULL なら created_at で数える
-    su.execute("INSERT INTO alc_api.hub_measurements (tenant_id, device_id, kind, payload, seq, recorded_at) VALUES ($1, 'dev-2', 'timecard', '{}', 100, NULL)", &[&t]).await.unwrap();
+    su.execute("INSERT INTO alc_api.hub_measurements (tenant_id, device_id, kind, payload, seq, recorded_at) VALUES ($1, 'alarm:d2', 'timecard', '{}', 100, NULL)", &[&t]).await.unwrap();
     // 指静脈の登録 (registered_device_id が NULL の行は数えない)
     let emp: Uuid = su.query_one("INSERT INTO alc_api.employees (tenant_id, nfc_id, name) VALUES ($1, $2, '乗務員') RETURNING id", &[&t, &format!("nfc-{}", Uuid::new_v4())]).await.unwrap().get(0);
-    su.execute("INSERT INTO alc_api.vein_enroll_events (tenant_id, employee_id, registered_device_id) VALUES ($1, $2, 'dev-3'), ($1, $2, NULL)", &[&t, &emp]).await.unwrap();
+    su.execute("INSERT INTO alc_api.vein_enroll_events (tenant_id, employee_id, registered_device_id) VALUES ($1, $2, 'alarm:d3'), ($1, $2, NULL)", &[&t, &emp]).await.unwrap();
 
     let mut pg = rt().await;
     let c = caller(t, false);
@@ -867,20 +875,20 @@ async fn device_candidates_are_counted() {
             )
         })
         .collect();
-    // 新しい順: dev-3 (指静脈 = 今) → dev-2 (created_at = 今の timecard) → dev-1
+    // 新しい順: alarm:d3 (指静脈 = 今) → alarm:d2 (created_at = 今の timecard) → alarm:d1
     assert_eq!(
         got,
         vec![
             (
-                "dev-3".to_owned(),
+                "alarm:d3".to_owned(),
                 json!({"alcohol": 0, "blood_pressure": 0, "timecard": 0, "license": 0, "vein_enroll": 1})
             ),
             (
-                "dev-2".to_owned(),
+                "alarm:d2".to_owned(),
                 json!({"alcohol": 0, "blood_pressure": 0, "timecard": 2, "license": 0, "vein_enroll": 0})
             ),
             (
-                "dev-1".to_owned(),
+                "alarm:d1".to_owned(),
                 json!({"alcohol": 2, "blood_pressure": 1, "timecard": 0, "license": 0, "vein_enroll": 0})
             ),
         ]
@@ -901,14 +909,14 @@ async fn device_candidates_are_counted() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|r| r["device_id"] == "dev-3")
+        .find(|r| r["device_id"] == "alarm:d3")
         .unwrap();
     assert_eq!(dev3["counts"]["alcohol"], 1);
     let dev2 = body
         .as_array()
         .unwrap()
         .iter()
-        .find(|r| r["device_id"] == "dev-2")
+        .find(|r| r["device_id"] == "alarm:d2")
         .unwrap();
     assert_eq!(dev2["counts"]["license"], 1);
 }
@@ -921,15 +929,15 @@ async fn dev_device_candidates_are_marked() {
     let emp: Uuid = su.query_one("INSERT INTO alc_api.employees (tenant_id, nfc_id, name) VALUES ($1, $2, '乗務員') RETURNING id", &[&t, &format!("nfc-{}", Uuid::new_v4())]).await.unwrap().get(0);
     let emp_other: Uuid = su.query_one("INSERT INTO alc_api.employees (tenant_id, nfc_id, name) VALUES ($1, $2, '他社') RETURNING id", &[&other, &format!("nfc-{}", Uuid::new_v4())]).await.unwrap().get(0);
     // 本番の行 (app.device_dev 未設定)
-    su.execute("INSERT INTO alc_api.hub_measurements (tenant_id, device_id, kind, payload, seq, recorded_at) VALUES ($1, 'prod-1', 'alcohol', '{}', 1, now() - interval '3 hours')", &[&t]).await.unwrap();
+    su.execute("INSERT INTO alc_api.hub_measurements (tenant_id, device_id, kind, payload, seq, recorded_at) VALUES ($1, 'alarm:p1', 'alcohol', '{}', 1, now() - interval '3 hours')", &[&t]).await.unwrap();
     // 開発端末の行は RLS の WITH CHECK に合わせ、app.device_dev='1' を立てた transaction で入れる
     for (tenant, employee, device, at) in [
-        (t, emp, "dev-1", "now() - interval '1 hour'"),
-        (t, emp, "dev-2", "now() - interval '2 hours'"),
-        (other, emp_other, "dev-other", "now() - interval '1 hour'"),
+        (t, emp, "alarm:d1", "now() - interval '1 hour'"),
+        (t, emp, "alarm:d2", "now() - interval '2 hours'"),
+        (other, emp_other, "alarm:dother", "now() - interval '1 hour'"),
     ] {
-        // 指静脈の登録 (created_at = 今) は dev-1 と他テナントだけ。dev-2 は 2 時間前の timecard が最終
-        let vein = if device == "dev-2" {
+        // 指静脈の登録 (created_at = 今) は alarm:d1 と他テナントだけ。alarm:d2 は 2 時間前の timecard が最終
+        let vein = if device == "alarm:d2" {
             String::new()
         } else {
             format!("INSERT INTO alc_api.vein_enroll_events (tenant_id, employee_id, registered_device_id) VALUES ('{tenant}', '{employee}', '{device}');")
@@ -943,7 +951,7 @@ async fn dev_device_candidates_are_marked() {
         .unwrap();
     }
     let flags: Vec<bool> = su
-        .query("SELECT is_dev FROM alc_api.hub_measurements WHERE tenant_id = $1 AND device_id LIKE 'dev-%' ORDER BY device_id", &[&t])
+        .query("SELECT is_dev FROM alc_api.hub_measurements WHERE tenant_id = $1 AND device_id LIKE 'alarm:d%' ORDER BY device_id", &[&t])
         .await
         .unwrap()
         .iter()
@@ -961,7 +969,7 @@ async fn dev_device_candidates_are_marked() {
         .map(|r| (r["device_id"].as_str().unwrap(), r["is_dev"].as_bool().unwrap()))
         .collect();
     // 新しい順に、本番と開発端末が混ざって並ぶ。他テナントの開発端末は出ない
-    assert_eq!(got, [("dev-1", true), ("dev-2", true), ("prod-1", false)]);
+    assert_eq!(got, [("alarm:d1", true), ("alarm:d2", true), ("alarm:p1", false)]);
     assert_eq!(body[0]["counts"]["timecard"], 1);
     assert_eq!(body[0]["counts"]["vein_enroll"], 1);
     assert_eq!(body[2]["counts"]["alcohol"], 1);
@@ -1057,15 +1065,47 @@ const S: i64 = 1000;
 /// 端末のイベントを 1 行入れる (時刻は UNIX ms。`at_sql` が Some ならその式を recorded_at に)。
 /// 開発端末の行は RLS の WITH CHECK に合わせ、`app.device_dev='1'` を立てた transaction で入れる
 async fn hub_event(su: &Client, t: Uuid, device: &str, kind: &str, recorded: Option<i64>, created: i64, dev: bool) -> Uuid {
+    hub_event_via(su, t, device, None, kind, recorded, created, dev).await
+}
+
+/// `via` = 接続に使った hub の ID (`device` に機体の鍵の ID を入れた行が、鍵 ⇔ hub の結び付きになる)
+#[allow(clippy::too_many_arguments)]
+async fn hub_event_via(su: &Client, t: Uuid, device: &str, via: Option<&str>, kind: &str, recorded: Option<i64>, created: i64, dev: bool) -> Uuid {
     let id = Uuid::new_v4();
     let at = |ms: i64| format!("'epoch'::timestamptz + {ms} * interval '1 millisecond'");
     let recorded = recorded.map(at).unwrap_or_else(|| "NULL".into());
+    let via = via.map(|v| format!("'{v}'")).unwrap_or_else(|| "NULL".into());
     let set = if dev { "SELECT set_config('app.device_dev', '1', true);" } else { "" };
     su.batch_execute(&format!(
-        "BEGIN; {set} INSERT INTO alc_api.hub_measurements (id, tenant_id, device_id, kind, payload, seq, recorded_at, created_at) \
-         VALUES ('{id}', '{t}', '{device}', '{kind}', '{{}}', {seq}, {recorded}, {created}); COMMIT;",
+        "BEGIN; {set} INSERT INTO alc_api.hub_measurements (id, tenant_id, device_id, via_device_id, kind, payload, seq, recorded_at, created_at) \
+         VALUES ('{id}', '{t}', '{device}', {via}, '{kind}', '{{}}', {seq}, {recorded}, {created}); COMMIT;",
         seq = id.as_u128() as i64 & i64::MAX,
         created = at(created),
+    ))
+    .await
+    .unwrap();
+    id
+}
+
+/// measurements の 1 行 (PC 経由の測定)。`measured` = アルコールの時刻、`bp` = (血圧の時刻, 最高血圧)
+async fn measurement(su: &Client, t: Uuid, device: Option<&str>, status: &str, measured: i64, bp: Option<(i64, Option<i32>)>, dev: bool) -> Uuid {
+    let emp: Uuid = su
+        .query_one("INSERT INTO alc_api.employees (tenant_id, nfc_id, name) VALUES ($1, $2, '乗務員') RETURNING id", &[&t, &format!("nfc-{}", Uuid::new_v4())])
+        .await
+        .unwrap()
+        .get(0);
+    let id = Uuid::new_v4();
+    let at = |ms: i64| format!("'epoch'::timestamptz + {ms} * interval '1 millisecond'");
+    let device = device.map(|d| format!("'{d}'")).unwrap_or_else(|| "NULL".into());
+    let (medical_at, systolic) = match bp {
+        Some((ms, sys)) => (at(ms), sys.map(|v| v.to_string()).unwrap_or_else(|| "NULL".into())),
+        None => ("NULL".into(), "NULL".into()),
+    };
+    let set = if dev { "SELECT set_config('app.device_dev', '1', true);" } else { "" };
+    su.batch_execute(&format!(
+        "BEGIN; {set} INSERT INTO alc_api.measurements (id, tenant_id, employee_id, device_id, status, measured_at, medical_measured_at, systolic) \
+         VALUES ('{id}', '{t}', '{emp}', {device}, '{status}', {m}, {medical_at}, {systolic}); COMMIT;",
+        m = at(measured),
     ))
     .await
     .unwrap();
@@ -1420,4 +1460,337 @@ async fn cron_picks_events_that_arrived_after_the_scanned_until() {
     // 次の回は拾い直さない
     let o = run_camera(&mut pg, t, &c, &mut fake, T + 800 * S, 40).await.unwrap();
     assert_eq!((o.events, o.ready), (0, 0));
+}
+
+// ---- 機体の鍵の ID への畳み込み (hub_measurements.via_device_id / measurements.device_id) ----
+
+/// 現在時刻 (UNIX ms)。候補の集計は `now()` から数えるので、行の時刻はここからの相対で入れる
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+/// 候補の応答を (device_id, is_dev, counts) の並びにする
+fn candidate_rows(body: &Value) -> Vec<(String, bool, Value)> {
+    body.as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["device_id"].as_str().unwrap().to_owned(), r["is_dev"].as_bool().unwrap(), r["counts"].clone()))
+        .collect()
+}
+
+fn counts(alcohol: i64, blood_pressure: i64, timecard: i64, license: i64, vein_enroll: i64) -> Value {
+    json!({"alcohol": alcohol, "blood_pressure": blood_pressure, "timecard": timecard, "license": license, "vein_enroll": vein_enroll})
+}
+
+#[tokio::test]
+async fn candidates_fold_linked_hub_rows_into_the_key_and_hide_the_rest() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let su = admin().await;
+    let n = now_ms();
+    let h = 3_600 * S;
+    let (key, key2, hub) = ("alarm:aaaa0001", "alarm:bbbb0002", "cores3-a");
+
+    // 結び付きの元: 鍵の ID の行に via_device_id = hub の ID (これもアルコール 1 件)
+    hub_event_via(&su, t, key, Some(hub), "alcohol", Some(n - h), n - h, false).await;
+    // 結び付き前に hub の ID で入った行 (鍵の行に合算される)・指静脈の登録
+    hub_event(&su, t, hub, "alcohol", Some(n - 2 * h), n - 2 * h, false).await;
+    hub_event(&su, t, hub, "timecard", Some(n - h / 2), n - h / 2, false).await;
+    vein_event(&su, t, hub, n - 5 * h, false).await;
+    // 結び付きの無い hub・ブラウザ打刻・自己ペアの乱数 ID は候補に出さない
+    hub_event(&su, t, "cores3-z", "alcohol", Some(n - h), n - h, false).await;
+    hub_event(&su, t, "browser", "timecard", Some(n - h), n - h, false).await;
+    hub_event(&su, t, "kiosk-3f9c2a", "license", Some(n - h), n - h, false).await;
+    vein_event(&su, t, "kiosk-3f9c2a", n - h, false).await;
+    // measurements (PC 経由): アルコールは completed だけ、血圧は最高血圧と測定時刻がある行だけ
+    measurement(&su, t, Some(key), "completed", n - 3 * h, None, false).await;
+    measurement(&su, t, Some(key), "started", n - 3 * h, None, false).await;
+    measurement(&su, t, Some(key), "completed", n - 4 * h, Some((n - 4 * h, Some(120))), false).await;
+    // 同じ鍵・同じ kind の hub の行 (n - h) の ±60 秒に在る measurements は重複として数えない
+    measurement(&su, t, Some(key), "completed", n - h + 20 * S, None, false).await;
+    // 結び付きの無い鍵の measurements だけの端末も候補になる。端末の ID が無い行は数えない
+    measurement(&su, t, Some(key2), "completed", n - 6 * h, None, false).await;
+    measurement(&su, t, None, "completed", n - h, Some((n - h, Some(130))), false).await;
+    // 他テナントの同じ hub の ID の結び付きは混ざらない
+    hub_event_via(&su, other, "alarm:other0003", Some(hub), "alcohol", Some(n - h), n - h, false).await;
+
+    let mut pg = rt().await;
+    let (s, body) = call(&mut pg, &caller(t, false), "GET", "/device-candidates", "", Value::Null).await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(
+        candidate_rows(&body),
+        vec![
+            // alcohol: 結び付きの元 1 + hub の ID の旧行 1 + measurements 2 (n-3h と、血圧と同じ行の n-4h。重複の 1 件と started は数えない) / 血圧 1 / 打刻 1 / 指静脈 1
+            (key.to_owned(), false, counts(4, 1, 1, 0, 1)),
+            (key2.to_owned(), false, counts(1, 0, 0, 0, 0)),
+        ]
+    );
+    // 応答の形は今のまま
+    let keys: Vec<&String> = body[0].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["counts", "device_id", "is_dev", "last_at"]);
+    assert!(body[0]["last_at"].as_str().unwrap().ends_with("+09:00"));
+}
+
+#[tokio::test]
+async fn links_are_not_folded_across_the_is_dev_axis() {
+    let t = tenant().await;
+    let su = admin().await;
+    let n = now_ms();
+    let h = 3_600 * S;
+    // 本番の軸の結び付き (hub-p → 鍵 p) と、開発端末の軸の旧行 (hub-p の ID のまま)
+    hub_event_via(&su, t, "alarm:prod0001", Some("hub-p"), "alcohol", Some(n - h), n - h, false).await;
+    hub_event(&su, t, "hub-p", "timecard", Some(n - h), n - h, true).await;
+    // 開発端末の軸の結び付き (hub-d → 鍵 d) と、本番の軸の旧行 (hub-d の ID のまま)
+    hub_event_via(&su, t, "alarm:dev00002", Some("hub-d"), "alcohol", Some(n - h), n - h, true).await;
+    hub_event(&su, t, "hub-d", "timecard", Some(n - h), n - h, false).await;
+
+    let mut pg = rt().await;
+    let (s, body) = call(&mut pg, &caller(t, false), "GET", "/device-candidates", "", Value::Null).await;
+    assert_eq!(s, 200, "{body}");
+    // 軸を跨いで畳まない: 逆の軸の旧行は鍵に合算されず (件数は結び付きの元の 1 件だけ)、alarm: でないので出ない
+    assert_eq!(
+        candidate_rows(&body),
+        vec![
+            ("alarm:dev00002".to_owned(), true, counts(1, 0, 0, 0, 0)),
+            ("alarm:prod0001".to_owned(), false, counts(1, 0, 0, 0, 0)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn measurement_events_are_picked_and_cut_into_clip_events() {
+    let t = tenant().await;
+    let su = admin().await;
+    let mut pg = rt().await;
+    let key = "alarm:cccc0001";
+    let cam = recording_camera(&mut pg, t, &[key]).await;
+    // 1 行がアルコール (measured_at) と血圧 (medical_measured_at) の 2 イベントになる
+    let both = measurement(&su, t, Some(key), "completed", T + 10 * S, Some((T + 20 * S, Some(118))), false).await;
+    // 開発端末の軸の行
+    let dev_alc = measurement(&su, t, Some(key), "completed", T + 30 * S, None, true).await;
+    // 出ない行: status が started のアルコール (血圧が無ければ何も出ない)・最高血圧の無い血圧・端末の ID が無い行
+    measurement(&su, t, Some(key), "started", T + 40 * S, None, false).await;
+    measurement(&su, t, Some(key), "started", T + 41 * S, Some((T + 41 * S, None)), false).await;
+    measurement(&su, t, None, "completed", T + 42 * S, Some((T + 42 * S, Some(120))), false).await;
+    measurement(&su, t, Some("alarm:other000"), "completed", T + 43 * S, None, false).await;
+
+    let got = pg::auto_events(&mut pg, t, cam, T, T + 3600 * S).await.unwrap();
+    let mut seen: Vec<(Uuid, &str, &str, i64, &str, bool)> = got
+        .iter()
+        .map(|e| (e.source_id, e.source_table.as_str(), e.kind.as_str(), (e.at_ms - T) / S, e.device_id.as_str(), e.is_dev))
+        .collect();
+    seen.sort_by_key(|x| x.3);
+    assert_eq!(
+        seen,
+        vec![
+            (both, "measurements", "alcohol", 10, key, false),
+            (both, "measurements_bp", "blood_pressure", 20, key, false),
+            (dev_alc, "measurements", "alcohol", 30, key, true),
+        ]
+    );
+
+    // cron の切り出しで cam_clip_events に入る (migration 190 の CHECK が source_table を通す)
+    let mut fake = Fake { files: vec![sd(0, true), sd(240, true), sd(480, false)], ..Default::default() };
+    let c = AutoCamera { id: cam, scanned_until_ms: Some(T) };
+    let o = run_camera(&mut pg, t, &c, &mut fake, T + 700 * S, 40).await.unwrap();
+    assert_eq!((o.events, o.groups, o.ready, o.failed), (3, 1, 1, 0), "{}", o.line());
+    let rows: Vec<(String, String, Option<String>, bool)> = su
+        .query(
+            "SELECT source_table, kind, device_id, is_dev FROM alc_api.cam_clip_events WHERE tenant_id = $1 AND camera_id = $2 ORDER BY occurred_at, source_table",
+            &[&t, &cam],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("measurements".into(), "alcohol".into(), Some(key.into()), false),
+            ("measurements_bp".into(), "blood_pressure".into(), Some(key.into()), false),
+            ("measurements".into(), "alcohol".into(), Some(key.into()), true),
+        ]
+    );
+    // 次の回は同じ測定を拾わない (同じ source_id が alcohol / bp の 2 つの source_table で入っていても衝突しない)
+    assert!(pg::auto_events(&mut pg, t, cam, T, T + 3600 * S).await.unwrap().is_empty());
+
+    // その日の口にも出る (clip つき)
+    let (s, body) = call(&mut pg, &caller(t, false), "GET", "/events", &format!("camera_id={cam}&date=2026-10-23"), Value::Null).await;
+    assert_eq!(s, 200, "{body}");
+    let tables: Vec<(&str, &str, bool)> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["source_table"].as_str().unwrap(), r["kind"].as_str().unwrap(), r["clip"].is_object()))
+        .collect();
+    assert_eq!(tables, [("measurements", "alcohol", true), ("measurements_bp", "blood_pressure", true), ("measurements", "alcohol", true)]);
+}
+
+#[tokio::test]
+async fn measurement_events_duplicating_hub_events_within_60s_are_dropped() {
+    let t = tenant().await;
+    let su = admin().await;
+    let mut pg = rt().await;
+    let key = "alarm:dddd0001";
+    let cam = recording_camera(&mut pg, t, &[key]).await;
+    let (from, to) = (T, T + 1800 * S);
+
+    // hub のアルコール (T+100) の ±60 秒: +50・+60 (境目も重複) は落ち、+70 は残る。-50 も落ちる
+    hub_event(&su, t, key, "alcohol", Some(T + 100 * S), T + 100 * S, false).await;
+    measurement(&su, t, Some(key), "completed", T + 150 * S, None, false).await;
+    measurement(&su, t, Some(key), "completed", T + 160 * S, None, false).await;
+    let kept_70 = measurement(&su, t, Some(key), "completed", T + 170 * S, None, false).await;
+    measurement(&su, t, Some(key), "completed", T + 50 * S, None, false).await;
+    // 血圧も同じ (hub の blood_pressure T+300 に対し measurements の medical_measured_at T+330 は落ち、T+400 は残る)
+    hub_event(&su, t, key, "blood_pressure", Some(T + 300 * S), T + 300 * S, false).await;
+    measurement(&su, t, Some(key), "started", T + 330 * S, Some((T + 330 * S, Some(110))), false).await;
+    let kept_bp = measurement(&su, t, Some(key), "started", T + 400 * S, Some((T + 400 * S, Some(111))), false).await;
+    // kind が違う hub (timecard) の近くのアルコール・別の端末の hub の近くのアルコールは落とさない
+    hub_event(&su, t, key, "timecard", Some(T + 500 * S), T + 500 * S, false).await;
+    let kept_kind = measurement(&su, t, Some(key), "completed", T + 510 * S, None, false).await;
+    hub_event(&su, t, "alarm:eeee0002", "alcohol", Some(T + 600 * S), T + 600 * S, false).await;
+    let kept_dev = measurement(&su, t, Some(key), "completed", T + 610 * S, None, false).await;
+    // hub の ID の旧行 (結び付きで同じ鍵に畳まれる) とも重複と見なす。結び付きの元の行は窓の外 (T+2000) でも効く
+    hub_event(&su, t, "hub-d", "alcohol", Some(T + 700 * S), T + 700 * S, false).await;
+    hub_event_via(&su, t, key, Some("hub-d"), "alcohol", Some(T + 2000 * S), T + 2000 * S, false).await;
+    measurement(&su, t, Some(key), "completed", T + 720 * S, None, false).await;
+    // 他テナントの hub は重複の相手にならない
+    let other = tenant().await;
+    hub_event(&su, other, key, "alcohol", Some(T + 800 * S), T + 800 * S, false).await;
+    let kept_other = measurement(&su, t, Some(key), "completed", T + 810 * S, None, false).await;
+
+    let got = pg::auto_events(&mut pg, t, cam, from, to).await.unwrap();
+    let mut m: Vec<(i64, &str, Uuid)> = got
+        .iter()
+        .filter(|e| e.source_table.starts_with("measurements"))
+        .map(|e| ((e.at_ms - T) / S, e.source_table.as_str(), e.source_id))
+        .collect();
+    m.sort();
+    let mut want = vec![
+        (170, "measurements", kept_70),
+        (400, "measurements_bp", kept_bp),
+        (510, "measurements", kept_kind),
+        (610, "measurements", kept_dev),
+        (810, "measurements", kept_other),
+    ];
+    want.sort();
+    assert_eq!(m, want);
+    // hub 側のイベントは落とさない (hub の ID の旧行は鍵の ID で出る)。窓の外の結び付きの元 (T+2000) と別の端末は出ない
+    let hubs = got.iter().filter(|e| e.source_table == "hub_measurements").count();
+    assert_eq!(hubs, 4, "alcohol (100) / blood_pressure (300) / timecard (500) / hub-d の旧行 (700)");
+    assert!(got.iter().all(|e| e.device_id == key), "hub の ID のまま出ている / 別の端末が混ざっている");
+}
+
+#[tokio::test]
+async fn camera_picks_both_hub_and_key_records_whichever_it_is_linked_to() {
+    let t = tenant().await;
+    let su = admin().await;
+    let mut pg = rt().await;
+    let (key, hub) = ("alarm:ffff0001", "hub-1");
+    // 結び付き (鍵の ID の行 + via)・hub の ID の旧行・鍵の ID の行・measurements
+    let link = hub_event_via(&su, t, key, Some(hub), "alcohol", Some(T + 5 * S), T + 5 * S, false).await;
+    let legacy = hub_event(&su, t, hub, "license", Some(T + 10 * S), T + 10 * S, false).await;
+    let direct = hub_event(&su, t, key, "timecard", Some(T + 20 * S), T + 20 * S, false).await;
+    // (アルコールの測定は hub のアルコール T+5 の ±60 秒の外に置く)
+    let pc = measurement(&su, t, Some(key), "completed", T + 200 * S, None, false).await;
+    // 結び付きの無い hub の ID で結び付けたカメラは、その hub の ID のまま拾う。無関係な端末は拾わない
+    let solo = hub_event(&su, t, "hub-9", "alcohol", Some(T + 40 * S), T + 40 * S, false).await;
+    hub_event(&su, t, "alarm:zzzz0009", "alcohol", Some(T + 50 * S), T + 50 * S, false).await;
+
+    let by_hub = recording_camera(&mut pg, t, &[hub]).await;
+    let by_key = recording_camera(&mut pg, t, &[key]).await;
+    let by_solo = recording_camera(&mut pg, t, &["hub-9"]).await;
+    let want = {
+        let mut v = vec![(link, key), (legacy, key), (direct, key), (pc, key)];
+        v.sort();
+        v
+    };
+    for cam in [by_hub, by_key] {
+        let got = pg::auto_events(&mut pg, t, cam, T, T + 3600 * S).await.unwrap();
+        let mut ids: Vec<(Uuid, &str)> = got.iter().map(|e| (e.source_id, e.device_id.as_str())).collect();
+        ids.sort();
+        assert_eq!(ids, want, "camera {cam}");
+        // その日の口も同じ (返す device_id は鍵の ID)
+        let day = pg::day_events(&mut pg, t, cam, T, T + 3600 * S).await.unwrap();
+        let mut ids: Vec<(Uuid, &str)> = day.iter().map(|d| (d.event.source_id, d.event.device_id.as_str())).collect();
+        ids.sort();
+        assert_eq!(ids, want, "camera {cam} (day)");
+    }
+    let got = pg::auto_events(&mut pg, t, by_solo, T, T + 3600 * S).await.unwrap();
+    assert_eq!(got.iter().map(|e| (e.source_id, e.device_id.as_str())).collect::<Vec<_>>(), vec![(solo, "hub-9")]);
+}
+
+#[tokio::test]
+async fn camera_device_ids_are_folded_and_pending_ones_are_reported() {
+    let t = tenant().await;
+    let su = admin().await;
+    let mut pg = rt().await;
+    // hub-1 は鍵 aaaa に結び付いている。hub-2 は結び付き無し
+    hub_event_via(&su, t, "alarm:aaaa0001", Some("hub-1"), "alcohol", Some(T), T, false).await;
+    // 開発端末の軸の結び付き (hub-3 → 鍵 dev) も畳みに使う
+    hub_event_via(&su, t, "alarm:dev00003", Some("hub-3"), "alcohol", Some(T), T, true).await;
+
+    let (s, cam) = call(
+        &mut pg,
+        &caller(t, false),
+        "POST",
+        "/cameras",
+        "",
+        json!({"name": "入口", "device_ids": ["hub-2", "hub-1", "alarm:aaaa0001", "alarm:zzzz0009", "hub-3"]}),
+    )
+    .await;
+    assert_eq!(s, 201, "{cam}");
+    // 結び付いた hub は鍵に畳まれ (重複は 1 つ)、結び付きの無い hub はそのまま返って pending にも入る
+    let folded = json!(["alarm:aaaa0001", "alarm:dev00003", "alarm:zzzz0009", "hub-2"]);
+    assert_eq!(cam["device_ids"], folded);
+    assert_eq!(cam["pending_device_ids"], json!(["hub-2"]));
+    let id = cam["id"].as_str().unwrap().to_owned();
+
+    // 保存は送った ID のまま (畳まない)
+    let stored: Vec<String> = su
+        .query("SELECT device_id FROM alc_api.cam_camera_devices WHERE tenant_id = $1 ORDER BY device_id", &[&t])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(stored, ["alarm:aaaa0001", "alarm:zzzz0009", "hub-1", "hub-2", "hub-3"]);
+
+    // 一覧・PATCH の応答も畳んで返す。運行管理者席は device_ids だけ (畳んだ値)
+    let (_, list) = call(&mut pg, &caller(t, false), "GET", "/cameras", "", Value::Null).await;
+    assert_eq!(list["cameras"][0]["device_ids"], folded);
+    assert_eq!(list["cameras"][0]["pending_device_ids"], json!(["hub-2"]));
+    let (s, patched) = call(&mut pg, &caller(t, false), "PATCH", &format!("/cameras/{id}"), "", json!({"name": "入口 2"})).await;
+    assert_eq!(s, 200, "{patched}");
+    assert_eq!(patched["device_ids"], folded);
+    assert_eq!(patched["pending_device_ids"], json!(["hub-2"]));
+    let (_, tm) = call(&mut pg, &tenko_manager(t), "GET", "/cameras", "", Value::Null).await;
+    assert_eq!(tm["cameras"][0], json!({"id": id, "name": "入口 2", "device_ids": folded}));
+
+    // 画面が畳んだ ID を送り返せば結び付けが置き換わり、pending も消える
+    let (s, replaced) = call(&mut pg, &caller(t, false), "PATCH", &format!("/cameras/{id}"), "", json!({"device_ids": ["alarm:aaaa0001"]})).await;
+    assert_eq!(s, 200, "{replaced}");
+    assert_eq!((replaced["device_ids"].clone(), replaced["pending_device_ids"].clone()), (json!(["alarm:aaaa0001"]), json!([])));
+    let stored: Vec<String> = su
+        .query("SELECT device_id FROM alc_api.cam_camera_devices WHERE tenant_id = $1", &[&t])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(stored, ["alarm:aaaa0001"]);
+
+    // 結び付けた端末が無いカメラは結び付きを引かずに空のまま
+    let (_, empty) = call(&mut pg, &caller(t, false), "POST", "/cameras", "", json!({"name": "空"})).await;
+    assert_eq!((empty["device_ids"].clone(), empty["pending_device_ids"].clone()), (json!([]), json!([])));
+
+    // 拠点 PC の /cameras/mine は変えない (鍵の sub で引く。stream_device_ids の順位表は畳まない)
+    let (s, put) = call(&mut pg, &caller(t, false), "PATCH", &format!("/cameras/{id}"), "", json!({"stream_device_ids": ["alarm:aaaa0001"], "lan_ip": "192.168.0.10", "rtsp_path": "s1"})).await;
+    assert_eq!(s, 200, "{put}");
+    assert_eq!(put["stream_device_ids"], json!(["alarm:aaaa0001"]));
+    let (_, mine) = call(&mut pg, &cam_host(t, "alarm:aaaa0001"), "GET", "/cameras/mine", "", Value::Null).await;
+    assert_eq!(mine["cameras"].as_array().unwrap().len(), 1);
+    let (_, none) = call(&mut pg, &cam_host(t, "hub-1"), "GET", "/cameras/mine", "", Value::Null).await;
+    assert_eq!(none["cameras"].as_array().unwrap().len(), 0);
 }
