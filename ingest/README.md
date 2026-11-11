@@ -90,8 +90,10 @@ GET   /api/cam-clips/events?camera_id=<uuid>&date=2026-10-23   (JST の 1 日)
 - 外から直接は届かない (workers_dev / route なし。`ingest/scripts/check-exposure.sh` が CI で検査)。auth-worker の振り分け表
   `ALC_BINDING_ROUTES` から届き、JWT の検証は auth-worker が済ませる。Worker が受ける呼び手は 3 つで、それ以外は 403:
   - 管理者のログイン (画面用の proxy、`X-User-Role: admin`) — 全部の口
-  - 運行管理者席の鍵 (端末用の proxy、`X-Device-Role: device-tenko-manager`) — 遠隔点呼の画面が乗務員の端末からカメラを
-    引くための `GET /cameras` だけ。他の口は 403。auth-worker 側でも席の許可表 (`TENKO_MANAGER_ROUTES`) がこの GET 1 本だけを通す
+  - 運行管理者席の鍵 (端末用の proxy、`X-Device-Role: device-tenko-manager`) — 読み取りの 3 口だけ: 遠隔点呼の画面が乗務員の
+    端末からカメラを引く `GET /cameras`、運行管理者の画面の「拠点カメラの録画」が使う `GET /events` と `GET /clips/...` (再生)。
+    切り出し・自動切り出しの実行・カメラの編集・端末の候補・鍵の状態は 403。auth-worker 側でも席の許可表 (`TENKO_MANAGER_ROUTES`)
+    がこの GET 3 本だけを通す
   - 拠点 PC の配信の鍵 (端末用の proxy、`X-Device-Role: device-cam-host`。CoreS3 署名の usage `cam-host`) — `GET /cameras/mine`
     だけ。他の口は 403。端末は `X-Device-Id` (鍵の JWT の sub、`alarm:<fingerprint>`) で、無ければ 401・200 文字超は 400
 
