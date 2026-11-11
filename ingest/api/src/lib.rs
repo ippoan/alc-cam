@@ -11,7 +11,9 @@
 //! 宛先 (`vpc_binding`) は VPC Service の binding 名 (宛先の IP は Cloudflare 側に在り、Worker は持たない)。DB では
 //! `cameras.rec_ip` 列に入る ([`pg`])。その binding がこの Worker に在るかは Worker が確かめる ([`Op::vpc_binding`])。
 //! 応答・ログに資格情報を出さない。一覧の応答は `vpc_binding` を返すが、パスワードは返さない。
-//! 運行管理者席の鍵 ([`Role::TenkoManager`]) に許すのは一覧 (`GET /cameras`) だけで、応答は `id`・`name`・`device_ids` に絞る。
+//! 運行管理者席の鍵 ([`Role::TenkoManager`]) に許すのは読み取りだけ — 一覧 (`GET /cameras`、応答は `id`・`name`・`device_ids` に絞る)、
+//! その日のイベント (`GET /events`) と切り出しの再生 (`GET /clips/...`)。切り出し・自動切り出しの実行・カメラの編集・
+//! 端末の候補・鍵の状態は管理者だけ。
 //! カメラの `device_ids` は応答で機体の鍵の ID (`alarm:<fp>`) に畳む (hub の ID は、結び付いた鍵があればその ID。
 //! [`pg::fold_device_ids`])。結び付きの無い hub の ID はそのまま返し、管理者向けには `pending_device_ids` にも入れる
 //! (機体の鍵への置き換え待ち)。保存 (POST / PATCH) は送られた ID のまま。
@@ -540,8 +542,13 @@ fn clip_key(rest: &str, caller: &Caller) -> Result<String, ApiError> {
     Ok(format!("clips/{rest}"))
 }
 
+/// 運行管理者席の鍵に許す口: カメラの一覧・その日のイベント・切り出しの再生 (どれも GET の読み取り)
+fn tenko_manager_may(method: &str, path: &str) -> bool {
+    method == "GET" && (path == "/cameras" || path == "/events" || path.starts_with("/clips/"))
+}
+
 /// method・path (`PUBLIC_PATH_PREFIX` を剥がした後)・query (`?` の後)・本文から仕事を決める。DB には触らない。
-/// 運行管理者席の鍵は `GET /cameras` 以外を 403 にする (無い口も 404 でなく 403)
+/// 運行管理者席の鍵は読み取りの 3 口 ([`tenko_manager_may`]) 以外を 403 にする (無い口も 404 でなく 403)
 pub fn parse(
     method: &str,
     path: &str,
@@ -550,8 +557,8 @@ pub fn parse(
     caller: &Caller,
     max_clip_ms: i64,
 ) -> Result<Op, ApiError> {
-    if caller.role == Role::TenkoManager && (method, path) != ("GET", "/cameras") {
-        return Err(ApiError::new(403, "運行管理者席はカメラの一覧だけを使えます"));
+    if caller.role == Role::TenkoManager && !tenko_manager_may(method, path) {
+        return Err(ApiError::new(403, "運行管理者席は録画の一覧と再生だけを使えます"));
     }
     if caller.role == Role::CamHost {
         if (method, path) != ("GET", "/cameras/mine") {
@@ -1108,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn tenko_manager_can_only_list_cameras() {
+    fn tenko_manager_can_only_read() {
         let m = tenko_manager();
         assert!(matches!(
             parse("GET", "/cameras", "", "", &m, 60_000),
@@ -1118,6 +1125,17 @@ mod tests {
         let clip = format!("/clips/{TENANT}/{id}/20261023T125800_20261023T125930.mp4");
         let patch = format!("/cameras/{id}");
         let events = format!("camera_id={id}&date=2026-10-23");
+        assert!(matches!(
+            parse("GET", "/events", &events, "", &m, 60_000),
+            Ok(Op::Events { .. })
+        ));
+        assert!(matches!(
+            parse("GET", &clip, "", "", &m, 60_000),
+            Ok(Op::GetClip { .. })
+        ));
+        // 別のテナントの切り出しは管理者と同じく 404
+        let other = format!("/clips/00000000-0000-4000-8000-0000000000bb/{id}/20261023T125800_20261023T125930.mp4");
+        assert_eq!(status(parse("GET", &other, "", "", &m, 60_000)), 404);
         let clip_body = format!(r#"{{"camera_id":"{id}","from":"2026-10-23T12:58:00","to":"2026-10-23T12:59:00"}}"#);
         for (method, path, query, body) in [
             ("POST", "/cameras", "", r#"{"name":"入口"}"#),
@@ -1125,8 +1143,9 @@ mod tests {
             ("GET", "/device-candidates", "", ""),
             ("GET", "/device-key-status", "", ""),
             ("POST", "/clips", "", clip_body.as_str()),
-            ("GET", clip.as_str(), "", ""),
-            ("GET", "/events", events.as_str(), ""),
+            ("POST", "/auto-run", "", ""),
+            ("POST", "/events", events.as_str(), ""),
+            ("DELETE", clip.as_str(), "", ""),
             ("GET", "/cameras/", "", ""),
             ("GET", patch.as_str(), "", ""),
             ("DELETE", "/cameras", "", ""),
