@@ -651,7 +651,9 @@ pub async fn recording_cameras(pg: &mut PgClient, tenant: Uuid) -> Result<Vec<Re
     .await
 }
 
-/// イベントの元 (hub_measurements の 5 種 (試験記録 `test` を含む。MCP `create_test_record` が機体に作らせ、いつも開発の軸)・指静脈の登録・measurements のアルコールと血圧)。`$1` テナント。
+/// イベントの元 (hub_measurements の 5 種 (試験記録 `test` を含む。MCP `create_test_record` が機体に作らせ、いつも開発の軸)・指静脈の登録・
+/// 点呼の本人確認 (`tenko_identity_events`、kind `tenko_identity`。自己点検表 ト①「生体認証をする時の顔の画像」。照合した端末が在る行だけ。
+/// Refs ippoan/alc-app#720)・measurements のアルコールと血圧)。`$1` テナント。
 /// 引数は期間の `[lo, hi)` (timestamptz の式。切り出しは UNIX ms の `$3`/`$4`、候補は直近 `$2` 日)。
 /// 時刻の比較は ms を interval で足す (浮動小数の to_timestamp で境目がずれないように)。
 /// `device_id` は結び付き (`link`: hub の ID → 機体の鍵の ID) で畳んだ値 — hub の ID の行は鍵の ID で出る。
@@ -695,6 +697,13 @@ ev AS (
      WHERE v.tenant_id = $1 AND v.registered_device_id IS NOT NULL
        AND v.created_at >= ", $lo, "
        AND v.created_at < ", $hi, "
+    UNION ALL
+    SELECT 'tenko_identity_events', ti.id, 'tenko_identity', ti.occurred_at, COALESCE(l.key_id, ti.device_id), ti.device_id
+      FROM alc_api.tenko_identity_events ti
+      LEFT JOIN link l ON l.hub_id = ti.device_id
+     WHERE ti.tenant_id = $1 AND ti.device_id IS NOT NULL
+       AND ti.occurred_at >= ", $lo, "
+       AND ti.occurred_at < ", $hi, "
     UNION ALL
     SELECT 'measurements', m.id, 'alcohol', m.measured_at, COALESCE(l.key_id, m.device_id), m.device_id
       FROM alc_api.measurements m

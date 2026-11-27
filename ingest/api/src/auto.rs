@@ -37,10 +37,10 @@ pub const LIST_LEAD_MS: i64 = 3_600_000;
 /// 拾うイベント (`cam_clip_events` の 1 行になる)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
-    /// `hub_measurements` / `vein_enroll_events`
+    /// `hub_measurements` / `vein_enroll_events` / `tenko_identity_events` / `measurements` / `measurements_bp`
     pub source_table: String,
     pub source_id: Uuid,
-    /// hub_measurements の kind、指静脈の登録は `vein_enroll`
+    /// hub_measurements の kind、指静脈の登録は `vein_enroll`、点呼の本人確認は `tenko_identity`
     pub kind: String,
     pub at_ms: i64,
     pub device_id: String,

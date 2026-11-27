@@ -1129,6 +1129,26 @@ async fn vein_event(su: &Client, t: Uuid, device: &str, created: i64, dev: bool)
     id
 }
 
+/// 点呼の本人確認を 1 件作る (乗務員と点呼も作る。`device` が None なら照合した端末の無い行)
+async fn identity_event(su: &Client, t: Uuid, device: Option<&str>, occurred: i64) -> Uuid {
+    let emp: Uuid = su
+        .query_one("INSERT INTO alc_api.employees (tenant_id, nfc_id, name) VALUES ($1, $2, '乗務員') RETURNING id", &[&t, &format!("nfc-{}", Uuid::new_v4())])
+        .await
+        .unwrap()
+        .get(0);
+    let (session, id) = (Uuid::new_v4(), Uuid::new_v4());
+    let device = device.map(|d| format!("'{d}'")).unwrap_or_else(|| "NULL".into());
+    su.batch_execute(&format!(
+        "INSERT INTO alc_api.tenko_sessions (id, tenant_id, employee_id, tenko_type, status) \
+         VALUES ('{session}', '{t}', '{emp}', 'pre_operation', 'medical_pending'); \
+         INSERT INTO alc_api.tenko_identity_events (id, tenant_id, session_id, employee_id, phase, method, device_id, occurred_at) \
+         VALUES ('{id}', '{t}', '{session}', '{emp}', 'start', 'vein', {device}, 'epoch'::timestamptz + {occurred} * interval '1 millisecond');"
+    ))
+    .await
+    .unwrap();
+    id
+}
+
 /// 録画を取り込むカメラを作る (結び付ける端末つき)
 async fn recording_camera(pg: &mut PgClient, t: Uuid, devices: &[&str]) -> Uuid {
     let (s, cam) = call(pg, &caller(t, true), "POST", "/cameras", "", json!({"name": "C", "vpc_binding": random_binding(), "device_ids": devices})).await;
@@ -1252,6 +1272,9 @@ async fn auto_events_are_picked_from_linked_devices_on_both_axes() {
     let vein = vein_event(&su, t, "prod-1", T + 50 * S, false).await;
     let dev_vein = vein_event(&su, t, "dev-1", T + 60 * S, true).await;
     vein_event(&su, other, "dev-1", T + 60 * S, true).await;
+    // 点呼の本人確認 (照合した端末が在る行だけ。管理者の画面からの NULL は拾わない)
+    let identity = identity_event(&su, t, Some("prod-1"), T + 65 * S).await;
+    identity_event(&su, t, None, T + 66 * S).await;
 
     let got = pg::auto_events(&mut pg, t, cam, from, to).await.unwrap();
     let mut seen: Vec<(Uuid, &str, &str, i64, bool)> =
@@ -1266,6 +1289,7 @@ async fn auto_events_are_picked_from_linked_devices_on_both_axes() {
             (dev_license, "hub_measurements", "license", 40, true),
             (vein, "vein_enroll_events", "vein_enroll", 50, false),
             (dev_vein, "vein_enroll_events", "vein_enroll", 60, true),
+            (identity, "tenko_identity_events", "tenko_identity", 65, false),
         ]
     );
 
@@ -1275,7 +1299,7 @@ async fn auto_events_are_picked_from_linked_devices_on_both_axes() {
     pg::record_clip_events(&mut pg, t, cam, clip, picked.clone()).await.unwrap();
     pg::record_clip_events(&mut pg, t, cam, clip, picked).await.unwrap();
     let rest: Vec<Uuid> = pg::auto_events(&mut pg, t, cam, from, to).await.unwrap().iter().map(|e| e.source_id).collect();
-    assert_eq!(rest.len(), 4);
+    assert_eq!(rest.len(), 5);
     assert!(!rest.contains(&alcohol) && !rest.contains(&dev_license));
     let rows = clip_events_of(t, cam).await;
     assert_eq!(rows, vec![(alcohol, false, 0), (dev_license, true, 0)]);
