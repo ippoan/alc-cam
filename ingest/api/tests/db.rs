@@ -1248,6 +1248,34 @@ async fn scanned_until(t: Uuid, cam: Uuid) -> Option<i64> {
         .get(0)
 }
 
+/// 点呼の詳細から見る本人確認と切り出し (Refs ippoan/alc-app#720): 切った本人確認はカメラごとに、切っていなければ切り出し無し。
+/// 別の点呼の本人確認は出ない
+#[tokio::test]
+async fn tenko_identity_lists_identities_with_their_clips() {
+    let t = tenant().await;
+    let su = admin().await;
+    let mut pg = rt().await;
+    let cam = recording_camera(&mut pg, t, &["prod-1"]).await;
+    let cut = identity_event(&su, t, Some("prod-1"), T + 10 * S).await;
+    let session: Uuid = su
+        .query_one("SELECT session_id FROM alc_api.tenko_identity_events WHERE id = $1", &[&cut])
+        .await
+        .unwrap()
+        .get(0);
+    identity_event(&su, t, Some("prod-1"), T + 20 * S).await;
+    let events = pg::auto_events(&mut pg, t, cam, T, T + 3600 * S).await.unwrap();
+    let clip = pg::record_clip(&mut pg, t, ClipRecord { camera_id: cam, from_ms: T, to_ms: T + 30 * S, r2_key: "clips/i".into(), size_bytes: Some(1), status: "ready", error: None }).await.unwrap();
+    pg::record_clip_events(&mut pg, t, cam, clip, events.into_iter().filter(|e| e.source_id == cut).collect()).await.unwrap();
+
+    let got = pg::tenko_identity(&mut pg, t, session).await.unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!((got[0].event_id, got[0].phase.as_str(), (got[0].at_ms - T) / S), (cut, "start", 10));
+    assert_eq!(got[0].clip.as_ref().map(|c| c.key.as_str()), Some("clips/i"));
+    assert_eq!(got[0].camera_name.as_deref(), Some("C"));
+    // 切っていない・存在しない点呼は空
+    assert!(pg::tenko_identity(&mut pg, t, Uuid::new_v4()).await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn auto_events_are_picked_from_linked_devices_on_both_axes() {
     let t = tenant().await;

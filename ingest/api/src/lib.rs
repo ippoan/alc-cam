@@ -174,6 +174,10 @@ pub enum Op {
         from_ms: i64,
         to_ms: i64,
     },
+    /// 点呼 1 件の本人確認 (指静脈の照合) と、その切り出し (自己点検表 ト①。Refs ippoan/alc-app#720)
+    TenkoIdentity {
+        session_id: Uuid,
+    },
     /// cron と同じ自動切り出しを呼び手のテナントだけで回す。`camera_id` があればその 1 台だけ
     AutoRun {
         camera_id: Option<Uuid>,
@@ -524,6 +528,45 @@ fn events_input(query: &str) -> Result<Op, ApiError> {
     })
 }
 
+/// `GET /tenko-identity?session_id=<uuid>`
+fn tenko_identity_input(query: &str) -> Result<Op, ApiError> {
+    let session_id = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("session_id="))
+        .and_then(|v| Uuid::parse_str(v).ok())
+        .ok_or_else(|| bad("session_id の形が正しくありません"))?;
+    Ok(Op::TenkoIdentity { session_id })
+}
+
+/// 点呼の本人確認の行を本人確認 1 件ごとにまとめる (切り出しはカメラごとに並べる。切っていなければ空)
+pub fn tenko_identity_json(rows: &[pg::IdentityClip]) -> Value {
+    let mut list: Vec<Value> = Vec::new();
+    let mut last: Option<Uuid> = None;
+    for r in rows {
+        if last != Some(r.event_id) {
+            list.push(json!({
+                "id": r.event_id,
+                "phase": r.phase,
+                "method": r.method,
+                "occurred_at": jst_iso(r.at_ms),
+                "device_id": r.device_id,
+                "clips": [],
+            }));
+            last = Some(r.event_id);
+        }
+        if let (Some(c), Some(item)) = (&r.clip, list.last_mut()) {
+            item["clips"].as_array_mut().expect("clips は配列").push(json!({
+                "clip_id": c.clip_id,
+                "key": c.key,
+                "status": c.status,
+                "error": c.error,
+                "camera_name": r.camera_name,
+            }));
+        }
+    }
+    Value::Array(list)
+}
+
 /// 手動の切り出しが要求より短い範囲しか取れなかったか (頭が遅い・終わりが早い)。キーフレームに寄って
 /// 頭が前に出るのは短縮ではない
 pub fn truncated(from_ms: i64, to_ms: i64, actual_from_ms: i64, actual_to_ms: i64) -> bool {
@@ -542,9 +585,9 @@ fn clip_key(rest: &str, caller: &Caller) -> Result<String, ApiError> {
     Ok(format!("clips/{rest}"))
 }
 
-/// 運行管理者席の鍵に許す口: カメラの一覧・その日のイベント・切り出しの再生 (どれも GET の読み取り)
+/// 運行管理者席の鍵に許す口: カメラの一覧・その日のイベント・点呼の本人確認・切り出しの再生 (どれも GET の読み取り)
 fn tenko_manager_may(method: &str, path: &str) -> bool {
-    method == "GET" && (path == "/cameras" || path == "/events" || path.starts_with("/clips/"))
+    method == "GET" && (path == "/cameras" || path == "/events" || path == "/tenko-identity" || path.starts_with("/clips/"))
 }
 
 /// method・path (`PUBLIC_PATH_PREFIX` を剥がした後)・query (`?` の後)・本文から仕事を決める。DB には触らない。
@@ -583,6 +626,7 @@ pub fn parse(
         ("POST", "/clips") => clip_input(body, max_clip_ms),
         ("POST", "/auto-run") => auto_run_input(body),
         ("GET", "/events") => events_input(query),
+        ("GET", "/tenko-identity") => tenko_identity_input(query),
         ("GET", p) if p.starts_with("/clips/") => Ok(Op::GetClip {
             key: clip_key(&p["/clips/".len()..], caller)?,
         }),
@@ -908,6 +952,15 @@ pub async fn execute(
                 body: Value::Array(list),
             })
         }
+        Op::TenkoIdentity { session_id } => {
+            let rows = pg::tenko_identity(pg, tenant, session_id)
+                .await
+                .map_err(|e| db_error(&e))?;
+            Ok(Reply {
+                status: 200,
+                body: tenko_identity_json(&rows),
+            })
+        }
         Op::CreateClip { .. } | Op::GetClip { .. } | Op::AutoRun { .. } => Err(ApiError::new(404, "Not Found")),
     }
 }
@@ -954,6 +1007,52 @@ mod tests {
             role: Role::CamHost,
             device_id: Some(DEVICE.to_owned()),
         }
+    }
+
+    #[test]
+    fn tenko_identity_takes_a_session_id() {
+        let c = admin(false);
+        let sid = "00000000-0000-4000-8000-0000000000cc";
+        let Ok(Op::TenkoIdentity { session_id }) = parse("GET", "/tenko-identity", &format!("x=1&session_id={sid}"), "", &c, 1) else {
+            panic!("session_id で受ける");
+        };
+        assert_eq!(session_id.to_string(), sid);
+        for q in ["", "session_id=", "session_id=abc"] {
+            assert_eq!(status(parse("GET", "/tenko-identity", q, "", &c, 1)), 400, "{q}");
+        }
+    }
+
+    #[test]
+    fn tenko_identity_json_groups_clips_per_identity() {
+        let ev = |n: u128, at_ms: i64| (Uuid::from_u128(n), at_ms);
+        let clip = |n: u128, key: &str| pg::ClipRef { clip_id: Uuid::from_u128(n), key: key.into(), status: "ready".into(), error: None };
+        let (a, at_a) = ev(1, 1_795_000_000_000);
+        let (b, at_b) = ev(2, 1_795_000_060_000);
+        let row = |id: Uuid, at_ms: i64, phase: &str, clip: Option<pg::ClipRef>, cam: Option<&str>| pg::IdentityClip {
+            event_id: id,
+            phase: phase.into(),
+            method: Some("vein".into()),
+            at_ms,
+            device_id: Some("alarm:k".into()),
+            clip,
+            camera_name: cam.map(Into::into),
+        };
+        let got = tenko_identity_json(&[
+            row(a, at_a, "start", Some(clip(10, "clips/x/1.mp4")), Some("入口")),
+            row(a, at_a, "start", Some(clip(11, "clips/x/2.mp4")), Some("奥")),
+            row(b, at_b, "resume", None, None),
+        ]);
+        let list = got.as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["phase"], "start");
+        assert_eq!(list[0]["method"], "vein");
+        assert_eq!(list[0]["occurred_at"], jst_iso(at_a));
+        let clips = list[0]["clips"].as_array().unwrap();
+        assert_eq!(clips.len(), 2);
+        assert_eq!((clips[0]["key"].as_str(), clips[0]["camera_name"].as_str()), (Some("clips/x/1.mp4"), Some("入口")));
+        assert_eq!(clips[1]["camera_name"], "奥");
+        assert_eq!(list[1]["phase"], "resume");
+        assert_eq!(list[1]["clips"], json!([]));
     }
 
     fn status(r: Result<Op, ApiError>) -> u16 {
@@ -1128,6 +1227,11 @@ mod tests {
         assert!(matches!(
             parse("GET", "/events", &events, "", &m, 60_000),
             Ok(Op::Events { .. })
+        ));
+        // 点呼の本人確認と切り出し (点呼の詳細から見る。Refs ippoan/alc-app#720)
+        assert!(matches!(
+            parse("GET", "/tenko-identity", &format!("session_id={id}"), "", &m, 60_000),
+            Ok(Op::TenkoIdentity { .. })
         ));
         assert!(matches!(
             parse("GET", &clip, "", "", &m, 60_000),

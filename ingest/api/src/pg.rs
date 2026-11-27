@@ -938,6 +938,69 @@ pub struct ClipRef {
     pub error: Option<String>,
 }
 
+/// 点呼の本人確認 1 件と、それを切り出した切り出し 1 本 (カメラごとに 1 行。切っていなければ `clip` が None)。
+/// 自己点検表 ト①「生体認証をする時の顔の画像」を点呼の詳細から見るため (Refs ippoan/alc-app#720)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityClip {
+    pub event_id: Uuid,
+    pub phase: String,
+    pub method: Option<String>,
+    pub at_ms: i64,
+    pub device_id: Option<String>,
+    pub clip: Option<ClipRef>,
+    pub camera_name: Option<String>,
+}
+impl TxOutput for IdentityClip {}
+
+/// 点呼 (`$2`) の本人確認と切り出し (時刻の順。カメラは名前の順)
+const SELECT_TENKO_IDENTITY: &str = "SELECT ti.id, ti.phase, ti.method, (extract(epoch FROM ti.occurred_at) * 1000)::int8, ti.device_id,
+       c.id, c.r2_key, c.status, c.error, cam.name
+  FROM alc_api.tenko_identity_events ti
+  LEFT JOIN alc_api.cam_clip_events e
+         ON e.tenant_id = ti.tenant_id AND e.source_table = 'tenko_identity_events' AND e.source_id = ti.id
+  LEFT JOIN alc_api.cam_clips c ON c.tenant_id = e.tenant_id AND c.id = e.clip_id
+  LEFT JOIN alc_api.cameras cam ON cam.tenant_id = e.tenant_id AND cam.id = e.camera_id
+ WHERE ti.tenant_id = $1 AND ti.session_id = $2
+ ORDER BY ti.occurred_at, ti.id, cam.name";
+
+/// 点呼 1 件の本人確認と切り出し (本番の行と開発端末の行。点呼はどちらか一方の軸にだけ在る)
+pub async fn tenko_identity(pg: &mut PgClient, tenant: Uuid, session_id: Uuid) -> Result<Vec<IdentityClip>, Error> {
+    let mut all = Vec::new();
+    for is_dev in [false, true] {
+        let rows = pg
+            .tenant_tx(tenant, move |tx| {
+                Box::pin(async move {
+                    if is_dev {
+                        tx.query_typed(SET_DEVICE_DEV, &[]).await?;
+                    }
+                    let rows = tx
+                        .query_typed(SELECT_TENKO_IDENTITY, &[(&tenant, Type::UUID), (&session_id, Type::UUID)])
+                        .await?;
+                    Ok(rows
+                        .iter()
+                        .map(|r| IdentityClip {
+                            event_id: r.get(0),
+                            phase: r.get(1),
+                            method: r.get(2),
+                            at_ms: r.get(3),
+                            device_id: r.get(4),
+                            clip: r.get::<_, Option<Uuid>>(5).map(|clip_id| ClipRef {
+                                clip_id,
+                                key: r.get(6),
+                                status: r.get(7),
+                                error: r.get(8),
+                            }),
+                            camera_name: r.get(9),
+                        })
+                        .collect::<Vec<_>>())
+                })
+            })
+            .await?;
+        all.extend(rows);
+    }
+    Ok(all)
+}
+
 /// その日の口の 1 行
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DayEvent {
